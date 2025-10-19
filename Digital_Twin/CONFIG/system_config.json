@@ -1,0 +1,232 @@
+{
+  "application": {
+    "name": "Digital Twin System",
+    "version": "2.0.0",
+    "environment": "production",
+    "debug": false,
+    "timezone": "UTC"
+  },
+  "database": {
+    "primary": {
+      "type": "sqlite",
+      "path": "DATABASE/health_data.db",
+      "pool_size": 10,
+      "timeout": 30
+    },
+    "secure": {
+      "type": "sqlite",
+      "path": "DATABASE/secure_database.db",
+      "encryption": true,
+      "backup_interval_hours": 6
+    },
+    "backup": {
+      "enabled": true,
+      "interval_hours": 24,
+      "retention_days": 30,
+      "path": "SECURITY/data_backups/"
+    }
+  },
+  "security": {
+    "encryption": {
+      "algorithm": "AES-256",
+      "key_rotation_days": 90
+    },
+    "authentication": {
+      "jwt_expiry_hours": 24,
+      "session_timeout_minutes": 60,
+      "max_login_attempts": 5
+    },
+    "audit": {
+      "enabled": true,
+      "log_all_operations": true,
+      "retention_days": 365
+    }
+  },
+  "websocket": {
+    "enabled": true,
+    "max_connections": 1000,
+    "heartbeat_interval": 30,
+    "message_queue_size": 10000,
+    "compression": true
+  },
+  "analytics": {
+    "enabled": true,
+    "real_time_processing": true,
+    "batch_size": 1000,
+    "prediction_intervals": {
+      "short_term_minutes": 60,
+      "medium_term_hours": 24,
+      "long_term_days": 7
+    }
+  },
+  "alerts": {
+    "enabled": true,
+    "channels": ["websocket", "email", "sms"],
+    "thresholds": {
+      "temperature": {
+        "warning": 80,
+        "critical": 95
+      },
+      "pressure": {
+        "warning": 950,
+        "critical": 1000
+      },
+      "vibration": {
+        "warning": 0.5,
+        "critical": 0.8
+      },
+      "efficiency": {
+        "warning_low": 70,
+        "critical_low": 50
+      }
+    },
+    "escalation": {
+      "warning_delay_minutes": 5,
+      "critical_delay_minutes": 1,
+      "max_retries": 3
+    }
+  },
+  "health_scoring": {
+    "enabled": true,
+    "update_interval_minutes": 15,
+    "weights": {
+      "performance": 0.3,
+      "reliability": 0.25,
+      "efficiency": 0.2,
+      "maintenance": 0.15,
+      "security": 0.1
+    },
+    "thresholds": {
+      "excellent": 90,
+      "good": 75,
+      "fair": 60,
+      "poor": 40
+    }
+  },
+  "data_collection": {
+    "enabled": true,
+    "interval_seconds": 30,
+    "batch_processing": true,
+    "data_retention_days": 365,
+    "cleanup": {
+      "enabled": true,
+      "schedule": "0 2 * * *",
+      "keep_aggregated": true
+    }
+  },
+  "reporting": {
+    "enabled": true,
+    "auto_generation": true,
+    "formats": ["html", "pdf", "json"],
+    "schedule": {
+      "daily": "0 6 * * *",
+      "weekly": "0 6 * * 1",
+      "monthly": "0 6 1 * *"
+    },
+    "retention_days": 90
+  },
+  "monitoring": {
+    "system_metrics": {
+      "enabled": true,
+      "interval_seconds": 60
+    },
+    "performance": {
+      "enabled": true,
+      "thresholds": {
+        "cpu_percent": 80,
+        "memory_percent": 85,
+        "disk_percent": 90,
+        "response_time_ms": 1000
+      }
+    },
+    "healthchecks": {
+      "enabled": true,
+      "endpoints": [
+        "/health",
+        "/api/health",
+        "/metrics"
+      ]
+    }
+  },
+  "integration": {
+    "mqtt": {
+      "enabled": true,
+      "broker": "localhost",
+      "port": 1883,
+      "topics": {
+        "device_data": "digitaltwin/devices/+/data",
+        "commands": "digitaltwin/commands/+",
+        "alerts": "digitaltwin/alerts"
+      }
+    },
+    "rest_api": {
+      "enabled": true,
+      "version": "v2",
+      "rate_limiting": {
+        "enabled": true,
+        "requests_per_minute": 100
+      }
+    },
+    "external_apis": {
+      "weather": {
+        "enabled": false,
+        "api_key": "",
+        "update_interval_hours": 1
+      }
+    }
+  },
+  "machine_learning": {
+    "enabled": true,
+    "models": {
+      "anomaly_detection": {
+        "enabled": true,
+        "algorithm": "isolation_forest",
+        "retrain_interval_days": 7
+      },
+      "predictive_maintenance": {
+        "enabled": true,
+        "algorithm": "random_forest",
+        "retrain_interval_days": 30
+      },
+      "pattern_analysis": {
+        "enabled": true,
+        "algorithms": ["time_series", "clustering"],
+        "update_interval_hours": 6
+      }
+    }
+  },
+  "caching": {
+    "enabled": true,
+    "backend": "redis",
+    "ttl_seconds": 3600,
+    "max_size_mb": 512
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "rotation": {
+      "enabled": true,
+      "max_size_mb": 100,
+      "backup_count": 5
+    },
+    "destinations": {
+      "file": true,
+      "console": false,
+      "remote": false
+    }
+  },
+  "ui": {
+    "theme": "modern-dark",
+    "refresh_rate_seconds": 30,
+    "charts": {
+      "default_points": 100,
+      "animation": true,
+      "real_time": true
+    },
+    "features": {
+      "export_data": true,
+      "advanced_analytics": true,
+      "mobile_responsive": true
+    }
+  }
+}
