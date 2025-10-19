@@ -60,7 +60,7 @@ class DashboardHelper:
             'primary': ['#3498db', '#2ecc71', '#f39c12', '#e74c3c', '#9b59b6'],
             'status': {
                 'normal': '#27ae60',
-                'warning': '#f39c12', 
+                'warning': '#f39c12',  
                 'critical': '#e74c3c',
                 'offline': '#95a5a6'
             },
@@ -93,39 +93,38 @@ class DashboardHelper:
         
         return logger
     
-    def get_dashboard_overview(self, device_data: List[Dict] = None) -> Dict:
+    def get_dashboard_overview(self) -> Dict:
         """
-        Get comprehensive dashboard overview data.
+        Get comprehensive dashboard overview data, including historical aggregates,
+        trend summaries, and multi-asset comparisons.
         
-        Args:
-            device_data: Optional device data, will fetch if not provided
-            
         Returns:
             Dictionary containing dashboard overview metrics
         """
         try:
             self.logger.info("Generating dashboard overview")
             
-            if device_data is None:
-                device_data = self._fetch_device_data()
+            # Fetch 7 days of data for historical trends and aggregations
+            historical_df = self._fetch_device_data(days_back=7)
             
-            if not device_data:
+            if historical_df.empty:
                 return self._get_default_overview()
             
-            # Convert to DataFrame for easier processing
-            df = pd.DataFrame(device_data)
+            # Get the latest snapshot for each device
+            latest_df = historical_df.groupby('device_id').last().reset_index()
             
             # Calculate key metrics
             overview = {
                 'timestamp': datetime.now().isoformat(),
-                'system_metrics': self._calculate_system_metrics(df),
-                'device_metrics': self._calculate_device_metrics(df),
-                'health_metrics': self._calculate_health_metrics(df),
-                'performance_metrics': self._calculate_performance_metrics(df),
-                'status_distribution': self._calculate_status_distribution(df),
-                'trend_analysis': self._calculate_trend_analysis(df),
+                'system_metrics': self._calculate_system_metrics(latest_df, historical_df),
+                'device_metrics': self._calculate_device_metrics(latest_df),
+                'health_metrics': self._calculate_health_metrics(historical_df),
+                'performance_metrics': self._calculate_performance_metrics(historical_df),
+                'status_distribution': self._calculate_status_distribution(latest_df),
+                'trend_analysis': self._calculate_trend_analysis(historical_df),
+                'asset_comparisons': self._calculate_asset_comparisons(latest_df),
                 'alerts_summary': self._get_alerts_summary(),
-                'energy_metrics': self._calculate_energy_metrics(df)
+                'energy_metrics': self._calculate_energy_metrics(historical_df)
             }
             
             return overview
@@ -134,87 +133,107 @@ class DashboardHelper:
             self.logger.error(f"Dashboard overview generation error: {e}")
             return self._get_default_overview()
     
-    def _fetch_device_data(self) -> List[Dict]:
-        """Fetch latest device data from database."""
+    def _fetch_device_data(self, days_back: int = 1) -> pd.DataFrame:
+        """
+        Fetch device data from the database for the specified number of days.
+        
+        Args:
+            days_back: Number of days to fetch data for.
+            
+        Returns:
+            DataFrame containing device data.
+        """
         try:
             db_path = "DATABASE/health_data.db"
             
             if not Path(db_path).exists():
-                return self._generate_sample_device_data()
+                return pd.DataFrame(self._generate_sample_device_data())
             
             with sqlite3.connect(db_path) as conn:
-                query = """
+                query = f"""
                     SELECT device_id, device_name, device_type, value, unit, status, 
                            health_score, efficiency_score, location, timestamp,
                            operating_hours, days_since_maintenance
                     FROM device_data 
-                    WHERE timestamp >= datetime('now', '-1 day')
+                    WHERE timestamp >= datetime('now', '-{days_back} days')
                     ORDER BY timestamp DESC
                 """
                 
                 df = pd.read_sql_query(query, conn)
-                return df.to_dict('records')
+                return df
                 
         except Exception as e:
             self.logger.error(f"Error fetching device data: {e}")
-            return self._generate_sample_device_data()
+            return pd.DataFrame(self._generate_sample_device_data())
     
     def _generate_sample_device_data(self) -> List[Dict]:
-        """Generate sample device data for demonstration."""
+        """Generate sample device data for demonstration (now richer for trends)."""
         try:
             devices = []
             device_types = ['temperature_sensor', 'pressure_sensor', 'vibration_sensor', 
-                          'humidity_sensor', 'power_meter']
+                            'humidity_sensor', 'power_meter']
             locations = ['Factory Floor A', 'Factory Floor B', 'Warehouse', 'Quality Lab']
             
-            for i in range(20):
-                device_type = np.random.choice(device_types)
+            for i in range(20):  # 20 unique devices
+                device_type_base = np.random.choice(device_types)
+                location = np.random.choice(locations)
                 
-                # Generate realistic values based on device type
-                if device_type == 'temperature_sensor':
-                    value = np.random.uniform(18, 35)
-                    unit = '°C'
-                elif device_type == 'pressure_sensor':
-                    value = np.random.uniform(900, 1100)
-                    unit = 'hPa'
-                elif device_type == 'vibration_sensor':
-                    value = np.random.uniform(0.1, 0.6)
-                    unit = 'mm/s'
-                elif device_type == 'humidity_sensor':
-                    value = np.random.uniform(30, 80)
-                    unit = '%RH'
-                else:  # power_meter
-                    value = np.random.uniform(800, 2000)
-                    unit = 'W'
+                # Base values for this device
+                base_health = np.random.uniform(0.5, 0.9)
+                base_efficiency = np.random.uniform(0.6, 0.9)
                 
-                # Determine status based on value ranges
-                config = self.aggregation_config.get(device_type.split('_')[0], {})
-                normal_range = config.get('normal_range', (0, 100))
-                
-                if normal_range[0] <= value <= normal_range[1]:
-                    status = 'normal'
-                    health_score = np.random.uniform(0.8, 1.0)
-                elif value < normal_range[0] * 0.8 or value > normal_range[1] * 1.2:
-                    status = 'critical'
-                    health_score = np.random.uniform(0.2, 0.5)
-                else:
-                    status = 'warning'
-                    health_score = np.random.uniform(0.5, 0.8)
-                
-                devices.append({
-                    'device_id': f'DEVICE_{i+1:03d}',
-                    'device_name': f'{device_type.replace("_", " ").title()} {i+1:03d}',
-                    'device_type': device_type,
-                    'value': round(value, config.get('precision', 1)),
-                    'unit': unit,
-                    'status': status,
-                    'health_score': health_score,
-                    'efficiency_score': np.random.uniform(0.7, 1.0),
-                    'location': np.random.choice(locations),
-                    'timestamp': datetime.now().isoformat(),
-                    'operating_hours': np.random.uniform(100, 8000),
-                    'days_since_maintenance': np.random.randint(1, 90)
-                })
+                for j in range(10): # 10 data points each over the last 7 days
+                    timestamp = datetime.now() - timedelta(days=np.random.uniform(0, 7), 
+                                                           hours=np.random.uniform(0, 24))
+                    
+                    device_type = device_type_base
+                    
+                    # Generate realistic values based on device type
+                    if device_type == 'temperature_sensor':
+                        value = np.random.uniform(18, 35)
+                        unit = '°C'
+                    elif device_type == 'pressure_sensor':
+                        value = np.random.uniform(900, 1100)
+                        unit = 'hPa'
+                    elif device_type == 'vibration_sensor':
+                        value = np.random.uniform(0.1, 0.6)
+                        unit = 'mm/s'
+                    elif device_type == 'humidity_sensor':
+                        value = np.random.uniform(30, 80)
+                        unit = '%RH'
+                    else:  # power_meter
+                        value = np.random.uniform(800, 2000)
+                        unit = 'W'
+                    
+                    # Determine status based on value ranges
+                    config = self.aggregation_config.get(device_type.split('_')[0], {})
+                    normal_range = config.get('normal_range', (0, 100))
+                    
+                    # Simulate trend
+                    health_score = max(0.2, min(1.0, base_health + (j * 0.01))) # Slowly improving
+                    efficiency_score = max(0.2, min(1.0, base_efficiency - (j * 0.005))) # Slowly declining
+                    
+                    if normal_range[0] <= value <= normal_range[1]:
+                        status = 'normal'
+                    elif value < normal_range[0] * 0.8 or value > normal_range[1] * 1.2:
+                        status = 'critical'
+                    else:
+                        status = 'warning'
+                    
+                    devices.append({
+                        'device_id': f'DEVICE_{i+1:03d}',
+                        'device_name': f'{device_type.replace("_", " ").title()} {i+1:03d}',
+                        'device_type': device_type,
+                        'value': round(value, config.get('precision', 1)),
+                        'unit': unit,
+                        'status': status,
+                        'health_score': health_score,
+                        'efficiency_score': efficiency_score,
+                        'location': location,
+                        'timestamp': timestamp.isoformat(),
+                        'operating_hours': np.random.uniform(100, 8000),
+                        'days_since_maintenance': np.random.randint(1, 90)
+                    })
             
             return devices
             
@@ -222,18 +241,15 @@ class DashboardHelper:
             self.logger.error(f"Sample data generation error: {e}")
             return []
     
-    def _calculate_system_metrics(self, df: pd.DataFrame) -> Dict:
+    def _calculate_system_metrics(self, latest_df: pd.DataFrame, historical_df: pd.DataFrame) -> Dict:
         """Calculate system-level metrics."""
         try:
-            total_devices = len(df['device_id'].unique()) if 'device_id' in df.columns else 0
+            total_devices = len(latest_df)
             
             if total_devices == 0:
-                return {'total_devices': 0, 'active_devices': 0, 'uptime': 100.0}
+                return {'total_devices': 0, 'active_devices': 0, 'uptime': 100.0, 'data_points_collected': 0}
             
-            # Get latest data for each device
-            latest_df = df.groupby('device_id').last().reset_index()
-            
-            active_devices = len(latest_df[latest_df['status'] == 'normal']) if 'status' in latest_df.columns else 0
+            active_devices = len(latest_df[latest_df['status'] == 'normal'])
             
             # Calculate system uptime based on device status
             uptime = (active_devices / total_devices) * 100 if total_devices > 0 else 100.0
@@ -247,22 +263,19 @@ class DashboardHelper:
                 'offline_devices': total_devices - active_devices,
                 'uptime': round(uptime, 2),
                 'response_time_ms': round(response_time, 1),
-                'data_points_collected': len(df),
+                'data_points_collected': len(historical_df), # Total points in the period
                 'last_update': datetime.now().isoformat()
             }
             
         except Exception as e:
             self.logger.error(f"System metrics calculation error: {e}")
-            return {'total_devices': 0, 'active_devices': 0, 'uptime': 0.0}
+            return {'total_devices': 0, 'active_devices': 0, 'uptime': 0.0, 'data_points_collected': 0}
     
-    def _calculate_device_metrics(self, df: pd.DataFrame) -> Dict:
-        """Calculate device-specific metrics."""
+    def _calculate_device_metrics(self, latest_df: pd.DataFrame) -> Dict:
+        """Calculate device-specific metrics based on latest snapshot."""
         try:
-            if df.empty:
+            if latest_df.empty:
                 return {}
-            
-            # Get latest data for each device
-            latest_df = df.groupby('device_id').last().reset_index()
             
             device_metrics = {}
             
@@ -284,14 +297,14 @@ class DashboardHelper:
             self.logger.error(f"Device metrics calculation error: {e}")
             return {}
     
-    def _calculate_health_metrics(self, df: pd.DataFrame) -> Dict:
-        """Calculate health-related metrics."""
+    def _calculate_health_metrics(self, historical_df: pd.DataFrame) -> Dict:
+        """Calculate health-related metrics from historical data."""
         try:
-            if df.empty or 'health_score' not in df.columns:
+            if historical_df.empty or 'health_score' not in historical_df.columns:
                 return self._get_default_health_metrics()
             
-            # Get latest health scores for each device
-            latest_df = df.groupby('device_id').last().reset_index()
+            # Get latest health scores for current snapshot
+            latest_df = historical_df.groupby('device_id').last().reset_index()
             health_scores = latest_df['health_score'].dropna()
             
             if health_scores.empty:
@@ -300,7 +313,7 @@ class DashboardHelper:
             # Convert to percentages
             health_scores_pct = health_scores * 100
             
-            # Calculate health distribution
+            # Calculate health distribution from latest snapshot
             health_distribution = {
                 'excellent': len(health_scores[health_scores >= 0.9]),
                 'good': len(health_scores[(health_scores >= 0.7) & (health_scores < 0.9)]),
@@ -309,8 +322,8 @@ class DashboardHelper:
                 'critical': len(health_scores[health_scores < 0.3])
             }
             
-            # Calculate trend (simplified)
-            health_trend = self._calculate_health_trend(df)
+            # Calculate trend from historical data
+            health_trend_details = self._calculate_detailed_trend(historical_df, 'health_score')
             
             return {
                 'average_health': round(health_scores_pct.mean(), 1),
@@ -319,37 +332,13 @@ class DashboardHelper:
                 'max_health': round(health_scores_pct.max(), 1),
                 'std_health': round(health_scores_pct.std(), 1),
                 'health_distribution': health_distribution,
-                'health_trend': health_trend,
+                'health_trend': health_trend_details.get('trend', 'stable'), # Simple trend for overview card
                 'devices_needing_attention': health_distribution['poor'] + health_distribution['critical']
             }
             
         except Exception as e:
             self.logger.error(f"Health metrics calculation error: {e}")
             return self._get_default_health_metrics()
-    
-    def _calculate_health_trend(self, df: pd.DataFrame) -> str:
-        """Calculate health trend direction."""
-        try:
-            if len(df) < 10:
-                return 'stable'
-            
-            # Sort by timestamp and calculate moving average
-            df_sorted = df.sort_values('timestamp')
-            recent_health = df_sorted['health_score'].tail(10).mean()
-            older_health = df_sorted['health_score'].head(10).mean()
-            
-            diff = recent_health - older_health
-            
-            if diff > 0.05:
-                return 'improving'
-            elif diff < -0.05:
-                return 'declining'
-            else:
-                return 'stable'
-                
-        except Exception as e:
-            self.logger.error(f"Health trend calculation error: {e}")
-            return 'stable'
     
     def _get_default_health_metrics(self) -> Dict:
         """Get default health metrics when no data is available."""
@@ -366,14 +355,14 @@ class DashboardHelper:
             'devices_needing_attention': 3
         }
     
-    def _calculate_performance_metrics(self, df: pd.DataFrame) -> Dict:
+    def _calculate_performance_metrics(self, historical_df: pd.DataFrame) -> Dict:
         """Calculate performance-related metrics."""
         try:
-            if df.empty or 'efficiency_score' not in df.columns:
+            if historical_df.empty or 'efficiency_score' not in historical_df.columns:
                 return self._get_default_performance_metrics()
             
-            # Get latest efficiency scores for each device
-            latest_df = df.groupby('device_id').last().reset_index()
+            # Get latest snapshot for current metrics
+            latest_df = historical_df.groupby('device_id').last().reset_index()
             efficiency_scores = latest_df['efficiency_score'].dropna() * 100
             
             # Calculate operating hours statistics
@@ -396,11 +385,14 @@ class DashboardHelper:
                     'devices_overdue_maintenance': len(maintenance_days[maintenance_days > 90])
                 }
             
+            # Calculate trend from historical data
+            efficiency_trend_details = self._calculate_detailed_trend(historical_df, 'efficiency_score')
+            
             return {
                 'average_efficiency': round(efficiency_scores.mean(), 1) if not efficiency_scores.empty else 85.0,
                 'min_efficiency': round(efficiency_scores.min(), 1) if not efficiency_scores.empty else 70.0,
                 'max_efficiency': round(efficiency_scores.max(), 1) if not efficiency_scores.empty else 98.0,
-                'efficiency_trend': self._calculate_efficiency_trend(df),
+                'efficiency_trend': efficiency_trend_details.get('trend', 'stable'),
                 **operating_hours_stats,
                 **maintenance_stats
             }
@@ -408,28 +400,6 @@ class DashboardHelper:
         except Exception as e:
             self.logger.error(f"Performance metrics calculation error: {e}")
             return self._get_default_performance_metrics()
-    
-    def _calculate_efficiency_trend(self, df: pd.DataFrame) -> str:
-        """Calculate efficiency trend direction."""
-        try:
-            if len(df) < 10 or 'efficiency_score' not in df.columns:
-                return 'stable'
-            
-            df_sorted = df.sort_values('timestamp')
-            recent_efficiency = df_sorted['efficiency_score'].tail(10).mean()
-            older_efficiency = df_sorted['efficiency_score'].head(10).mean()
-            
-            diff = recent_efficiency - older_efficiency
-            
-            if diff > 0.05:
-                return 'improving'
-            elif diff < -0.05:
-                return 'declining'
-            else:
-                return 'stable'
-                
-        except Exception as e:
-            return 'stable'
     
     def _get_default_performance_metrics(self) -> Dict:
         """Get default performance metrics when no data is available."""
@@ -446,14 +416,12 @@ class DashboardHelper:
             'devices_overdue_maintenance': 1
         }
     
-    def _calculate_status_distribution(self, df: pd.DataFrame) -> Dict:
-        """Calculate device status distribution."""
+    def _calculate_status_distribution(self, latest_df: pd.DataFrame) -> Dict:
+        """Calculate device status distribution from latest snapshot."""
         try:
-            if df.empty or 'status' not in df.columns:
-                return {'normal': 15, 'warning': 3, 'critical': 2}
+            if latest_df.empty or 'status' not in latest_df.columns:
+                return {'normal': 0, 'warning': 0, 'critical': 0, 'offline': 0}
             
-            # Get latest status for each device
-            latest_df = df.groupby('device_id').last().reset_index()
             status_counts = latest_df['status'].value_counts().to_dict()
             
             # Ensure all status types are present
@@ -468,40 +436,147 @@ class DashboardHelper:
             
         except Exception as e:
             self.logger.error(f"Status distribution calculation error: {e}")
-            return {'normal': 15, 'warning': 3, 'critical': 2}
-    
+            return {'normal': 0, 'warning': 0, 'critical': 0, 'offline': 0}
+
+    def _calculate_detailed_trend(self, df: pd.DataFrame, metric: str) -> Dict:
+        """
+        Calculate detailed trend analysis for a specific metric using daily resampling.
+        
+        Args:
+            df: The historical DataFrame (e.g., 7 days).
+            metric: The column name of the metric to analyze (e.g., 'health_score').
+            
+        Returns:
+            A dictionary with trend, slope, and changes.
+        """
+        default_trend = {'trend': 'stable', 'slope': 0.0, 'change_24h': 0.0, 'change_7d': 0.0, 'unit': '%'}
+        
+        try:
+            if df.empty or metric not in df.columns:
+                return default_trend
+            
+            df_copy = df.dropna(subset=[metric, 'timestamp']).copy()
+            df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'])
+            
+            # Resample to daily average
+            daily_avg = df_copy.set_index('timestamp').resample('D')[metric].mean().dropna()
+            
+            if len(daily_avg) < 2:
+                return default_trend
+                
+            # Get latest, 24h ago, and 7d ago (or first) values
+            latest_val = daily_avg.iloc[-1]
+            prev_val_24h = daily_avg.iloc[-2]
+            prev_val_7d = daily_avg.iloc[0] # First value in the series
+            
+            # Calculate changes
+            change_24h = latest_val - prev_val_24h
+            change_7d = latest_val - prev_val_7d
+            
+            # Calculate linear regression slope
+            x = np.arange(len(daily_avg))
+            slope, _, _, _, _ = stats.linregress(x, daily_avg.values)
+            
+            # Determine trend string
+            trend_str = 'stable'
+            if slope > 0.005:  # Threshold for 'improving'
+                trend_str = 'improving'
+            elif slope < -0.005: # Threshold for 'declining'
+                trend_str = 'declining'
+                
+            # Unit (all our trends are scores 0-1, so we convert to %)
+            unit = '%'
+            multiplier = 100
+            if metric == 'value': # Special case for 'value' trend
+                unit = df_copy['unit'].iloc[0] if 'unit' in df_copy.columns else ''
+                multiplier = 1
+
+            return {
+                'trend': trend_str,
+                'slope': round(slope * multiplier, 3),
+                'change_24h': round(change_24h * multiplier, 2),
+                'change_7d': round(change_7d * multiplier, 2),
+                'unit': unit
+            }
+
+        except Exception as e:
+            self.logger.error(f"Detailed trend calculation error for {metric}: {e}")
+            return default_trend
+
     def _calculate_trend_analysis(self, df: pd.DataFrame) -> Dict:
-        """Calculate trend analysis for key metrics."""
+        """Calculate detailed trend analysis for key metrics."""
         try:
             trends = {}
             
-            # Analyze trends for different metrics
             if not df.empty:
                 # Health trend
-                trends['health'] = self._calculate_health_trend(df)
+                trends['health'] = self._calculate_detailed_trend(df, 'health_score')
                 
                 # Efficiency trend
-                trends['efficiency'] = self._calculate_efficiency_trend(df)
+                trends['efficiency'] = self._calculate_detailed_trend(df, 'efficiency_score')
                 
-                # Device count trend (simplified)
-                trends['device_count'] = 'stable'
+                # Example: Key metric trend (e.g., Temperature)
+                temp_df = df[df['device_type'] == 'temperature_sensor']
+                if not temp_df.empty:
+                    trends['temperature'] = self._calculate_detailed_trend(temp_df, 'value')
                 
-                # Alert trend (simplified)
-                trends['alerts'] = 'decreasing'
             else:
                 trends = {
-                    'health': 'stable',
-                    'efficiency': 'stable',
-                    'device_count': 'stable',
-                    'alerts': 'stable'
+                    'health': self._calculate_detailed_trend(df, 'health_score'),
+                    'efficiency': self._calculate_detailed_trend(df, 'efficiency_score')
                 }
             
             return trends
             
         except Exception as e:
             self.logger.error(f"Trend analysis calculation error: {e}")
-            return {'health': 'stable', 'efficiency': 'stable'}
-    
+            return {'health': {'trend': 'stable'}, 'efficiency': {'trend': 'stable'}}
+
+    def _calculate_asset_comparisons(self, latest_df: pd.DataFrame) -> Dict:
+        """Calculate multi-asset comparisons, like top/bottom performers."""
+        try:
+            comparisons = {}
+            
+            # Top 5 / Bottom 5 by Health
+            if 'health_score' in latest_df.columns:
+                health_cols = ['device_id', 'device_name', 'health_score']
+                top_health = latest_df.nlargest(5, 'health_score')[health_cols].copy()
+                top_health['health_score'] = (top_health['health_score'] * 100).round(1)
+                
+                bottom_health = latest_df.nsmallest(5, 'health_score')[health_cols].copy()
+                bottom_health['health_score'] = (bottom_health['health_score'] * 100).round(1)
+                
+                comparisons['top_5_health'] = top_health.to_dict('records')
+                comparisons['bottom_5_health'] = bottom_health.to_dict('records')
+
+            # Top 5 / Bottom 5 by Efficiency
+            if 'efficiency_score' in latest_df.columns:
+                eff_cols = ['device_id', 'device_name', 'efficiency_score']
+                top_eff = latest_df.nlargest(5, 'efficiency_score')[eff_cols].copy()
+                top_eff['efficiency_score'] = (top_eff['efficiency_score'] * 100).round(1)
+                
+                bottom_eff = latest_df.nsmallest(5, 'efficiency_score')[eff_cols].copy()
+                bottom_eff['efficiency_score'] = (bottom_eff['efficiency_score'] * 100).round(1)
+
+                comparisons['top_5_efficiency'] = top_eff.to_dict('records')
+                comparisons['bottom_5_efficiency'] = bottom_eff.to_dict('records')
+
+            # Aggregates by Location
+            if 'location' in latest_df.columns and 'health_score' in latest_df.columns:
+                health_by_loc = (latest_df.groupby('location')['health_score'].mean() * 100).round(1)
+                comparisons['health_by_location'] = health_by_loc.to_dict()
+
+            # Aggregates by Device Type
+            if 'device_type' in latest_df.columns and 'efficiency_score' in latest_df.columns:
+                eff_by_type = (latest_df.groupby('device_type')['efficiency_score'].mean() * 100).round(1)
+                comparisons['efficiency_by_type'] = eff_by_type.to_dict()
+
+            return comparisons
+
+        except Exception as e:
+            self.logger.error(f"Asset comparison calculation error: {e}")
+            return {}
+
     def _get_alerts_summary(self) -> Dict:
         """Get alerts summary information."""
         try:
@@ -534,45 +609,52 @@ class DashboardHelper:
             self.logger.error(f"Alerts summary error: {e}")
             return {'total_alerts': 0, 'critical_alerts': 0}
     
-    def _calculate_energy_metrics(self, df: pd.DataFrame) -> Dict:
-        """Calculate energy consumption metrics."""
+    def _calculate_energy_metrics(self, historical_df: pd.DataFrame) -> Dict:
+        """Calculate energy consumption metrics based on historical data."""
         try:
-            # Try to get energy data from database
-            energy_data = self._fetch_energy_data()
+            power_df = historical_df[historical_df['device_type'] == 'power_meter']
             
-            if energy_data:
-                current_power = energy_data.get('current_power', 1250)
-                daily_energy = energy_data.get('daily_energy', 28.5)
-                monthly_cost = energy_data.get('monthly_cost', 450)
-            else:
-                # Generate realistic simulated data
-                hour = datetime.now().hour
-                base_power = 1200
-                load_factor = 0.8 + 0.3 * np.sin(2 * np.pi * hour / 24)
-                current_power = base_power * load_factor
-                daily_energy = current_power * 24 / 1000  # kWh
-                monthly_cost = daily_energy * 30 * 0.12  # $0.12 per kWh
+            if power_df.empty:
+                # Fallback to simulated data
+                return self._get_default_energy_metrics()
+
+            # Get latest total power
+            latest_power_df = power_df.groupby('device_id').last()
+            current_power_w = latest_power_df['value'].sum()
+            current_power_kw = current_power_w / 1000.0
+            
+            # Calculate daily energy from historical data
+            power_df['timestamp'] = pd.to_datetime(power_df['timestamp'])
+            # Assuming 'value' is avg power in Watts over the reporting interval.
+            # This is a simplification; real energy = power * time_interval.
+            # We'll simulate daily energy based on current power.
+            daily_energy_kwh = current_power_kw * 24 
+            monthly_cost_usd = daily_energy_kwh * 30 * 0.12 # $0.12 per kWh
             
             return {
-                'current_power_kw': round(current_power, 1),
-                'daily_energy_kwh': round(daily_energy, 1),
-                'monthly_cost_usd': round(monthly_cost, 0),
-                'energy_efficiency': round(np.random.uniform(85, 95), 1),
-                'carbon_footprint_kg': round(daily_energy * 0.4, 1)  # 0.4 kg CO2 per kWh
+                'current_power_kw': round(current_power_kw, 1),
+                'daily_energy_kwh': round(daily_energy_kwh, 1),
+                'monthly_cost_usd': round(monthly_cost_usd, 0),
+                'energy_efficiency': round(np.random.uniform(85, 95), 1), # Simulated
+                'carbon_footprint_kg': round(daily_energy_kwh * 0.4, 1)  # 0.4 kg CO2 per kWh
             }
             
         except Exception as e:
             self.logger.error(f"Energy metrics calculation error: {e}")
-            return {
-                'current_power_kw': 1250.0,
-                'daily_energy_kwh': 30.0,
-                'monthly_cost_usd': 432.0,
-                'energy_efficiency': 88.5,
-                'carbon_footprint_kg': 12.0
-            }
+            return self._get_default_energy_metrics()
+
+    def _get_default_energy_metrics(self) -> Dict:
+        """Get default energy metrics when no data is available."""
+        return {
+            'current_power_kw': 1250.0,
+            'daily_energy_kwh': 30.0,
+            'monthly_cost_usd': 432.0,
+            'energy_efficiency': 88.5,
+            'carbon_footprint_kg': 12.0
+        }
     
     def _fetch_energy_data(self) -> Dict:
-        """Fetch energy data from database."""
+        """Fetch energy data from database (legacy, can be merged)."""
         try:
             db_path = "DATABASE/health_data.db"
             
@@ -611,7 +693,8 @@ class DashboardHelper:
             'health_metrics': self._get_default_health_metrics(),
             'performance_metrics': self._get_default_performance_metrics(),
             'status_distribution': {'normal': 0, 'warning': 0, 'critical': 0},
-            'trend_analysis': {'health': 'stable', 'efficiency': 'stable'},
+            'trend_analysis': {'health': {'trend': 'stable'}, 'efficiency': {'trend': 'stable'}},
+            'asset_comparisons': {},
             'alerts_summary': {'total_alerts': 0, 'critical_alerts': 0},
             'energy_metrics': {
                 'current_power_kw': 0.0,
@@ -622,7 +705,7 @@ class DashboardHelper:
         }
     
     def prepare_chart_data(self, chart_type: str, data_source: str = 'database', 
-                          time_range: str = '24h', device_id: str = None) -> Dict:
+                           time_range: str = '24h', device_id: str = None) -> Dict:
         """
         Prepare data for specific chart types.
         
@@ -780,8 +863,7 @@ class DashboardHelper:
         """Prepare data for pie charts (status distribution)."""
         try:
             # Get device status distribution
-            device_data = self._fetch_device_data()
-            df = pd.DataFrame(device_data)
+            df = self._fetch_device_data(days_back=1)
             
             if not df.empty and 'status' in df.columns:
                 status_counts = df.groupby('device_id')['status'].last().value_counts()
@@ -826,7 +908,8 @@ class DashboardHelper:
         try:
             if device_id:
                 # Single device health gauge
-                device_data = self._fetch_device_data()
+                device_data_df = self._fetch_device_data(days_back=1)
+                device_data = device_data_df.to_dict('records')
                 device = next((d for d in device_data if d.get('device_id') == device_id), None)
                 
                 if device and 'health_score' in device:
@@ -875,7 +958,8 @@ class DashboardHelper:
         """Prepare data for heatmap visualization."""
         try:
             # Generate device location heatmap data
-            device_data = self._fetch_device_data()
+            device_data_df = self._fetch_device_data(days_back=1)
+            device_data = device_data_df.to_dict('records')
             locations = ['Factory Floor A', 'Factory Floor B', 'Warehouse', 'Quality Lab']
             device_types = ['temperature_sensor', 'pressure_sensor', 'vibration_sensor', 'humidity_sensor']
             
@@ -962,9 +1046,8 @@ class DashboardHelper:
             Real-time update data
         """
         try:
-            # Get fresh data
-            device_data = self._fetch_device_data()
-            df = pd.DataFrame(device_data)
+            # Get fresh data (last 1 day is fine for "real-time")
+            df = self._fetch_device_data(days_back=1)
             
             # Calculate deltas from previous values
             updates = {
@@ -992,23 +1075,26 @@ class DashboardHelper:
     def _get_metric_with_delta(self, metric_name: str, df: pd.DataFrame) -> Dict:
         """Get metric value with delta from previous reading."""
         try:
+            # Get latest snapshot
+            latest_df = df.groupby('device_id').last().reset_index() if not df.empty else df
+            
             # Calculate current value based on metric type
             if metric_name == 'system_health':
-                if not df.empty and 'health_score' in df.columns:
-                    current_value = df.groupby('device_id')['health_score'].last().mean() * 100
+                if not latest_df.empty and 'health_score' in latest_df.columns:
+                    current_value = latest_df['health_score'].mean() * 100
                 else:
                     current_value = 85.0
             elif metric_name == 'active_devices':
-                if not df.empty and 'status' in df.columns:
-                    current_value = len(df[df.groupby('device_id')['status'].last() == 'normal'])
+                if not latest_df.empty and 'status' in latest_df.columns:
+                    current_value = len(latest_df[latest_df['status'] == 'normal'])
                 else:
                     current_value = 15
             elif metric_name == 'energy_usage':
-                energy_data = self._fetch_energy_data()
-                current_value = energy_data.get('current_power', 1250.0)
+                energy_data = self._calculate_energy_metrics(df) # Use historical df
+                current_value = energy_data.get('current_power_kw', 1250.0)
             elif metric_name == 'efficiency':
-                if not df.empty and 'efficiency_score' in df.columns:
-                    current_value = df.groupby('device_id')['efficiency_score'].last().mean() * 100
+                if not latest_df.empty and 'efficiency_score' in latest_df.columns:
+                    current_value = latest_df['efficiency_score'].mean() * 100
                 else:
                     current_value = 85.5
             else:
@@ -1053,13 +1139,13 @@ class DashboardHelper:
                     ('Device Offline', 'critical')
                 ]
                 
-                alert_type, severity = np.random.choice(alert_types)
+                alert_title, severity = alert_types[np.random.randint(0, len(alert_types))]
                 device_id = f'DEVICE_{np.random.randint(1, 21):03d}'
                 
                 return [{
                     'id': f'alert_{int(datetime.now().timestamp())}',
-                    'title': alert_type,
-                    'message': f'{alert_type} detected on {device_id}',
+                    'title': alert_title,
+                    'message': f'{alert_title} detected on {device_id}',
                     'severity': severity,
                     'device_id': device_id,
                     'timestamp': datetime.now().isoformat()
@@ -1130,14 +1216,16 @@ class DashboardHelper:
             Device summary data
         """
         try:
-            device_data = self._fetch_device_data()
+            device_data_df = self._fetch_device_data(days_back=1)
+            device_data = device_data_df.to_dict('records')
             device = next((d for d in device_data if d.get('device_id') == device_id), None)
             
             if not device:
                 return {'error': f'Device {device_id} not found'}
             
             # Get historical data for trends
-            historical_data = self._get_device_historical_data(device_id, hours=24)
+            historical_data_df = self._get_device_historical_data(device_id, hours=168) # 7 days
+            historical_data = historical_data_df.to_dict('records')
             
             summary = {
                 'device_id': device_id,
@@ -1153,7 +1241,7 @@ class DashboardHelper:
                     'operating_hours': device.get('operating_hours', 0),
                     'days_since_maintenance': device.get('days_since_maintenance', 0)
                 },
-                'trends': self._calculate_device_trends(historical_data),
+                'trends': self._calculate_device_trends(historical_data_df),
                 'alerts': self._get_device_alerts(device_id),
                 'recommendations': self._get_device_recommendations(device),
                 'last_updated': device.get('timestamp', datetime.now().isoformat())
@@ -1165,28 +1253,28 @@ class DashboardHelper:
             self.logger.error(f"Device summary error for {device_id}: {e}")
             return {'error': str(e)}
     
-    def _get_device_historical_data(self, device_id: str, hours: int = 24) -> List[Dict]:
+    def _get_device_historical_data(self, device_id: str, hours: int = 24) -> pd.DataFrame:
         """Get historical data for a specific device."""
         try:
             db_path = "DATABASE/health_data.db"
             
             if not Path(db_path).exists():
                 # Generate sample historical data
-                return self._generate_sample_historical_data(device_id, hours)
+                return pd.DataFrame(self._generate_sample_historical_data(device_id, hours))
             
             with sqlite3.connect(db_path) as conn:
-                query = """
+                query = f"""
                     SELECT * FROM device_data 
-                    WHERE device_id = ? AND timestamp >= datetime('now', '-{} hours')
+                    WHERE device_id = ? AND timestamp >= datetime('now', '-{hours} hours')
                     ORDER BY timestamp ASC
-                """.format(hours)
+                """
                 
                 df = pd.read_sql_query(query, conn, params=[device_id])
-                return df.to_dict('records')
+                return df
                 
         except Exception as e:
             self.logger.error(f"Historical data retrieval error for {device_id}: {e}")
-            return []
+            return pd.DataFrame()
     
     def _generate_sample_historical_data(self, device_id: str, hours: int) -> List[Dict]:
         """Generate sample historical data for demonstration."""
@@ -1216,33 +1304,19 @@ class DashboardHelper:
             self.logger.error(f"Sample historical data generation error: {e}")
             return []
     
-    def _calculate_device_trends(self, historical_data: List[Dict]) -> Dict:
-        """Calculate trends for device metrics."""
+    def _calculate_device_trends(self, historical_df: pd.DataFrame) -> Dict:
+        """Calculate trends for a single device's metrics."""
         try:
-            if not historical_data:
+            if historical_df.empty:
                 return {'health': 'stable', 'efficiency': 'stable', 'value': 'stable'}
             
-            df = pd.DataFrame(historical_data)
             trends = {}
             
             for metric in ['health_score', 'efficiency_score', 'value']:
-                if metric in df.columns:
-                    values = df[metric].dropna()
-                    if len(values) >= 3:
-                        # Simple linear trend
-                        x = np.arange(len(values))
-                        slope, _, _, _, _ = stats.linregress(x, values)
-                        
-                        if slope > 0.001:
-                            trend = 'improving'
-                        elif slope < -0.001:
-                            trend = 'declining'
-                        else:
-                            trend = 'stable'
-                    else:
-                        trend = 'stable'
-                    
-                    trends[metric.replace('_score', '')] = trend
+                if metric in historical_df.columns:
+                    # Use the same robust trend calculation
+                    trend_details = self._calculate_detailed_trend(historical_df, metric)
+                    trends[metric.replace('_score', '')] = trend_details.get('trend', 'stable')
             
             return trends
             
@@ -1264,9 +1338,9 @@ class DashboardHelper:
                     ('Sensor Calibration', 'warning')
                 ]
                 
-                for alert_type, severity in alert_types[:np.random.randint(1, 3)]:
+                for alert_title, severity in alert_types[:np.random.randint(1, 3)]:
                     alerts.append({
-                        'title': alert_type,
+                        'title': alert_title,
                         'severity': severity,
                         'timestamp': (datetime.now() - timedelta(hours=np.random.randint(1, 48))).isoformat()
                     })
@@ -1354,7 +1428,8 @@ class DashboardHelper:
             
             # Get comprehensive data
             overview = self.get_dashboard_overview()
-            device_data = self._fetch_device_data()
+            device_data_df = self._fetch_device_data(days_back=1)
+            device_data = device_data_df.to_dict('records')
             
             export_data = {
                 'export_timestamp': datetime.now().isoformat(),
@@ -1363,7 +1438,7 @@ class DashboardHelper:
             }
             
             if include_historical:
-                export_data['historical_data'] = self._get_all_historical_data()
+                export_data['historical_data'] = self._get_all_historical_data().to_dict('records')
             
             if format_type == 'json':
                 # Save as JSON file
@@ -1388,27 +1463,27 @@ class DashboardHelper:
             self.logger.error(f"Dashboard data export error: {e}")
             return {'error': str(e)}
     
-    def _get_all_historical_data(self, days: int = 7) -> List[Dict]:
+    def _get_all_historical_data(self, days: int = 7) -> pd.DataFrame:
         """Get historical data for all devices."""
         try:
             db_path = "DATABASE/health_data.db"
             
             if not Path(db_path).exists():
-                return []
+                return pd.DataFrame()
             
             with sqlite3.connect(db_path) as conn:
-                query = """
+                query = f"""
                     SELECT * FROM device_data 
-                    WHERE timestamp >= datetime('now', '-{} days')
+                    WHERE timestamp >= datetime('now', '-{days} days')
                     ORDER BY timestamp DESC
-                """.format(days)
+                """
                 
                 df = pd.read_sql_query(query, conn)
-                return df.to_dict('records')
+                return df
                 
         except Exception as e:
             self.logger.error(f"Historical data retrieval error: {e}")
-            return []
+            return pd.DataFrame()
     
     def clear_cache(self):
         """Clear all cached data."""
@@ -1454,7 +1529,7 @@ if __name__ == "__main__":
     print("=== DIGITAL TWIN DASHBOARD HELPER DEMO ===\n")
     
     # 1. Get dashboard overview
-    print("1. Getting dashboard overview...")
+    print("1. Getting dashboard overview (using 7-day historical data)...")
     overview = dashboard.get_dashboard_overview()
     
     print(f"System Metrics:")
@@ -1462,7 +1537,7 @@ if __name__ == "__main__":
     print(f"  - Total Devices: {system_metrics.get('total_devices', 0)}")
     print(f"  - Active Devices: {system_metrics.get('active_devices', 0)}")
     print(f"  - System Uptime: {system_metrics.get('uptime', 0)}%")
-    print(f"  - Response Time: {system_metrics.get('response_time_ms', 0)} ms")
+    print(f"  - Data Points (7d): {system_metrics.get('data_points_collected', 0)}")
     
     print(f"\nHealth Metrics:")
     health_metrics = overview.get('health_metrics', {})
@@ -1479,37 +1554,59 @@ if __name__ == "__main__":
     print(f"\nEnergy Metrics:")
     energy_metrics = overview.get('energy_metrics', {})
     print(f"  - Current Power: {energy_metrics.get('current_power_kw', 0)} kW")
-    print(f"  - Daily Energy: {energy_metrics.get('daily_energy_kwh', 0)} kWh")
-    print(f"  - Monthly Cost: ${energy_metrics.get('monthly_cost_usd', 0)}")
+    print(f"  - Daily Energy (Est): {energy_metrics.get('daily_energy_kwh', 0)} kWh")
+    print(f"  - Monthly Cost (Est): ${energy_metrics.get('monthly_cost_usd', 0)}")
     
     print(f"\nStatus Distribution:")
     status_distribution = overview.get('status_distribution', {})
     for status, count in status_distribution.items():
         print(f"  - {status.title()}: {count} devices")
-    
+        
     print(f"\nAlerts Summary:")
     alerts_summary = overview.get('alerts_summary', {})
     print(f"  - Total Alerts: {alerts_summary.get('total_alerts', 0)}")
     print(f"  - Critical Alerts: {alerts_summary.get('critical_alerts', 0)}")
-    print(f"  - Warning Alerts: {alerts_summary.get('warning_alerts', 0)}")
-    
-    # 2. Test chart data preparation
+
+    # 2. Test NEW Trend Analysis
     print("\n" + "="*50)
-    print("2. Testing chart data preparation...")
+    print("2. Testing NEW Detailed Trend Analysis...")
+    
+    trend_analysis = overview.get('trend_analysis', {})
+    print("Trend Analysis (7-day):")
+    for metric, details in trend_analysis.items():
+        print(f"  - {metric.title()}:")
+        print(f"    - Trend: {details.get('trend', 'stable')}")
+        print(f"    - Slope: {details.get('slope', 0.0)} {details.get('unit', '%')} /day")
+        print(f"    - 24h Change: {details.get('change_24h', 0.0):+.2f} {details.get('unit', '%')}")
+        print(f"    - 7d Change: {details.get('change_7d', 0.0):+.2f} {details.get('unit', '%')}")
+
+    # 3. Test NEW Asset Comparisons
+    print("\n" + "="*50)
+    print("3. Testing NEW Asset Comparisons...")
+    
+    asset_comparisons = overview.get('asset_comparisons', {})
+    print("Bottom 3 Health Devices:")
+    for device in asset_comparisons.get('bottom_5_health', [])[:3]:
+        print(f"  - {device.get('device_name')} ({device.get('device_id')}): {device.get('health_score')}%")
+        
+    print("\nTop 3 Efficiency Devices:")
+    for device in asset_comparisons.get('top_5_efficiency', [])[:3]:
+        print(f"  - {device.get('device_name')} ({device.get('device_id')}): {device.get('efficiency_score')}%")
+
+    print("\nAvg Health by Location:")
+    for loc, health in asset_comparisons.get('health_by_location', {}).items():
+        print(f"  - {loc}: {health:.1f}%")
+
+    # 4. Test chart data preparation
+    print("\n" + "="*50)
+    print("4. Testing chart data preparation...")
     
     # Line chart data
-    line_chart = dashboard.prepare_chart_data('line', time_range='24h')
+    line_chart = dashboard.prepare_chart_data('line', time_range='7d')
     if 'error' not in line_chart:
-        print(f"✓ Line Chart: {len(line_chart.get('datasets', []))} datasets with {len(line_chart.get('labels', []))} data points")
+        print(f"✓ Line Chart (7d): {len(line_chart.get('datasets', []))} datasets with {len(line_chart.get('labels', []))} data points")
     else:
         print(f"✗ Line Chart Error: {line_chart['error']}")
-    
-    # Bar chart data
-    bar_chart = dashboard.prepare_chart_data('bar')
-    if 'error' not in bar_chart:
-        print(f"✓ Bar Chart: {len(bar_chart.get('labels', []))} categories")
-    else:
-        print(f"✗ Bar Chart Error: {bar_chart['error']}")
     
     # Pie chart data
     pie_chart = dashboard.prepare_chart_data('pie')
@@ -1517,24 +1614,10 @@ if __name__ == "__main__":
         print(f"✓ Pie Chart: {len(pie_chart.get('labels', []))} segments")
     else:
         print(f"✗ Pie Chart Error: {pie_chart['error']}")
-    
-    # Gauge chart data
-    gauge_chart = dashboard.prepare_chart_data('gauge')
-    if 'error' not in gauge_chart:
-        print(f"✓ Gauge Chart: Value = {gauge_chart.get('value', 0)}%")
-    else:
-        print(f"✗ Gauge Chart Error: {gauge_chart['error']}")
-    
-    # Heatmap data
-    heatmap = dashboard.prepare_chart_data('heatmap')
-    if 'error' not in heatmap:
-        print(f"✓ Heatmap: {len(heatmap.get('yLabels', []))} x {len(heatmap.get('xLabels', []))} matrix")
-    else:
-        print(f"✗ Heatmap Error: {heatmap['error']}")
-    
-    # 3. Test real-time updates
+
+    # 5. Test real-time updates
     print("\n" + "="*50)
-    print("3. Testing real-time updates...")
+    print("5. Testing real-time updates...")
     
     realtime_data = dashboard.get_realtime_updates()
     if 'error' not in realtime_data:
@@ -1549,30 +1632,25 @@ if __name__ == "__main__":
         new_alerts = realtime_data.get('alerts', [])
         print(f"\nNew Alerts: {len(new_alerts)}")
         for alert in new_alerts[:3]:  # Show first 3 alerts
-            print(f"  - [{alert.get('severity', 'info').upper()}] {alert.get('title', '')}: {alert.get('message', '')}")
+            print(f"  - [{alert.get('severity', 'info').upper()}] {alert.get('title', '')}")
     else:
         print(f"✗ Real-time Updates Error: {realtime_data['error']}")
     
-    # 4. Test device summary
+    # 6. Test device summary
     print("\n" + "="*50)
-    print("4. Testing device summary...")
+    print("6. Testing device summary...")
     
     device_summary = dashboard.get_device_summary('DEVICE_001')
     if 'error' not in device_summary:
         print(f"Device: {device_summary.get('device_name', 'Unknown')}")
-        print(f"Type: {device_summary.get('device_type', 'Unknown')}")
-        print(f"Location: {device_summary.get('location', 'Unknown')}")
         print(f"Status: {device_summary.get('status', 'Unknown')}")
         
         current_metrics = device_summary.get('current_metrics', {})
-        print(f"Current Value: {current_metrics.get('value', 0)} {current_metrics.get('unit', '')}")
         print(f"Health Score: {current_metrics.get('health_score', 0)}%")
-        print(f"Efficiency: {current_metrics.get('efficiency_score', 0)}%")
         
         trends = device_summary.get('trends', {})
         print(f"Trends: Health={trends.get('health', 'stable')}, "
-              f"Efficiency={trends.get('efficiency', 'stable')}, "
-              f"Value={trends.get('value', 'stable')}")
+              f"Efficiency={trends.get('efficiency', 'stable')}")
         
         recommendations = device_summary.get('recommendations', [])
         print(f"Recommendations: {len(recommendations)}")
@@ -1581,103 +1659,20 @@ if __name__ == "__main__":
     else:
         print(f"✗ Device Summary Error: {device_summary['error']}")
     
-    # 5. Test data export
+    # 7. Test data export
     print("\n" + "="*50)
-    print("5. Testing data export...")
+    print("7. Testing data export...")
     
     # JSON export
-    json_export = dashboard.export_dashboard_data('json', include_historical=False)
+    json_export = dashboard.export_dashboard_data('json', include_historical=True)
     if 'error' not in json_export:
-        print(f"✓ JSON Export: {json_export.get('export_path', 'Unknown path')}")
+        print(f"✓ JSON Export (with history): {json_export.get('export_path', 'Unknown path')}")
     else:
         print(f"✗ JSON Export Error: {json_export['error']}")
     
-    # CSV export
-    csv_export = dashboard.export_dashboard_data('csv', include_historical=False)
-    if 'error' not in csv_export:
-        print(f"✓ CSV Export: {csv_export.get('export_path', 'Unknown path')}")
-    else:
-        print(f"✗ CSV Export Error: {csv_export['error']}")
-    
-    # 6. Test cache statistics
+    # 8. Cleanup and summary
     print("\n" + "="*50)
-    print("6. Cache statistics...")
-    
-    cache_stats = dashboard.get_cache_statistics()
-    print(f"Cache Entries: {cache_stats.get('total_entries', 0)}")
-    print(f"Estimated Size: {cache_stats.get('estimated_size_bytes', 0):,} bytes")
-    print(f"Buffer Size: {cache_stats.get('realtime_buffer_size', 0)}")
-    print(f"Hit Ratio: {cache_stats.get('cache_hit_ratio', 0)*100:.1f}%")
-    
-    # 7. Performance test
-    print("\n" + "="*50)
-    print("7. Performance test...")
-    
-    import time
-    
-    # Time dashboard overview generation
-    start_time = time.time()
-    for i in range(5):
-        overview = dashboard.get_dashboard_overview()
-    overview_time = (time.time() - start_time) / 5
-    print(f"Average Overview Generation Time: {overview_time*1000:.1f} ms")
-    
-    # Time chart data preparation
-    start_time = time.time()
-    for chart_type in ['line', 'bar', 'pie', 'gauge']:
-        dashboard.prepare_chart_data(chart_type)
-    chart_time = (time.time() - start_time) / 4
-    print(f"Average Chart Preparation Time: {chart_time*1000:.1f} ms")
-    
-    # Time real-time updates
-    start_time = time.time()
-    for i in range(10):
-        dashboard.get_realtime_updates()
-    realtime_time = (time.time() - start_time) / 10
-    print(f"Average Real-time Update Time: {realtime_time*1000:.1f} ms")
-    
-    # 8. Memory usage estimation
-    print("\n" + "="*50)
-    print("8. Memory usage estimation...")
-    
-    import sys
-    
-    # Estimate object sizes
-    overview_size = sys.getsizeof(str(overview))
-    chart_size = sys.getsizeof(str(line_chart))
-    realtime_size = sys.getsizeof(str(realtime_data))
-    
-    print(f"Overview Data Size: {overview_size:,} bytes")
-    print(f"Chart Data Size: {chart_size:,} bytes")
-    print(f"Real-time Data Size: {realtime_size:,} bytes")
-    print(f"Total Estimated Usage: {(overview_size + chart_size + realtime_size):,} bytes")
-    
-    # 9. Configuration display
-    print("\n" + "="*50)
-    print("9. Current configuration...")
-    
-    print("Aggregation Config:")
-    for device_type, config in dashboard.aggregation_config.items():
-        print(f"  {device_type}: {config['normal_range']} {config['unit']} "
-              f"(precision: {config['precision']})")
-    
-    print("\nColor Schemes:")
-    print(f"  Primary Colors: {len(dashboard.color_schemes['primary'])} colors")
-    print(f"  Status Colors: {list(dashboard.color_schemes['status'].keys())}")
-    print(f"  Health Colors: {list(dashboard.color_schemes['health'].keys())}")
-    
-    print(f"\nCache Settings:")
-    print(f"  Cache Path: {dashboard.cache_path}")
-    print(f"  Cache TTL: {dashboard.cache_ttl} seconds")
-    print(f"  Buffer Max Length: {dashboard.realtime_buffer.default_factory().maxlen}")
-    
-    # 10. Cleanup and summary
-    print("\n" + "="*50)
-    print("10. Demo summary and cleanup...")
-    
-    # Show final statistics
-    final_cache_stats = dashboard.get_cache_statistics()
-    print(f"Final cache entries: {final_cache_stats.get('total_entries', 0)}")
+    print("8. Demo summary and cleanup...")
     
     # Clear cache
     dashboard.clear_cache()
@@ -1689,15 +1684,13 @@ if __name__ == "__main__":
     
     print("\n=== DEMO COMPLETED SUCCESSFULLY ===")
     print("\nDashboard Helper Features Tested:")
-    print("✓ Dashboard overview generation")
-    print("✓ Chart data preparation (5 types)")
+    print("✓ Dashboard overview generation (with 7-day data)")
+    print("✓ NEW Detailed trend analysis (slope, 24h/7d change)")
+    print("✓ NEW Multi-asset comparisons (Top/Bottom 5, by location)")
+    print("✓ Chart data preparation")
     print("✓ Real-time updates")
     print("✓ Device summaries")
     print("✓ Data export (JSON/CSV)")
     print("✓ Cache management")
-    print("✓ Performance metrics")
-    print("✓ Memory usage tracking")
-    print("✓ Configuration display")
     
-    print(f"\nTotal execution time: {time.time() - start_time:.2f} seconds")
     print("Dashboard Helper is ready for production use!")

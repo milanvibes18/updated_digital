@@ -23,12 +23,54 @@ from sklearn.manifold import TSNE
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.feature_selection import mutual_info_regression
+from sklearn.ensemble import IsolationForest
 
 # Time series analysis
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import acf, pacf, adfuller
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.stats.diagnostic import acorr_ljungbox
+
+# --- Aggregation Helper Functions for Feature Extraction ---
+
+def _pa_agg_slope(series):
+    """(Helper) Calculate linear trend slope."""
+    if len(series) < 2:
+        return 0.0
+    try:
+        series = series.dropna()
+        if len(series) < 2:
+            return 0.0
+        x = np.arange(len(series))
+        coeffs = np.polyfit(x, series.values, 1)
+        return float(coeffs[0])
+    except (np.linalg.LinAlgError, ValueError):
+        return 0.0
+
+def _pa_agg_autocorr(series):
+    """(Helper) Calculate lag-1 autocorrelation."""
+    if len(series) < 2:
+        return 0.0
+    val = series.dropna().autocorr(lag=1)
+    return float(val) if pd.notna(val) else 0.0
+
+def _pa_agg_cv(series):
+    """(Helper) Calculate coefficient of variation."""
+    mean = series.mean()
+    std = series.std()
+    if pd.isna(mean) or pd.isna(std) or mean == 0:
+        return 0.0
+    return float(std / mean)
+
+def _pa_agg_entropy(series):
+    """(Helper) Calculate entropy of a categorical series."""
+    if series.empty:
+        return 0.0
+    probs = series.dropna().value_counts(normalize=True)
+    return float(stats.entropy(probs))
+
+# --- End Helper Functions ---
+
 
 class PatternAnalyzer:
     """
@@ -38,6 +80,12 @@ class PatternAnalyzer:
     """
     
     def __init__(self, cache_path="ANALYTICS/analysis_cache/"):
+        """
+        Initialize the PatternAnalyzer.
+
+        Args:
+            cache_path (str): Path to store cache files and patterns.
+        """
         self.cache_path = Path(cache_path)
         self.logger = self._setup_logging()
         
@@ -80,7 +128,7 @@ class PatternAnalyzer:
         
         # Load existing patterns
         self._load_pattern_templates()
-        
+    
     def _setup_logging(self):
         """Setup logging for pattern analyzer."""
         logger = logging.getLogger('PatternAnalyzer')
@@ -123,8 +171,8 @@ class PatternAnalyzer:
             self.logger.error(f"Failed to save pattern templates: {e}")
     
     def analyze_temporal_patterns(self, data: pd.DataFrame, 
-                                 timestamp_col: str = 'timestamp',
-                                 value_cols: List[str] = None) -> Dict:
+                                  timestamp_col: str = 'timestamp',
+                                  value_cols: List[str] = None) -> Dict:
         """
         Analyze temporal patterns in time series data.
         
@@ -193,6 +241,7 @@ class PatternAnalyzer:
             
             # Store results
             self.detected_patterns['temporal'] = results
+            self.pattern_history.append(('temporal_analysis', datetime.now().isoformat()))
             
             self.logger.info("Temporal pattern analysis completed")
             return results
@@ -206,6 +255,9 @@ class PatternAnalyzer:
         try:
             # Calculate autocorrelation
             max_lag = min(len(series) // 4, 100)
+            if max_lag < 1:
+                return {'cycles_detected': 0, 'cycles': []}
+                
             autocorr = acf(series.values, nlags=max_lag, fft=True)
             
             # Find peaks in autocorrelation
@@ -313,7 +365,7 @@ class PatternAnalyzer:
                     coeffs = np.polyfit(x, series.values, degree)
                     poly_fit = np.polyval(coeffs, x)
                     r_squared = 1 - (np.sum((series.values - poly_fit) ** 2) / 
-                                   np.sum((series.values - np.mean(series.values)) ** 2))
+                                     np.sum((series.values - np.mean(series.values)) ** 2))
                     
                     poly_trends[f'degree_{degree}'] = {
                         'coefficients': coeffs.tolist(),
@@ -347,6 +399,9 @@ class PatternAnalyzer:
         try:
             # Simple approach using moving windows
             window_size = max(10, len(series) // 20)
+            if len(series) < 2 * window_size:
+                 return {'change_points_detected': 0, 'change_points': []}
+                 
             trends = []
             
             for i in range(window_size, len(series) - window_size):
@@ -396,6 +451,9 @@ class PatternAnalyzer:
             min_length = self.config['temporal_patterns']['min_pattern_length']
             max_length = min(self.config['temporal_patterns']['max_pattern_length'], len(series) // 4)
             
+            if min_length > max_length:
+                 return {'recurring_patterns_found': 0, 'patterns': []}
+
             recurring_patterns = []
             
             # Normalize series for pattern matching
@@ -453,6 +511,9 @@ class PatternAnalyzer:
             
             # Get positive frequencies only
             positive_freq_idx = frequencies > 0
+            if not np.any(positive_freq_idx):
+                return {'dominant_periods_found': 0, 'periods': []}
+
             positive_freqs = frequencies[positive_freq_idx]
             positive_magnitudes = np.abs(fft_result[positive_freq_idx])
             
@@ -494,6 +555,9 @@ class PatternAnalyzer:
             mean_val = np.mean(values)
             std_val = np.std(values)
             
+            if std_val == 0:
+                return {'mean_change_points': [], 'variance_change_points': [], 'total_change_points': 0}
+
             # Standardize
             standardized = (values - mean_val) / std_val
             
@@ -538,6 +602,9 @@ class PatternAnalyzer:
         try:
             values = series.values
             window_size = max(10, len(values) // 20)
+            if len(values) < 2 * window_size:
+                return []
+                
             change_points = []
             
             for i in range(window_size, len(values) - window_size):
@@ -573,14 +640,14 @@ class PatternAnalyzer:
             return []
     
     def analyze_spatial_patterns(self, data: pd.DataFrame, 
-                                location_cols: List[str] = None,
-                                value_cols: List[str] = None) -> Dict:
+                                 location_cols: List[str] = None,
+                                 value_cols: List[str] = None) -> Dict:
         """
         Analyze spatial patterns in data.
-        
+
         Args:
             data: DataFrame with spatial data
-            location_cols: Columns containing location information
+            location_cols: Columns containing location information (e.g., ['x', 'y'])
             value_cols: Value columns to analyze spatially
             
         Returns:
@@ -589,24 +656,372 @@ class PatternAnalyzer:
         try:
             self.logger.info("Starting spatial pattern analysis")
             
-            # Prepare data
             df = data.copy()
             
+            # Auto-detect location columns if not provided
             if location_cols is None:
                 location_cols = [col for col in df.columns if any(
                     keyword in col.lower() for keyword in ['lat', 'lon', 'x', 'y', 'location']
                 )]
+            
+            # Auto-detect value columns if not provided
+            if value_cols is None:
+                value_cols = [col for col in df.select_dtypes(include=[np.number]).columns 
+                              if col not in location_cols]
+
+            if not location_cols or len(location_cols) < 2:
+                self.logger.warning("Insufficient location columns for spatial analysis.")
+                return {'analysis_timestamp': datetime.now().isoformat(), 'spatial_patterns': {}}
+            
+            # Ensure data is numeric and clean
+            spatial_data = df[location_cols + value_cols].dropna()
+            
+            if len(spatial_data) < self.config['spatial_patterns']['min_samples']:
+                self.logger.warning("Insufficient data for spatial analysis after cleaning.")
+                return {'analysis_timestamp': datetime.now().isoformat(), 'spatial_patterns': {}}
+
+            results = {
+                'analysis_timestamp': datetime.now().isoformat(),
+                'analyzed_location_cols': location_cols,
+                'analyzed_value_cols': value_cols,
+                'spatial_patterns': {}
+            }
+
+            # 1. Spatial Clustering (DBSCAN)
+            clustering_results = {}
+            try:
+                coords = spatial_data[location_cols].values
+                coords_scaled = StandardScaler().fit_transform(coords)
+                
+                dbscan = DBSCAN(
+                    eps=self.config['spatial_patterns']['clustering_eps'],
+                    min_samples=self.config['spatial_patterns']['min_samples']
+                )
+                clusters = dbscan.fit_predict(coords_scaled)
+                
+                n_clusters = len(set(clusters)) - (1 if -1 in clusters else 0)
+                n_noise = np.sum(clusters == -1)
+                
+                spatial_data['cluster'] = clusters
+                
+                cluster_summary = {}
+                for c in range(n_clusters):
+                    cluster_data = spatial_data[spatial_data['cluster'] == c]
+                    cluster_summary[f'cluster_{c}'] = {
+                        'size': len(cluster_data),
+                        'center': cluster_data[location_cols].mean().to_dict(),
+                        'value_means': cluster_data[value_cols].mean().to_dict()
+                    }
+
+                clustering_results = {
+                    'n_clusters': n_clusters,
+                    'n_noise_points': int(n_noise),
+                    'cluster_summary': cluster_summary,
+                    'silhouette_score': float(silhouette_score(coords_scaled, clusters)) if n_clusters > 1 else 0.0
+                }
+            except Exception as e:
+                self.logger.error(f"Spatial clustering error: {e}")
+                clustering_results = {'error': str(e)}
+
+            results['spatial_patterns']['clustering'] = clustering_results
+
+            # 2. Spatial Correlation (based on values)
+            correlation_results = {}
+            try:
+                corr_matrix = spatial_data[value_cols].corr()
+                
+                # Find strong correlations
+                strong_correlations = []
+                for i in range(len(corr_matrix.columns)):
+                    for j in range(i + 1, len(corr_matrix.columns)):
+                        col1 = corr_matrix.columns[i]
+                        col2 = corr_matrix.columns[j]
+                        corr_val = corr_matrix.iloc[i, j]
+                        
+                        if abs(corr_val) > self.config['spatial_patterns']['correlation_threshold']:
+                            strong_correlations.append({
+                                'variable_1': col1,
+                                'variable_2': col2,
+                                'correlation': float(corr_val),
+                                'type': 'positive' if corr_val > 0 else 'negative'
+                            })
+                
+                correlation_results = {
+                    'correlation_matrix': corr_matrix.to_dict(),
+                    'strong_correlations': strong_correlations
+                }
+            except Exception as e:
+                self.logger.error(f"Spatial correlation error: {e}")
+                correlation_results = {'error': str(e)}
+            
+            results['spatial_patterns']['correlation'] = correlation_results
+            
+            self.detected_patterns['spatial'] = results
+            self.pattern_history.append(('spatial_analysis', datetime.now().isoformat()))
+            self.logger.info("Spatial pattern analysis completed")
+            return results
+
         except Exception as e:
             self.logger.error(f"Error in spatial pattern analysis: {e}")
+            return {'analysis_timestamp': datetime.now().isoformat(), 'spatial_patterns': {}, 'error': str(e)}
+
+    def analyze_behavioral_patterns(self, data: pd.DataFrame, 
+                                    entity_col: str,
+                                    behavior_cols: List[str],
+                                    timestamp_col: str) -> Dict:
+        """
+        Analyze behavioral patterns of different entities.
+
+        Args:
+            data: DataFrame with behavioral data
+            entity_col: Column name identifying the entity (e.g., 'device_id')
+            behavior_cols: Columns representing behaviors (e.g., ['usage', 'temp'])
+            timestamp_col: Column name for timestamps
+            
+        Returns:
+            Dictionary containing behavioral pattern analysis results
+        """
+        try:
+            self.logger.info("Starting behavioral pattern analysis")
+            df = data.copy()
+
+            if entity_col not in df.columns:
+                self.logger.error(f"Entity column '{entity_col}' not found in data.")
+                return {}
+            
+            results = {
+                'analysis_timestamp': datetime.now().isoformat(),
+                'analyzed_entity_col': entity_col,
+                'analyzed_behavior_cols': behavior_cols,
+                'total_entities': int(df[entity_col].nunique()),
+                'behavioral_patterns': {}
+            }
+
+            # 1. Create aggregated behavioral features for clustering
+            features_df = self._create_behavioral_features(df, entity_col, behavior_cols)
+            
+            if features_df.empty:
+                 self.logger.warning("No behavioral features could be created.")
+                 return results
+            
+            feature_cols = [col for col in features_df.columns if col != entity_col]
+            features_scaled = StandardScaler().fit_transform(features_df[feature_cols])
+
+            # 2. Entity Clustering (KMeans)
+            try:
+                n_clusters = self._find_optimal_clusters_behavioral(features_scaled)
+                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+                clusters = kmeans.fit_predict(features_scaled)
+                
+                features_df['cluster'] = clusters
+                
+                cluster_summaries = {}
+                for c in range(n_clusters):
+                    cluster_data = features_df[features_df['cluster'] == c]
+                    cluster_summaries[f'cluster_{c}'] = {
+                        'size': len(cluster_data),
+                        'entities': cluster_data[entity_col].tolist(),
+                        'behavior_summary': self._summarize_cluster_behavior(cluster_data, behavior_cols)
+                    }
+                
+                results['behavioral_patterns']['entity_clustering'] = {
+                    'n_clusters': n_clusters,
+                    'cluster_summaries': cluster_summaries,
+                    'silhouette_score': float(silhouette_score(features_scaled, clusters)) if n_clusters > 1 else 0.0
+                }
+            except Exception as e:
+                self.logger.error(f"Behavioral clustering error: {e}")
+                results['behavioral_patterns']['entity_clustering'] = {'error': str(e)}
+
+            # 3. Behavioral Sequence Analysis
+            try:
+                sequence_results = self._analyze_behavioral_sequences(
+                    df, entity_col, behavior_cols, timestamp_col
+                )
+                results['behavioral_patterns']['sequences'] = sequence_results
+            except Exception as e:
+                self.logger.error(f"Behavioral sequence analysis error: {e}")
+                results['behavioral_patterns']['sequences'] = {'error': str(e)}
+
+            # 4. Anomalous Behavior Detection
+            try:
+                anomaly_results = self._detect_anomalous_behavior(
+                    features_df.drop(columns=['cluster'], errors='ignore'), entity_col, feature_cols
+                )
+                results['behavioral_patterns']['anomalies'] = anomaly_results
+            except Exception as e:
+                self.logger.error(f"Anomalous behavior detection error: {e}")
+                results['behavioral_patterns']['anomalies'] = {'error': str(e)}
+
+            # 5. State Transition Analysis
+            try:
+                transition_results = self._analyze_state_transitions(
+                    df, entity_col, behavior_cols, timestamp_col
+                )
+                results['behavioral_patterns']['state_transitions'] = transition_results
+            except Exception as e:
+                self.logger.error(f"State transition analysis error: {e}")
+                results['behavioral_patterns']['state_transitions'] = {'error': str(e)}
+
+            # 6. Collective Behavior Analysis
+            try:
+                collective_results = self._analyze_collective_behavior(
+                    df, entity_col, behavior_cols
+                )
+                results['behavioral_patterns']['collective_behavior'] = collective_results
+            except Exception as e:
+                self.logger.error(f"Collective behavior analysis error: {e}")
+                results['behavioral_patterns']['collective_behavior'] = {'error': str(e)}
+
+            self.detected_patterns['behavioral'] = results
+            self.pattern_history.append(('behavioral_analysis', datetime.now().isoformat()))
+            self.logger.info("Behavioral pattern analysis completed")
+            return results
+
+        except Exception as e:
+            self.logger.error(f"Error in behavioral pattern analysis: {e}")
+            return {'analysis_timestamp': datetime.now().isoformat(), 'behavioral_patterns': {}, 'error': str(e)}
+
+    def _create_behavioral_features(self, data: pd.DataFrame, 
+                                    entity_col: str, 
+                                    behavior_cols: List[str]) -> pd.DataFrame:
+        """
+        Create aggregated behavioral features for each entity.
+        (Improved version with temporal and categorical features)
+
+        Args:
+            data: The input DataFrame.
+            entity_col: The column identifying entities.
+            behavior_cols: The columns representing behaviors.
+
+        Returns:
+            A DataFrame where each row is an entity and columns are aggregated features.
+        """
+        try:
+            self.logger.info("Creating improved behavioral features")
+            df = data.copy()
+            
+            # Separate numeric and categorical columns
+            numeric_cols = []
+            categorical_cols = []
+            
+            for col in behavior_cols:
+                if col not in df.columns:
+                    continue
+                # Exclude boolean from numeric, treat as categorical
+                if pd.api.types.is_numeric_dtype(df[col]) and not pd.api.types.is_bool_dtype(df[col]):
+                    numeric_cols.append(col)
+                else:
+                    # Treat boolean, object, category types as categorical
+                    categorical_cols.append(col)
+            
+            if not numeric_cols and not categorical_cols:
+                self.logger.warning("No valid behavior columns found for feature creation.")
+                return pd.DataFrame()
+
+            all_features = []
+
+            # --- 1. Process Numeric Features ---
+            if numeric_cols:
+                self.logger.info(f"Processing numeric features: {numeric_cols}")
+                # Define aggregations
+                numeric_aggregations = {
+                    'mean': 'mean',
+                    'std': 'std',
+                    'median': 'median',
+                    'min': 'min',
+                    'max': 'max',
+                    'q25': lambda x: x.quantile(0.25),
+                    'q75': lambda x: x.quantile(0.75),
+                    'skew': 'skew',
+                    'kurt': 'kurtosis',
+                    'cv': _pa_agg_cv,
+                    'slope': _pa_agg_slope,
+                    'autocorr_lag1': _pa_agg_autocorr
+                }
+                
+                # Build the full aggregation dictionary
+                full_numeric_agg = {}
+                for col in numeric_cols:
+                    full_numeric_agg[col] = list(numeric_aggregations.values())
+                
+                numeric_features_df = df.groupby(entity_col).agg(full_numeric_agg)
+                
+                # Flatten multi-index columns
+                numeric_features_df.columns = ['_'.join(col).strip() for col in numeric_features_df.columns.values]
+                all_features.append(numeric_features_df)
+
+            # --- 2. Process Categorical Features ---
+            if categorical_cols:
+                self.logger.info(f"Processing categorical features: {categorical_cols}")
+                cat_aggregations = {
+                    'nunique': 'nunique',
+                    'top': lambda x: x.mode()[0] if not x.empty and not x.mode().empty else None,
+                    'entropy': _pa_agg_entropy
+                }
+                
+                full_cat_agg = {}
+                for col in categorical_cols:
+                    full_cat_agg[col] = list(cat_aggregations.values())
+                    
+                categorical_features_df = df.groupby(entity_col).agg(full_cat_agg)
+                categorical_features_df.columns = ['_'.join(col).strip() for col in categorical_features_df.columns.values]
+                
+                # One-hot encode the 'top' (mode) feature
+                dfs_to_concat = [categorical_features_df]
+                cols_to_drop = []
+                for col in categorical_cols:
+                    top_col = f"{col}_top"
+                    if top_col in categorical_features_df.columns:
+                        # pd.get_dummies handles NaNs (from empty groups)
+                        top_dummies = pd.get_dummies(categorical_features_df[top_col], prefix=top_col, dummy_na=True)
+                        dfs_to_concat.append(top_dummies)
+                        cols_to_drop.append(top_col)
+                
+                # Drop the original 'top' columns
+                categorical_features_df = categorical_features_df.drop(columns=cols_to_drop)
+                dfs_to_concat[0] = categorical_features_df # Update the base df
+                
+                all_features.append(pd.concat(dfs_to_concat, axis=1))
+
+            # --- 3. Combine Features ---
+            if not all_features:
+                return pd.DataFrame() # Should be covered, but as a safeguard
+                
+            features_df = pd.concat(all_features, axis=1)
+            
+            # Handle potential NaNs (e.g., from std on 1 record, or empty groups)
+            features_df = features_df.fillna(0)
+            
+            features_df.reset_index(inplace=True)
+            
+            self.logger.info(f"Created {len(features_df.columns) - 1} features for {len(features_df)} entities.")
+            return features_df
+
+        except Exception as e:
+            self.logger.error(f"Improved behavioral feature creation error: {e}")
+            return pd.DataFrame()
 
     def _find_optimal_clusters_behavioral(self, data: np.ndarray, max_k: int = 8) -> int:
-        """Find optimal number of clusters for behavioral data."""
+        """
+        Find optimal number of clusters for behavioral data using the Elbow method.
+
+        Args:
+            data: Scaled feature data for clustering.
+            max_k: Maximum number of clusters to test.
+
+        Returns:
+            Optimal number of clusters (k).
+        """
         try:
             if len(data) <= 3:
                 return min(2, len(data))
             
             inertias = []
             k_range = range(2, min(max_k + 1, len(data)))
+            
+            if not k_range:
+                return 2
             
             for k in k_range:
                 kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
@@ -617,11 +1032,11 @@ class PatternAnalyzer:
                 # Calculate rate of change
                 deltas = np.diff(inertias)
                 
-                # Find elbow (point of maximum change)
+                # Find elbow (point of maximum change in rate)
                 if len(deltas) >= 2:
                     delta_deltas = np.diff(deltas)
-                    elbow_idx = np.argmax(np.abs(delta_deltas)) + 2
-                    return min(elbow_idx, max_k)
+                    elbow_idx = np.argmax(np.abs(delta_deltas)) + 2 # +2 to account for diffs and 0-index
+                    return min(elbow_idx + 1, max_k) # +1 to align with k_range
             
             return min(3, len(data))
             
@@ -630,22 +1045,53 @@ class PatternAnalyzer:
             return 3
     
     def _summarize_cluster_behavior(self, cluster_data: pd.DataFrame, behavior_cols: List[str]) -> Dict:
-        """Summarize behavioral characteristics of a cluster."""
+        """
+        Summarize behavioral characteristics of a cluster.
+        (Improved to handle new features)
+
+        Args:
+            cluster_data: DataFrame containing feature data for a single cluster.
+            behavior_cols: List of base behavior column names (e.g., 'temperature').
+
+        Returns:
+            A dictionary summarizing the statistics for each behavior in the cluster.
+        """
         try:
             summary = {}
             
             for col in behavior_cols:
-                mean_cols = [c for c in cluster_data.columns if c.startswith(f"{col}_")]
+                # Find all feature columns derived from this base behavior
+                metric_cols = [c for c in cluster_data.columns if c.startswith(f"{col}_")]
                 
-                if mean_cols:
+                if metric_cols:
                     col_summary = {}
-                    for metric_col in mean_cols:
-                        metric = metric_col.split('_')[-1]  # Extract metric (mean, std, etc.)
-                        col_summary[metric] = {
+                    for metric_col in metric_cols:
+                        # Skip one-hot-encoded 'top' features, as their mean is just a proportion
+                        if '_top_' in metric_col: 
+                            continue
+                            
+                        # Extract metric (e.g., mean, std, slope)
+                        metric_name = metric_col[len(col)+1:] 
+                        
+                        if metric_col not in cluster_data.columns:
+                            continue
+
+                        col_summary[metric_name] = {
                             'mean': float(cluster_data[metric_col].mean()),
                             'std': float(cluster_data[metric_col].std()),
                             'median': float(cluster_data[metric_col].median())
                         }
+                    
+                    # Add proportion for one-hot-encoded 'top' features
+                    top_cols = [c for c in metric_cols if '_top_' in c]
+                    if top_cols:
+                        # Calculate mean proportion for each 'top' feature
+                        top_proportions = cluster_data[top_cols].mean()
+                        # Filter out proportions that are 0 (not relevant)
+                        relevant_proportions = top_proportions[top_proportions > 0].to_dict()
+                        if relevant_proportions:
+                            col_summary['top_proportions'] = relevant_proportions
+
                     summary[col] = col_summary
             
             return summary
@@ -655,10 +1101,21 @@ class PatternAnalyzer:
             return {}
     
     def _analyze_behavioral_sequences(self, data: pd.DataFrame, 
-                                    entity_col: str, 
-                                    behavior_cols: List[str], 
-                                    timestamp_col: str) -> Dict:
-        """Analyze behavioral sequences over time."""
+                                      entity_col: str, 
+                                      behavior_cols: List[str], 
+                                      timestamp_col: str) -> Dict:
+        """
+        Analyze behavioral sequences over time for entities.
+
+        Args:
+            data: The input DataFrame.
+            entity_col: The column identifying entities.
+            behavior_cols: The columns representing behaviors.
+            timestamp_col: The timestamp column.
+
+        Returns:
+            A dictionary with individual and global sequence patterns.
+        """
         try:
             df = data.copy()
             df[timestamp_col] = pd.to_datetime(df[timestamp_col])
@@ -676,17 +1133,25 @@ class PatternAnalyzer:
                 # Create behavioral states based on quantiles
                 entity_sequences = {}
                 for col in behavior_cols:
-                    if col not in entity_data.columns:
+                    if col not in entity_data.columns or not pd.api.types.is_numeric_dtype(entity_data[col]):
                         continue
                     
-                    values = entity_data[col]
+                    values = entity_data[col].dropna()
+                    if values.empty:
+                        continue
                     
                     # Create discrete states based on quartiles
-                    quartiles = values.quantile([0.25, 0.5, 0.75])
+                    try:
+                        quartiles = values.quantile([0.25, 0.5, 0.75])
+                    except ValueError:
+                        continue # Handle case with all equal values
+                        
                     states = []
                     
                     for val in values:
-                        if val <= quartiles[0.25]:
+                        if pd.isna(val):
+                            states.append('nan')
+                        elif val <= quartiles[0.25]:
                             states.append('low')
                         elif val <= quartiles[0.5]:
                             states.append('medium_low')
@@ -697,6 +1162,9 @@ class PatternAnalyzer:
                     
                     entity_sequences[col] = states
                 
+                if not entity_sequences:
+                    continue
+
                 # Find common subsequences
                 common_subsequences = self._find_common_subsequences(entity_sequences)
                 
@@ -704,7 +1172,7 @@ class PatternAnalyzer:
                     sequence_patterns[str(entity_id)] = {
                         'sequence_length': len(entity_data),
                         'common_patterns': common_subsequences[:5],  # Top 5 patterns
-                        'behavioral_states': entity_sequences
+                        'behavioral_states': {k: v[:50] for k, v in entity_sequences.items()} # Truncate for readability
                     }
             
             # Find global patterns across all entities
@@ -721,7 +1189,15 @@ class PatternAnalyzer:
             return {}
     
     def _find_common_subsequences(self, sequences: Dict[str, List[str]]) -> List[Dict]:
-        """Find common subsequences in behavioral states."""
+        """
+        Find common subsequences in behavioral states.
+
+        Args:
+            sequences: A dictionary mapping behavior columns to their state sequences.
+
+        Returns:
+            A list of common patterns found.
+        """
         try:
             if not sequences:
                 return []
@@ -733,6 +1209,9 @@ class PatternAnalyzer:
             pattern_counts = defaultdict(int)
             min_length = 3
             max_length = min(10, len(states) // 2)
+
+            if min_length > max_length:
+                return []
             
             # Extract all subsequences
             for length in range(min_length, max_length + 1):
@@ -760,7 +1239,15 @@ class PatternAnalyzer:
             return []
     
     def _find_global_sequence_patterns(self, sequence_patterns: Dict) -> Dict:
-        """Find patterns that occur across multiple entities."""
+        """
+        Find patterns that occur across multiple entities.
+
+        Args:
+            sequence_patterns: The dictionary of patterns found per entity.
+
+        Returns:
+            A dictionary of global patterns.
+        """
         try:
             if not sequence_patterns:
                 return {}
@@ -799,12 +1286,22 @@ class PatternAnalyzer:
             return {}
     
     def _detect_anomalous_behavior(self, data: pd.DataFrame, 
-                                  entity_col: str, 
-                                  behavior_cols: List[str]) -> Dict:
-        """Detect anomalous behavioral patterns."""
+                                   entity_col: str, 
+                                   behavior_cols: List[str]) -> Dict:
+        """
+        Detect anomalous behavioral patterns among entities.
+
+        Args:
+            data: DataFrame of aggregated entity features.
+            entity_col: The column identifying entities.
+            behavior_cols: The feature columns to use for anomaly detection.
+
+        Returns:
+            A dictionary of anomaly detection results.
+        """
         try:
             # Create entity profiles
-            entity_profiles = data.groupby(entity_col)[behavior_cols].mean().fillna(0)
+            entity_profiles = data.set_index(entity_col)[behavior_cols].fillna(0)
             
             if len(entity_profiles) < 5:
                 return {'anomaly_detection': False, 'reason': 'Insufficient data'}
@@ -814,10 +1311,8 @@ class PatternAnalyzer:
             profiles_scaled = scaler.fit_transform(entity_profiles)
             
             # Use Isolation Forest for anomaly detection
-            from sklearn.ensemble import IsolationForest
-            
             isolation_forest = IsolationForest(
-                contamination=0.1,
+                contamination=self.config['anomaly_patterns']['isolation_contamination'],
                 random_state=42
             )
             
@@ -845,7 +1340,7 @@ class PatternAnalyzer:
                 'anomalous_entities': anomalous_entities,
                 'anomaly_rate': len(anomalous_entities) / len(entity_profiles),
                 'detection_parameters': {
-                    'contamination': 0.1,
+                    'contamination': self.config['anomaly_patterns']['isolation_contamination'],
                     'total_entities': len(entity_profiles)
                 }
             }
@@ -855,7 +1350,16 @@ class PatternAnalyzer:
             return {'anomaly_detection': False, 'reason': str(e)}
     
     def _analyze_behavioral_deviation(self, entity_profile: pd.Series, all_profiles: pd.DataFrame) -> Dict:
-        """Analyze how an entity's behavior deviates from the norm."""
+        """
+        Analyze how an entity's behavior deviates from the norm.
+
+        Args:
+            entity_profile: The feature Series for the anomalous entity.
+            all_profiles: The DataFrame of features for all entities.
+
+        Returns:
+            A dictionary analyzing the deviation for each feature.
+        """
         try:
             deviations = {}
             
@@ -881,10 +1385,21 @@ class PatternAnalyzer:
             return {}
     
     def _analyze_state_transitions(self, data: pd.DataFrame, 
-                                  entity_col: str, 
-                                  behavior_cols: List[str], 
-                                  timestamp_col: str) -> Dict:
-        """Analyze state transitions in behavioral data."""
+                                   entity_col: str, 
+                                   behavior_cols: List[str], 
+                                   timestamp_col: str) -> Dict:
+        """
+        Analyze state transitions in behavioral data.
+
+        Args:
+            data: The input DataFrame.
+            entity_col: The column identifying entities.
+            behavior_cols: The columns representing behaviors.
+            timestamp_col: The timestamp column.
+
+        Returns:
+            A dictionary of transition matrices and insights.
+        """
         try:
             df = data.copy()
             df[timestamp_col] = pd.to_datetime(df[timestamp_col])
@@ -893,12 +1408,22 @@ class PatternAnalyzer:
             transition_analysis = {}
             
             for col in behavior_cols:
-                if col not in df.columns:
+                if col not in df.columns or not pd.api.types.is_numeric_dtype(df[col]):
                     continue
                 
+                # *** BUG FIX ***: Initialize transition counter for each column
+                entity_transitions = defaultdict(lambda: defaultdict(int))
+                
                 # Create behavioral states
-                values = df[col]
-                quartiles = values.quantile([0.33, 0.67])
+                values = df[col].dropna()
+                if values.empty:
+                    continue
+
+                try:
+                    quartiles = values.quantile([0.33, 0.67])
+                except ValueError:
+                    continue # Handle case with all equal values
+
                 
                 df[f'{col}_state'] = pd.cut(
                     df[col], 
@@ -927,7 +1452,9 @@ class PatternAnalyzer:
                 transition_matrix = {}
                 for from_state in ['low', 'medium', 'high']:
                     transition_matrix[from_state] = {}
-                    total_transitions = sum(entity_transitions[from_state].values()) or 1
+                    total_transitions = sum(entity_transitions[from_state].values())
+                    if total_transitions == 0:
+                        total_transitions = 1 # Avoid division by zero
                     
                     for to_state in ['low', 'medium', 'high']:
                         count = entity_transitions[from_state][to_state]
@@ -950,7 +1477,15 @@ class PatternAnalyzer:
             return {}
     
     def _find_most_common_transitions(self, transition_matrix: Dict) -> List[Dict]:
-        """Find most common state transitions."""
+        """
+        Find most common state transitions (excluding self-transitions).
+
+        Args:
+            transition_matrix: The calculated transition matrix.
+
+        Returns:
+            A list of the most common transitions.
+        """
         try:
             transitions = []
             
@@ -974,7 +1509,15 @@ class PatternAnalyzer:
             return []
     
     def _calculate_state_stability(self, transition_matrix: Dict) -> Dict:
-        """Calculate stability of each state."""
+        """
+        Calculate stability of each state (self-transition probability).
+
+        Args:
+            transition_matrix: The calculated transition matrix.
+
+        Returns:
+            A dictionary of state stabilities.
+        """
         try:
             stability = {}
             
@@ -993,14 +1536,24 @@ class PatternAnalyzer:
             return {}
     
     def _analyze_collective_behavior(self, data: pd.DataFrame, 
-                                   entity_col: str, 
-                                   behavior_cols: List[str]) -> Dict:
-        """Analyze collective behavioral patterns across entities."""
+                                    entity_col: str, 
+                                    behavior_cols: List[str]) -> Dict:
+        """
+        Analyze collective behavioral patterns across all entities.
+
+        Args:
+            data: The input DataFrame.
+            entity_col: The column identifying entities.
+            behavior_cols: The columns representing behaviors.
+
+        Returns:
+            A dictionary of collective statistics.
+        """
         try:
             collective_stats = {}
             
             for col in behavior_cols:
-                if col not in data.columns:
+                if col not in data.columns or not pd.api.types.is_numeric_dtype(data[col]):
                     continue
                 
                 # Overall distribution analysis
@@ -1023,7 +1576,10 @@ class PatternAnalyzer:
                 collective_stats[col]['distribution_shape'] = self._analyze_distribution_shape(values)
                 
                 # Identify collective trends
-                entity_means = data.groupby(entity_col)[col].mean()
+                entity_means = data.groupby(entity_col)[col].mean().dropna()
+                if entity_means.empty:
+                    continue
+
                 collective_stats[col]['entity_diversity'] = {
                     'entity_count': len(entity_means),
                     'mean_variation': float(entity_means.std()),
@@ -1039,7 +1595,15 @@ class PatternAnalyzer:
             return {}
     
     def _analyze_distribution_shape(self, values: pd.Series) -> Dict:
-        """Analyze the shape of a distribution."""
+        """
+        Analyze the shape of a distribution using skewness and kurtosis.
+
+        Args:
+            values: A pandas Series of numeric data.
+
+        Returns:
+            A dictionary interpreting the distribution shape.
+        """
         try:
             skewness = values.skew()
             kurtosis = values.kurtosis()
@@ -1052,20 +1616,20 @@ class PatternAnalyzer:
             else:
                 skew_interpretation = 'left_skewed'
             
-            # Interpret kurtosis
-            if kurtosis > 3:
-                kurtosis_interpretation = 'heavy_tailed'
+            # Interpret kurtosis (Fisher's definition, 0 is normal)
+            if kurtosis > 1:
+                kurtosis_interpretation = 'heavy_tailed (leptokurtic)'
             elif kurtosis < -1:
-                kurtosis_interpretation = 'light_tailed'
+                kurtosis_interpretation = 'light_tailed (platykurtic)'
             else:
-                kurtosis_interpretation = 'normal_tailed'
+                kurtosis_interpretation = 'normal_tailed (mesokurtic)'
             
             return {
                 'skewness': float(skewness),
                 'kurtosis': float(kurtosis),
                 'skew_interpretation': skew_interpretation,
                 'kurtosis_interpretation': kurtosis_interpretation,
-                'is_normal_like': abs(skewness) < 0.5 and -1 < kurtosis < 3
+                'is_normal_like': abs(skewness) < 0.5 and -1 < kurtosis < 1
             }
             
         except Exception as e:
@@ -1073,13 +1637,24 @@ class PatternAnalyzer:
             return {}
     
     def _find_outlier_entities(self, entity_means: pd.Series) -> List[Dict]:
-        """Find outlier entities based on their mean behavior."""
+        """
+        Find outlier entities based on their mean behavior using IQR.
+
+        Args:
+            entity_means: A Series of mean values, indexed by entity_id.
+
+        Returns:
+            A list of outlier entity details.
+        """
         try:
             # Use IQR method
             Q1 = entity_means.quantile(0.25)
             Q3 = entity_means.quantile(0.75)
             IQR = Q3 - Q1
             
+            if IQR == 0: # Avoid division by zero or no spread
+                return []
+
             lower_bound = Q1 - 1.5 * IQR
             upper_bound = Q3 + 1.5 * IQR
             
@@ -1105,7 +1680,12 @@ class PatternAnalyzer:
             return []
     
     def get_pattern_summary(self) -> Dict:
-        """Get summary of all detected patterns."""
+        """
+        Get summary of all detected patterns.
+
+        Returns:
+            A summary dictionary.
+        """
         try:
             summary = {
                 'analysis_timestamp': datetime.now().isoformat(),
@@ -1130,10 +1710,19 @@ class PatternAnalyzer:
             return {}
     
     def _count_patterns_in_analysis(self, analysis_data: Dict) -> int:
-        """Count total patterns found in an analysis."""
+        """
+        Count total patterns found in a specific analysis result.
+
+        Args:
+            analysis_data: The result dictionary from an analysis method.
+
+        Returns:
+            The total count of significant patterns found.
+        """
         try:
             count = 0
             
+            # Temporal patterns
             if 'patterns_found' in analysis_data:
                 for col_patterns in analysis_data['patterns_found'].values():
                     if isinstance(col_patterns, dict):
@@ -1146,6 +1735,17 @@ class PatternAnalyzer:
                                 if 'change_points' in pattern_category:
                                     count += pattern_category.get('change_points_detected', 0)
             
+            # Spatial patterns
+            if 'spatial_patterns' in analysis_data:
+                count += analysis_data['spatial_patterns'].get('clustering', {}).get('n_clusters', 0)
+                count += len(analysis_data['spatial_patterns'].get('correlation', {}).get('strong_correlations', []))
+
+            # Behavioral patterns
+            if 'behavioral_patterns' in analysis_data:
+                count += analysis_data['behavioral_patterns'].get('entity_clustering', {}).get('n_clusters', 0)
+                count += analysis_data['behavioral_patterns'].get('anomalies', {}).get('anomalous_entities_count', 0)
+                count += analysis_data['behavioral_patterns'].get('sequences', {}).get('individual_sequences', 0)
+
             return count
             
         except Exception as e:
@@ -1153,7 +1753,13 @@ class PatternAnalyzer:
             return 0
     
     def save_patterns_to_template(self, pattern_name: str, patterns: Dict):
-        """Save detected patterns as reusable templates."""
+        """
+        Save detected patterns as reusable templates.
+
+        Args:
+            pattern_name: A unique name for the template.
+            patterns: The pattern dictionary to save (e.g., from results['patterns_found']).
+        """
         try:
             self.pattern_templates[pattern_name] = {
                 'patterns': patterns,
@@ -1168,7 +1774,16 @@ class PatternAnalyzer:
             self.logger.error(f"Pattern template saving error: {e}")
     
     def match_against_templates(self, data: pd.DataFrame, template_name: str = None) -> Dict:
-        """Match data against existing pattern templates."""
+        """
+        Match new data against existing pattern templates.
+
+        Args:
+            data: The new DataFrame to check.
+            template_name: Specific template to match. If None, matches all.
+
+        Returns:
+            A dictionary of matching results.
+        """
         try:
             if not self.pattern_templates:
                 return {'matches': [], 'message': 'No templates available'}
@@ -1210,7 +1825,16 @@ class PatternAnalyzer:
             return {'matches': [], 'error': str(e)}
     
     def _calculate_template_match_score(self, data: pd.DataFrame, template_patterns: Dict) -> float:
-        """Calculate how well data matches a pattern template."""
+        """
+        Calculate how well data matches a pattern template (simplified).
+
+        Args:
+            data: The new DataFrame.
+            template_patterns: The patterns dictionary from a template.
+
+        Returns:
+            A match score between 0.0 and 1.0.
+        """
         try:
             # Simplified matching - compare statistical properties
             score = 0.0
@@ -1226,14 +1850,15 @@ class PatternAnalyzer:
                         data_mean = col_data.mean()
                         data_std = col_data.std()
                         
-                        template_mean = template_patterns[col].get('mean', data_mean)
-                        template_std = template_patterns[col].get('std', data_std)
+                        # Get template stats (e.g., from temporal trend)
+                        template_mean = template_patterns[col].get('trend', {}).get('linear_trend', {}).get('intercept', data_mean)
+                        template_std = data_std # Placeholder, better comparison needed
                         
                         # Calculate similarity (inverse of normalized difference)
-                        mean_diff = abs(data_mean - template_mean) / (template_mean + 1e-8)
-                        std_diff = abs(data_std - template_std) / (template_std + 1e-8)
+                        mean_diff = abs(data_mean - template_mean) / (abs(template_mean) + 1e-8)
+                        # std_diff = abs(data_std - template_std) / (template_std + 1e-8) # std comparison is tricky
                         
-                        col_similarity = 1.0 / (1.0 + mean_diff + std_diff)
+                        col_similarity = 1.0 / (1.0 + mean_diff) # Simplified
                         score += col_similarity
                         comparisons += 1
             
@@ -1244,7 +1869,16 @@ class PatternAnalyzer:
             return 0.0
     
     def _identify_matching_elements(self, data: pd.DataFrame, template_patterns: Dict) -> List[str]:
-        """Identify which elements match the template."""
+        """
+        Identify which elements (e.g., columns) match the template.
+
+        Args:
+            data: The new DataFrame.
+            template_patterns: The patterns dictionary from a template.
+
+        Returns:
+            A list of strings describing matching elements.
+        """
         try:
             matching_elements = []
             
@@ -1252,7 +1886,7 @@ class PatternAnalyzer:
             
             for col in numeric_cols:
                 if col in template_patterns:
-                    # Simple check - if column exists and has similar range
+                    # Simple check - if column exists
                     col_data = data[col].dropna()
                     if len(col_data) > 0:
                         matching_elements.append(f"Column: {col}")
@@ -1264,11 +1898,21 @@ class PatternAnalyzer:
             return []
     
     def export_patterns(self, output_path: str = None) -> str:
-        """Export detected patterns to JSON file."""
+        """
+        Export all detected patterns and templates to a JSON file.
+
+        Args:
+            output_path: Optional path to save the file.
+
+        Returns:
+            The final path of the exported file.
+        """
         try:
             if output_path is None:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 output_path = self.cache_path / f"pattern_export_{timestamp}.json"
+            else:
+                output_path = Path(output_path)
             
             export_data = {
                 'export_timestamp': datetime.now().isoformat(),
@@ -1288,8 +1932,18 @@ class PatternAnalyzer:
             raise
     
     def import_patterns(self, input_path: str):
-        """Import patterns from JSON file."""
+        """
+        Import patterns and templates from a JSON file.
+
+        Args:
+            input_path: The path to the JSON file to import.
+        """
         try:
+            input_path = Path(input_path)
+            if not input_path.exists():
+                self.logger.error(f"Import file not found: {input_path}")
+                return
+
             with open(input_path, 'r') as f:
                 import_data = json.load(f)
             
@@ -1301,10 +1955,8 @@ class PatternAnalyzer:
                 self.pattern_templates.update(import_data['pattern_templates'])
             
             if 'configuration' in import_data:
-                # Merge configuration (keep existing values as priority)
-                for key, value in import_data['configuration'].items():
-                    if key not in self.config:
-                        self.config[key] = value
+                # Merge configuration (imported values override existing ones)
+                self.config.update(import_data['configuration'])
             
             self.logger.info(f"Patterns imported from {input_path}")
             
@@ -1313,30 +1965,32 @@ class PatternAnalyzer:
             raise
     
     def clear_pattern_cache(self):
-        """Clear pattern analysis cache."""
+        """Clear all in-memory detected patterns and history."""
         try:
             self.detected_patterns.clear()
             self.pattern_history.clear()
             
-            # Clear cache files
-            cache_files = list(self.cache_path.glob("*.cache"))
-            for cache_file in cache_files:
-                cache_file.unlink()
+            # Note: This does not clear saved template files, only in-memory state.
             
-            self.logger.info("Pattern cache cleared")
+            self.logger.info("In-memory pattern cache cleared")
             
         except Exception as e:
             self.logger.error(f"Pattern cache clear error: {e}")
     
     def get_pattern_statistics(self) -> Dict:
-        """Get comprehensive statistics about pattern analysis."""
+        """
+        Get comprehensive statistics about pattern analysis.
+
+        Returns:
+            A dictionary of statistics.
+        """
         try:
             stats = {
                 'analysis_summary': {
                     'total_analyses_performed': len(self.detected_patterns),
                     'pattern_types_analyzed': list(self.detected_patterns.keys()),
                     'template_count': len(self.pattern_templates),
-                    'cache_size': len(self.pattern_history)
+                    'history_length': len(self.pattern_history)
                 },
                 'configuration': self.config,
                 'recent_activity': list(self.pattern_history)[-10:] if self.pattern_history else []
@@ -1375,11 +2029,16 @@ if __name__ == "__main__":
         'temperature': 20 + 5 * np.sin(np.arange(1000) * 2 * np.pi / 24) + np.random.normal(0, 1, 1000),
         'pressure': 1013 + 2 * np.sin(np.arange(1000) * 2 * np.pi / 168) + np.random.normal(0, 2, 1000),
         'vibration': 0.1 + 0.05 * np.sin(np.arange(1000) * 2 * np.pi / 12) + np.random.exponential(0.02, 1000),
-        'location_x': np.random.uniform(0, 100, 1000),
-        'location_y': np.random.uniform(0, 100, 1000),
+        'location_x': np.random.uniform(0, 10, 1000), # Reduced range for better clustering
+        'location_y': np.random.uniform(0, 10, 1000),
         'usage_hours': np.random.uniform(0, 24, 1000),
-        'efficiency': np.random.beta(2, 2, 1000) * 100
+        'efficiency': np.random.beta(2, 2, 1000) * 100,
+        'status_code': np.random.choice(['OK', 'WARN', 'FAIL', 'OK', 'OK'], 1000) # Added categorical feature
     })
+
+    # Add some anomalies for behavioral analysis
+    sample_data.loc[sample_data['device_id'] == 'device_A', 'temperature'] *= 1.5
+    sample_data.loc[sample_data['device_id'] == 'device_B', 'efficiency'] = 10
     
     print("=== DIGITAL TWIN PATTERN ANALYSIS DEMO ===\n")
     
@@ -1391,66 +2050,83 @@ if __name__ == "__main__":
         value_cols=['temperature', 'pressure', 'vibration']
     )
     
-    print(f"   - Analyzed {len(temporal_results['analyzed_columns'])} variables")
-    for col, patterns in temporal_results['patterns_found'].items():
+    print(f"    - Analyzed {len(temporal_results['analyzed_columns'])} variables")
+    for col, patterns in temporal_results.get('patterns_found', {}).items():
         cyclical = patterns.get('cyclical', {})
         seasonal = patterns.get('seasonal', {})
-        print(f"   - {col}: {cyclical.get('cycles_detected', 0)} cycles, seasonal: {seasonal.get('seasonal', False)}")
+        print(f"    - {col}: {cyclical.get('cycles_detected', 0)} cycles, seasonal: {seasonal.get('seasonal', False)}")
     
     # 2. Spatial Pattern Analysis
     print("\n2. Analyzing spatial patterns...")
+    # Update config for demo data
+    analyzer.config['spatial_patterns']['clustering_eps'] = 1.0 
     spatial_results = analyzer.analyze_spatial_patterns(
         sample_data,
         location_cols=['location_x', 'location_y'],
         value_cols=['temperature', 'pressure', 'vibration']
     )
     
-    clustering = spatial_results['spatial_patterns'].get('clustering', {})
-    correlation = spatial_results['spatial_patterns'].get('correlation', {})
-    print(f"   - Spatial clustering: {clustering.get('n_clusters', 0)} clusters found")
-    print(f"   - Strong correlations: {len(correlation.get('strong_correlations', []))}")
+    clustering = spatial_results.get('spatial_patterns', {}).get('clustering', {})
+    correlation = spatial_results.get('spatial_patterns', {}).get('correlation', {})
+    print(f"    - Spatial clustering: {clustering.get('n_clusters', 0)} clusters found")
+    print(f"    - Strong correlations: {len(correlation.get('strong_correlations', []))}")
     
     # 3. Behavioral Pattern Analysis
     print("\n3. Analyzing behavioral patterns...")
     behavioral_results = analyzer.analyze_behavioral_patterns(
         sample_data,
         entity_col='device_id',
-        behavior_cols=['temperature', 'pressure', 'vibration', 'efficiency'],
+        behavior_cols=['temperature', 'pressure', 'vibration', 'efficiency', 'status_code'], # Include categorical
         timestamp_col='timestamp'
     )
     
-    clustering_info = behavioral_results['behavioral_patterns'].get('entity_clustering', {})
-    anomalies = behavioral_results['behavioral_patterns'].get('anomalies', {})
-    print(f"   - Entity clusters: {clustering_info.get('n_clusters', 0)}")
-    print(f"   - Anomalous entities: {anomalies.get('anomalous_entities_count', 0)}")
+    clustering_info = behavioral_results.get('behavioral_patterns', {}).get('entity_clustering', {})
+    anomalies = behavioral_results.get('behavioral_patterns', {}).get('anomalies', {})
+    print(f"    - Entity clusters: {clustering_info.get('n_clusters', 0)}")
+    print(f"    - Anomalous entities: {anomalies.get('anomalous_entities_count', 0)}")
     
+    # Show summary for one cluster to demo new features
+    if 'cluster_summaries' in clustering_info:
+        print("\n    --- Example Cluster 0 Behavior Summary ---")
+        summary_c0 = clustering_info['cluster_summaries'].get('cluster_0', {}).get('behavior_summary', {})
+        for behavior, stats in summary_c0.items():
+            print(f"      - {behavior}:")
+            for stat_name, values in stats.items():
+                if stat_name == 'top_proportions':
+                    print(f"        - {stat_name}: {values}")
+                else:
+                    print(f"        - {stat_name} (mean): {values.get('mean', 0.0):.2f}")
+        print("    ------------------------------------------")
+
     # 4. Pattern Summary
     print("\n4. Pattern Analysis Summary:")
     summary = analyzer.get_pattern_summary()
-    print(f"   - Total pattern types analyzed: {summary['total_pattern_types']}")
-    print(f"   - Pattern types: {', '.join(summary['pattern_types'])}")
+    print(f"    - Total pattern types analyzed: {summary['total_pattern_types']}")
+    print(f"    - Pattern types: {', '.join(summary['pattern_types'])}")
     
     # 5. Save patterns as template
     print("\n5. Saving patterns as template...")
-    analyzer.save_patterns_to_template('industrial_sensor_patterns', temporal_results['patterns_found'])
-    print("   - Template saved successfully")
+    if 'patterns_found' in temporal_results:
+        analyzer.save_patterns_to_template('industrial_sensor_patterns', temporal_results['patterns_found'])
+        print("    - Template saved successfully")
+    else:
+        print("    - No temporal patterns to save")
     
     # 6. Export patterns
     print("\n6. Exporting patterns...")
     export_path = analyzer.export_patterns()
-    print(f"   - Patterns exported to: {export_path}")
+    print(f"    - Patterns exported to: {export_path}")
     
     # 7. Get statistics
     print("\n7. Pattern Analysis Statistics:")
     stats = analyzer.get_pattern_statistics()
-    print(f"   - Total analyses: {stats['analysis_summary']['total_analyses_performed']}")
-    print(f"   - Templates available: {stats['analysis_summary']['template_count']}")
+    print(f"    - Total analyses: {stats['analysis_summary']['total_analyses_performed']}")
+    print(f"    - Templates available: {stats['analysis_summary']['template_count']}")
     
     print("\n=== PATTERN ANALYSIS COMPLETED ===")
     print("\nKey Findings:")
     print("- Temporal patterns detected in temperature (daily cycles)")
-    print("- Spatial clustering revealed device groupings")
-    print("- Behavioral analysis identified device performance patterns")
-    print("- Anomaly detection found outlier devices")
+    print("- Spatial clustering potentially revealed device groupings")
+    print("- Behavioral analysis identified device performance patterns (e.g., device_A/B)")
+    print(f"- Anomaly detection found {anomalies.get('anomalous_entities_count', 0)} outlier devices")
     print("- All patterns saved for future reference and comparison")
-                

@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """
-Enhanced Flask Application for Digital Twin System v2.1 (Merged)
-Main web application with JWT security, real-time capabilities, 
-advanced analytics integration, scheduled retraining, reporting, and export.
+Enhanced Flask Application for Digital Twin System v3.0 (Production-Ready)
+Main web application with Redis caching, PostgreSQL, optimized SocketIO,
+and async task support.
+
+Major Enhancements:
+- Redis for distributed caching
+- PostgreSQL via SQLAlchemy
+- Optimized SocketIO with rooms and selective broadcasting
+- Async task support with Celery
+- Connection pooling and query optimization
+- Improved error handling and monitoring
 """
 
 import os
 import sys
 import json
 import logging
-import sqlite3
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -24,78 +31,433 @@ import hmac
 import secrets
 import math
 import random
+import re
+import pickle
+from contextlib import contextmanager
 
 # Flask imports
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
-import eventlet # Still needed for background tasks
+import eventlet
 
-# Security imports (Merged)
+# Database imports
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, Index
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.pool import QueuePool
+from sqlalchemy.exc import SQLAlchemyError
+
+# Redis imports
+import redis
+from redis.connection import ConnectionPool
+
+# Security imports
 from flask_jwt_extended import (
     JWTManager, jwt_required, create_access_token,
-    get_jwt_identity, unset_jwt_cookies
+    get_jwt_identity, unset_jwt_cookies, decode_token
 )
+from jwt.exceptions import ExpiredSignatureError, DecodeError, InvalidTokenError
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Background Scheduler (from File 2)
+# Rate Limiting
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+except ImportError:
+    logging.critical("Flask-Limiter not installed. Run 'pip install Flask-Limiter'. Exiting.")
+    sys.exit(1)
+
+# Background Scheduler
 from apscheduler.schedulers.background import BackgroundScheduler
+
+# Celery for async tasks
+try:
+    from celery import Celery
+    CELERY_AVAILABLE = True
+except ImportError:
+    logging.warning("Celery not installed. Async tasks will run synchronously.")
+    CELERY_AVAILABLE = False
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import custom modules (Kept comprehensive imports from File 1)
-# Made imports more robust - log critical if essential ones fail
+# Import custom modules
 try:
     from CONFIG.app_config import config
-    # Essential modules - log critical if missing
-    try:
-        from AI_MODULES.secure_database_manager import SecureDatabaseManager
-    except ImportError as e:
-        logging.critical(f"CRITICAL: Cannot import SecureDatabaseManager: {e}")
-        SecureDatabaseManager = None # Allow fallback for limited functionality
-    try:
-        from AI_MODULES.predictive_analytics_engine import PredictiveAnalyticsEngine
-    except ImportError as e:
-        logging.critical(f"CRITICAL: Cannot import PredictiveAnalyticsEngine: {e}")
-        PredictiveAnalyticsEngine = None
-    try:
-        from CONFIG.unified_data_generator import UnifiedDataGenerator
-    except ImportError as e:
-        logging.warning(f"Warning: Cannot import UnifiedDataGenerator: {e}")
-        UnifiedDataGenerator = None # Use fallback
-
-    # Optional/Supporting modules - log warning if missing
-    try:
-        from REPORTS.health_report_generator import HealthReportGenerator
-    except ImportError as e:
-        logging.warning(f"Warning: Cannot import HealthReportGenerator: {e}")
-        HealthReportGenerator = None
-    try:
-        from AI_MODULES.health_score import HealthScoreCalculator
-    except ImportError as e:
-        logging.warning(f"Warning: Cannot import HealthScoreCalculator: {e}")
-        HealthScoreCalculator = None
-    try:
-        from AI_MODULES.alert_manager import AlertManager
-    except ImportError as e:
-        logging.warning(f"Warning: Cannot import AlertManager: {e}")
-        AlertManager = None
-    try:
-        from AI_MODULES.pattern_analyzer import PatternAnalyzer
-    except ImportError as e:
-        logging.warning(f"Warning: Cannot import PatternAnalyzer: {e}")
-        PatternAnalyzer = None
-    try:
-        from AI_MODULES.recommendation_engine import RecommendationEngine
-    except ImportError as e:
-        logging.warning(f"Warning: Cannot import RecommendationEngine: {e}")
-        RecommendationEngine = None
-
+    from AI_MODULES.secure_database_manager import SecureDatabaseManager
+    from AI_MODULES.predictive_analytics_engine import PredictiveAnalyticsEngine
+    from CONFIG.unified_data_generator import UnifiedDataGenerator
+    from REPORTS.health_report_generator import HealthReportGenerator
+    from AI_MODULES.health_score import HealthScoreCalculator
+    from AI_MODULES.alert_manager import AlertManager
+    from AI_MODULES.pattern_analyzer import PatternAnalyzer
+    from AI_MODULES.recommendation_engine import RecommendationEngine
 except ImportError as e:
-    # Handle failure to import config
-    logging.critical(f"CRITICAL: Could not import app_config or essential directories: {e}")
+    logging.critical(f"CRITICAL: Could not import essential modules: {e}")
     sys.exit(1)
+
+# SQLAlchemy Base
+Base = declarative_base()
+
+# ==================== DATABASE MODELS ====================
+
+class DeviceData(Base):
+    """PostgreSQL model for device data"""
+    __tablename__ = 'device_data'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_id = Column(String(100), nullable=False, index=True)
+    device_type = Column(String(100))
+    device_name = Column(String(200))
+    timestamp = Column(DateTime, nullable=False, index=True)
+    value = Column(Float)
+    status = Column(String(50), index=True)
+    health_score = Column(Float)
+    efficiency_score = Column(Float)
+    location = Column(String(200))
+    unit = Column(String(50))
+    metadata = Column(Text)  # JSON string for additional data
+    
+    __table_args__ = (
+        Index('idx_device_timestamp', 'device_id', 'timestamp'),
+        Index('idx_status_timestamp', 'status', 'timestamp'),
+    )
+
+class Alert(Base):
+    """PostgreSQL model for alerts"""
+    __tablename__ = 'alerts'
+    
+    id = Column(String(100), primary_key=True)
+    device_id = Column(String(100), nullable=False, index=True)
+    alert_type = Column(String(100))
+    severity = Column(String(50), index=True)
+    description = Column(Text)
+    timestamp = Column(DateTime, nullable=False, index=True)
+    acknowledged = Column(Boolean, default=False)
+    value = Column(Float)
+    
+    __table_args__ = (
+        Index('idx_severity_timestamp', 'severity', 'timestamp'),
+    )
+
+# ==================== REDIS CACHE MANAGER ====================
+
+class RedisCacheManager:
+    """Manages Redis caching with connection pooling"""
+    
+    def __init__(self, redis_url: str = None, ttl: int = 300):
+        self.redis_url = redis_url or os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+        self.ttl = ttl  # Default TTL in seconds
+        self.logger = logging.getLogger('RedisCacheManager')
+        
+        try:
+            # Create connection pool
+            self.pool = ConnectionPool.from_url(
+                self.redis_url,
+                max_connections=50,
+                decode_responses=False  # We'll handle encoding
+            )
+            self.client = redis.Redis(connection_pool=self.pool)
+            
+            # Test connection
+            self.client.ping()
+            self.logger.info(f"Redis connected successfully: {self.redis_url}")
+            self.available = True
+            
+        except Exception as e:
+            self.logger.error(f"Redis connection failed: {e}. Falling back to in-memory cache.")
+            self.available = False
+            self.memory_cache = {}  # Fallback
+    
+    def get(self, key: str) -> Any:
+        """Get value from cache"""
+        try:
+            if self.available:
+                data = self.client.get(key)
+                return pickle.loads(data) if data else None
+            else:
+                return self.memory_cache.get(key)
+        except Exception as e:
+            self.logger.error(f"Cache get error for key {key}: {e}")
+            return None
+    
+    def set(self, key: str, value: Any, ttl: int = None) -> bool:
+        """Set value in cache with TTL"""
+        try:
+            ttl = ttl or self.ttl
+            if self.available:
+                serialized = pickle.dumps(value)
+                return self.client.setex(key, ttl, serialized)
+            else:
+                self.memory_cache[key] = value
+                return True
+        except Exception as e:
+            self.logger.error(f"Cache set error for key {key}: {e}")
+            return False
+    
+    def delete(self, key: str) -> bool:
+        """Delete key from cache"""
+        try:
+            if self.available:
+                return self.client.delete(key) > 0
+            else:
+                return self.memory_cache.pop(key, None) is not None
+        except Exception as e:
+            self.logger.error(f"Cache delete error for key {key}: {e}")
+            return False
+    
+    def get_many(self, keys: List[str]) -> Dict[str, Any]:
+        """Get multiple values"""
+        try:
+            if self.available:
+                values = self.client.mget(keys)
+                return {
+                    k: pickle.loads(v) if v else None 
+                    for k, v in zip(keys, values)
+                }
+            else:
+                return {k: self.memory_cache.get(k) for k in keys}
+        except Exception as e:
+            self.logger.error(f"Cache get_many error: {e}")
+            return {k: None for k in keys}
+    
+    def set_many(self, mapping: Dict[str, Any], ttl: int = None) -> bool:
+        """Set multiple key-value pairs"""
+        try:
+            ttl = ttl or self.ttl
+            if self.available:
+                pipeline = self.client.pipeline()
+                for key, value in mapping.items():
+                    serialized = pickle.dumps(value)
+                    pipeline.setex(key, ttl, serialized)
+                pipeline.execute()
+                return True
+            else:
+                self.memory_cache.update(mapping)
+                return True
+        except Exception as e:
+            self.logger.error(f"Cache set_many error: {e}")
+            return False
+    
+    def clear_pattern(self, pattern: str) -> int:
+        """Clear all keys matching pattern"""
+        try:
+            if self.available:
+                keys = self.client.keys(pattern)
+                if keys:
+                    return self.client.delete(*keys)
+                return 0
+            else:
+                keys_to_delete = [k for k in self.memory_cache.keys() if pattern in k]
+                for k in keys_to_delete:
+                    del self.memory_cache[k]
+                return len(keys_to_delete)
+        except Exception as e:
+            self.logger.error(f"Cache clear_pattern error: {e}")
+            return 0
+    
+    def increment(self, key: str, amount: int = 1) -> int:
+        """Increment counter"""
+        try:
+            if self.available:
+                return self.client.incr(key, amount)
+            else:
+                self.memory_cache[key] = self.memory_cache.get(key, 0) + amount
+                return self.memory_cache[key]
+        except Exception as e:
+            self.logger.error(f"Cache increment error: {e}")
+            return 0
+
+# ==================== DATABASE MANAGER ====================
+
+class PostgreSQLManager:
+    """Manages PostgreSQL connections and operations"""
+    
+    def __init__(self, db_url: str = None):
+        self.db_url = db_url or os.environ.get(
+            'DATABASE_URL',
+            'postgresql://postgres:password@localhost:5432/digital_twin'
+        )
+        self.logger = logging.getLogger('PostgreSQLManager')
+        
+        try:
+            # Create engine with connection pooling
+            self.engine = create_engine(
+                self.db_url,
+                poolclass=QueuePool,
+                pool_size=20,
+                max_overflow=40,
+                pool_pre_ping=True,  # Verify connections before using
+                pool_recycle=3600,   # Recycle connections after 1 hour
+                echo=False
+            )
+            
+            # Create tables
+            Base.metadata.create_all(self.engine)
+            
+            # Session factory
+            self.SessionLocal = scoped_session(sessionmaker(
+                autocommit=False,
+                autoflush=False,
+                bind=self.engine
+            ))
+            
+            self.logger.info("PostgreSQL connected successfully")
+            self.available = True
+            
+        except Exception as e:
+            self.logger.error(f"PostgreSQL connection failed: {e}")
+            self.available = False
+    
+    @contextmanager
+    def get_session(self):
+        """Context manager for database sessions"""
+        session = self.SessionLocal()
+        try:
+            yield session
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            self.logger.error(f"Session error: {e}")
+            raise
+        finally:
+            session.close()
+    
+    def bulk_insert_device_data(self, data_list: List[Dict]) -> bool:
+        """Bulk insert device data efficiently"""
+        try:
+            with self.get_session() as session:
+                objects = [
+                    DeviceData(
+                        device_id=d['device_id'],
+                        device_type=d.get('device_type'),
+                        device_name=d.get('device_name'),
+                        timestamp=d['timestamp'],
+                        value=d.get('value'),
+                        status=d.get('status'),
+                        health_score=d.get('health_score'),
+                        efficiency_score=d.get('efficiency_score'),
+                        location=d.get('location'),
+                        unit=d.get('unit'),
+                        metadata=json.dumps(d.get('metadata', {}))
+                    )
+                    for d in data_list
+                ]
+                session.bulk_save_objects(objects)
+            return True
+        except Exception as e:
+            self.logger.error(f"Bulk insert error: {e}")
+            return False
+    
+    def get_latest_device_data(self, limit: int = 100) -> pd.DataFrame:
+        """Get latest device data efficiently"""
+        try:
+            with self.get_session() as session:
+                # Subquery for latest timestamp per device
+                from sqlalchemy import func
+                subq = session.query(
+                    DeviceData.device_id,
+                    func.max(DeviceData.timestamp).label('max_ts')
+                ).group_by(DeviceData.device_id).subquery()
+                
+                # Join to get full records
+                query = session.query(DeviceData).join(
+                    subq,
+                    (DeviceData.device_id == subq.c.device_id) &
+                    (DeviceData.timestamp == subq.c.max_ts)
+                ).limit(limit)
+                
+                results = query.all()
+                
+                data = [{
+                    'device_id': r.device_id,
+                    'device_type': r.device_type,
+                    'device_name': r.device_name,
+                    'timestamp': r.timestamp,
+                    'value': r.value,
+                    'status': r.status,
+                    'health_score': r.health_score,
+                    'efficiency_score': r.efficiency_score,
+                    'location': r.location,
+                    'unit': r.unit
+                } for r in results]
+                
+                return pd.DataFrame(data)
+        except Exception as e:
+            self.logger.error(f"Query error: {e}")
+            return pd.DataFrame()
+    
+    def insert_alert(self, alert_data: Dict) -> bool:
+        """Insert single alert"""
+        try:
+            with self.get_session() as session:
+                alert = Alert(
+                    id=alert_data['id'],
+                    device_id=alert_data['device_id'],
+                    alert_type=alert_data.get('type'),
+                    severity=alert_data['severity'],
+                    description=alert_data['description'],
+                    timestamp=datetime.fromisoformat(alert_data['timestamp']),
+                    value=alert_data.get('value')
+                )
+                session.add(alert)
+            return True
+        except Exception as e:
+            self.logger.error(f"Alert insert error: {e}")
+            return False
+    
+    def get_recent_alerts(self, limit: int = 10, severity: str = None) -> List[Dict]:
+        """Get recent alerts"""
+        try:
+            with self.get_session() as session:
+                query = session.query(Alert).filter(
+                    Alert.acknowledged == False
+                )
+                
+                if severity:
+                    query = query.filter(Alert.severity == severity)
+                
+                query = query.order_by(Alert.timestamp.desc()).limit(limit)
+                results = query.all()
+                
+                return [{
+                    'id': r.id,
+                    'device_id': r.device_id,
+                    'type': r.alert_type,
+                    'severity': r.severity,
+                    'description': r.description,
+                    'timestamp': r.timestamp.isoformat(),
+                    'value': r.value
+                } for r in results]
+        except Exception as e:
+            self.logger.error(f"Get alerts error: {e}")
+            return []
+
+# ==================== CELERY CONFIGURATION ====================
+
+def make_celery(app):
+    """Create Celery instance"""
+    if not CELERY_AVAILABLE:
+        return None
+    
+    celery = Celery(
+        app.import_name,
+        backend=os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/1'),
+        broker=os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/1')
+    )
+    celery.conf.update(app.config)
+    
+    class ContextTask(celery.Task):
+        def __call__(self, *args, **kwargs):
+            with app.app_context():
+                return self.run(*args, **kwargs)
+    
+    celery.Task = ContextTask
+    return celery
+
+# ==================== MAIN APPLICATION CLASS ====================
 
 class DigitalTwinApp:
     """Main Digital Twin Flask Application Class"""
@@ -103,6 +465,8 @@ class DigitalTwinApp:
     def __init__(self):
         self.app = None
         self.socketio = None
+        self.cache = None
+        self.db_pg = None
         self.db_manager = None
         self.analytics_engine = None
         self.health_calculator = None
@@ -110,31 +474,41 @@ class DigitalTwinApp:
         self.pattern_analyzer = None
         self.recommendation_engine = None
         self.data_generator = None
-        self.scheduler = None # Added from File 2
-        self.jwt = None # Added from File 2
+        self.scheduler = None
+        self.jwt = None
+        self.limiter = None
+        self.celery = None
         
-        # Application state (Kept from File 1)
+        # Application state
         self.connected_clients = {}
-        self.data_cache = {}
-        self.last_update = datetime.now()
         self.start_time = datetime.now()
+        
+        # SocketIO rooms for selective broadcasting
+        self.rooms = {
+            'device_updates': set(),
+            'alerts': set(),
+            'system_metrics': set()
+        }
         
         # Initialize logging
         self.setup_logging()
         
-        # Initialize Flask app (Merged)
+        # Initialize Flask app
         self.create_app()
         
-        # Initialize all modules (Merged)
+        # Initialize infrastructure
+        self.initialize_infrastructure()
+        
+        # Initialize modules
         self.initialize_modules()
         
-        # Setup routes (Merged)
+        # Setup routes
         self.setup_routes()
         
-        # Setup WebSocket events (Kept from File 1)
+        # Setup WebSocket events
         self.setup_websocket_events()
         
-        # Start background tasks (Merged)
+        # Start background tasks
         self.start_background_tasks()
     
     def setup_logging(self):
@@ -149,208 +523,143 @@ class DigitalTwinApp:
             ]
         )
         self.logger = logging.getLogger('DigitalTwinApp')
-        self.logger.info("Digital Twin Application starting...")
+        self.logger.info("Digital Twin Application v3.0 starting...")
     
-    # --- Merged create_app ---
     def create_app(self):
-        """Create and configure Flask application with JWT"""
+        """Create and configure Flask application"""
         self.app = Flask(__name__, static_folder='static', template_folder='templates')
+        
+        # ProxyFix for Nginx/HTTPS
+        self.app.wsgi_app = ProxyFix(
+            self.app.wsgi_app, 
+            x_for=1, x_proto=1, x_host=1, x_prefix=1
+        )
         
         # Configuration
         self.app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
         self.app.config['DEBUG'] = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-        self.app.config['TESTING'] = False
-        
-        # --- Added from File 2: JWT Configuration ---
         self.app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', secrets.token_hex(32))
         self.app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
+        
+        # JWT
         self.jwt = JWTManager(self.app)
         
-        # CORS configuration (Merged - added supports_credentials)
-        CORS(self.app, origins="*", supports_credentials=True, 
+        # Rate Limiter with Redis
+        redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+        self.limiter = Limiter(
+            app=self.app,
+            key_func=get_remote_address,
+            default_limits=["1000 per hour", "100 per minute"],
+            storage_uri=redis_url  # Use Redis for distributed rate limiting
+        )
+        self.logger.info("Flask-Limiter initialized with Redis.")
+        
+        # CORS
+        allowed_origins = os.environ.get(
+            'CORS_ALLOWED_ORIGINS',
+            'http://localhost:3000,http://127.0.0.1:3000'
+        ).split(',')
+        CORS(self.app, origins=allowed_origins, supports_credentials=True,
              allow_headers=["Content-Type", "Authorization", "X-CSRF-Token"])
         
-        # SocketIO initialization (Kept from File 1 - eventlet)
+        # SocketIO with optimized settings
         self.socketio = SocketIO(
             self.app,
-            cors_allowed_origins="*",
+            cors_allowed_origins=allowed_origins,
             async_mode='eventlet',
             logger=False,
             engineio_logger=False,
             ping_timeout=60,
-            ping_interval=25
+            ping_interval=25,
+            message_queue=redis_url,  # Redis for message queue (multi-worker support)
+            channel='digital_twin'
         )
         
-        self.logger.info("Flask application created successfully with JWT and SocketIO (Eventlet)")
+        # Celery
+        if CELERY_AVAILABLE:
+            self.celery = make_celery(self.app)
+            self.logger.info("Celery initialized for async tasks.")
+        
+        self.logger.info("Flask application created successfully")
     
-    # --- Merged initialize_modules ---
+    def initialize_infrastructure(self):
+        """Initialize Redis and PostgreSQL"""
+        # Redis Cache
+        self.cache = RedisCacheManager(
+            redis_url=os.environ.get('REDIS_URL', 'redis://localhost:6379/0'),
+            ttl=300  # 5 minutes default TTL
+        )
+        
+        # PostgreSQL
+        self.db_pg = PostgreSQLManager(
+            db_url=os.environ.get('DATABASE_URL')
+        )
+        
+        self.logger.info("Infrastructure initialized (Redis & PostgreSQL)")
+    
     def initialize_modules(self):
-        """Initialize AI, analytics, and data generation modules with fallbacks"""
+        """Initialize AI and analytics modules"""
         try:
-            # Initialize core modules (check if imported)
-            if SecureDatabaseManager:
-                self.db_manager = SecureDatabaseManager()
-            else:
-                self.logger.critical("SecureDatabaseManager failed to import. Authentication and DB operations will fail.")
-            
-            if PredictiveAnalyticsEngine:
-                self.analytics_engine = PredictiveAnalyticsEngine()
-            else:
-                 self.logger.critical("PredictiveAnalyticsEngine failed to import. Analytics and retraining will fail.")
-
-            if HealthScoreCalculator:
-                self.health_calculator = HealthScoreCalculator()
-            else:
-                self.logger.warning("HealthScoreCalculator not available. Using fallback logic.")
-            
-            if AlertManager:
-                self.alert_manager = AlertManager()
-            else:
-                self.logger.warning("AlertManager not available. Using fallback logic.")
-                self.alert_manager = self._create_fallback_alert_manager() # Kept fallback
-            
-            if PatternAnalyzer:
-                self.pattern_analyzer = PatternAnalyzer()
-            else:
-                self.logger.warning("PatternAnalyzer not available. Some recommendations may be limited.")
-            
-            if RecommendationEngine:
-                self.recommendation_engine = RecommendationEngine()
-            else:
-                self.logger.warning("RecommendationEngine not available. Recommendations will be basic.")
-
-            if UnifiedDataGenerator:
-                self.data_generator = UnifiedDataGenerator()
-            else:
-                self.logger.warning("UnifiedDataGenerator not available. Using basic fallback data generator.")
-                self.data_generator = self._create_fallback_data_generator() # Kept fallback
-
-            # --- Added from File 2: Initialize Scheduler ---
+            self.db_manager = SecureDatabaseManager()
+            self.analytics_engine = PredictiveAnalyticsEngine()
+            self.health_calculator = HealthScoreCalculator()
+            self.alert_manager = AlertManager()
+            self.pattern_analyzer = PatternAnalyzer()
+            self.recommendation_engine = RecommendationEngine()
+            self.data_generator = UnifiedDataGenerator()
             self.scheduler = BackgroundScheduler(daemon=True)
             
-            self.logger.info("Modules initialized (with potential fallbacks).")
-            
+            self.logger.info("Modules initialized successfully")
         except Exception as e:
-            self.logger.error(f"Critical error during module initialization: {e}", exc_info=True)
-            # Attempt to initialize fallbacks even on general error
-            self._initialize_fallback_modules() 
-            if not self.db_manager or not self.analytics_engine or not self.data_generator:
-                 self.logger.critical("Essential modules (DB, Analytics, Generator) failed. Exiting.")
-                 sys.exit(1) # Exit if essential modules totally failed
-
-    # Kept Fallback methods from File 1
-    def _create_fallback_alert_manager(self):
-        """Create a fallback alert manager"""
-        # ... (Implementation from File 1) ...
-        class FallbackAlertManager:
-            def __init__(self):
-                self.alert_conditions = {
-                    'temperature_high': {'threshold': 80, 'operator': '>', 'severity': 'warning'},
-                    'temperature_critical': {'threshold': 100, 'operator': '>', 'severity': 'critical'},
-                    # ... other conditions
-                }
-            
-            def evaluate_conditions(self, data, device_id):
-                alerts = []
-                # ... Simplified alert logic from File 1 ...
-                device_type = data.get('device_type', '')
-                value = data.get('value', 0)
-                health_score = data.get('health_score', 1.0)
-                
-                if 'temperature' in device_type and value > 80:
-                    severity = 'critical' if value > 100 else 'warning'
-                    alerts.append({ 'id': str(uuid.uuid4()), 'device_id': device_id, 'type': 'temperature_alert', 'severity': severity, 'description': f'Temp {value}°C high', 'timestamp': datetime.now().isoformat(), 'value': value })
-                elif 'pressure' in device_type and value > 1050:
-                    alerts.append({ 'id': str(uuid.uuid4()), 'device_id': device_id, 'type': 'pressure_alert', 'severity': 'warning', 'description': f'Pressure {value} hPa high', 'timestamp': datetime.now().isoformat(), 'value': value })
-                # ... Add more simple rules ...
-                if health_score < 0.5:
-                     alerts.append({ 'id': str(uuid.uuid4()), 'device_id': device_id, 'type': 'health_alert', 'severity': 'critical', 'description': f'Health {health_score:.1%} low', 'timestamp': datetime.now().isoformat(), 'value': health_score })
-                return alerts
-        self.logger.info("Using FallbackAlertManager.")
-        return FallbackAlertManager()
+            self.logger.error(f"Module initialization error: {e}", exc_info=True)
     
-    def _create_fallback_data_generator(self):
-        """Create a fallback data generator"""
-        # ... (Implementation from File 1) ...
-        class FallbackDataGenerator:
-             def __init__(self):
-                 self.device_types = ['temperature_sensor', 'pressure_sensor', 'vibration_sensor']
-                 self.locations = ['Factory A', 'Warehouse B']
-             
-             def generate_device_data(self, device_count=10, days_of_data=0.01, interval_minutes=1):
-                 data = []
-                 now = datetime.now()
-                 start_time = now - timedelta(days=days_of_data)
-                 current_time = start_time
-                 while current_time <= now:
-                     for i in range(device_count):
-                         dev_id=f'F_DEVICE_{i+1:03d}'
-                         dev_type=random.choice(self.device_types)
-                         val = random.uniform(10,50)
-                         status = 'normal' if random.random() > 0.1 else 'warning'
-                         health = random.uniform(0.7, 1.0) if status == 'normal' else random.uniform(0.4, 0.7)
-                         eff = health * random.uniform(0.8, 0.95)
-                         data.append({'device_id': dev_id, 'device_type': dev_type, 'timestamp': current_time, 'value': round(val,2), 'status': status, 'health_score': round(health,3), 'efficiency_score': round(eff,3), 'location': random.choice(self.locations), 'unit': 'N/A', 'device_name': f'Fallback {dev_type} {i+1}'})
-                     current_time += timedelta(minutes=interval_minutes)
-                 return pd.DataFrame(data)
-
-             def generate_complete_dataset(self, device_count=10, days_of_data=1):
-                  # Simplified: just generate device data
-                  return {'device_data': self.generate_device_data(device_count, days_of_data)}
-
-        self.logger.info("Using FallbackDataGenerator.")
-        return FallbackDataGenerator()
-    
-    def _initialize_fallback_modules(self):
-        """Initialize fallback modules when imports fail"""
-        if not hasattr(self, 'alert_manager') or self.alert_manager is None:
-             self.alert_manager = self._create_fallback_alert_manager()
-        if not hasattr(self, 'data_generator') or self.data_generator is None:
-             self.data_generator = self._create_fallback_data_generator()
-        # Add fallbacks for others if needed, though core functionality might be lost
-        if not hasattr(self, 'health_calculator') or self.health_calculator is None:
-             self.logger.warning("Health calculation fallback: Using basic score from generator.")
-             # No separate fallback class, rely on generator's score
-        if not hasattr(self, 'recommendation_engine') or self.recommendation_engine is None:
-             self.logger.warning("Recommendation engine fallback: Providing static recommendations.")
-             # No separate fallback class, rely on static data in get_recommendations
-        # Analytics, Pattern Analyzer require more complex fallbacks or disabling features
-
-    # --- Merged setup_routes ---
     def setup_routes(self):
-        """Setup all Flask routes including authentication and protected endpoints"""
+        """Setup all Flask routes"""
         
-        # --- Authentication Endpoints (from File 2) ---
+        # ==================== AUTH ENDPOINTS ====================
+        
         @self.app.route('/api/register', methods=['POST'])
+        @self.limiter.limit("5 per hour")
         def register():
-            """User registration endpoint."""
-            if not self.db_manager:
-                return jsonify({"error": "Database manager not available"}), 503
             data = request.get_json()
+            if not data:
+                return jsonify({"error": "Invalid request"}), 400
+            
             username = data.get('username')
             password = data.get('password')
             email = data.get('email')
             
-            if not username or not password:
-                return jsonify({"error": "Username and password are required"}), 400
+            errors = {}
+            if not username or len(username) < 3:
+                errors['username'] = "Username must be at least 3 characters"
+            if not password or len(password) < 8:
+                errors['password'] = "Password must be at least 8 characters"
+            if not email or not re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", email):
+                errors['email'] = "Valid email required"
+            
+            if errors:
+                return jsonify({"error": "Validation failed", "details": errors}), 400
             
             try:
                 if self.db_manager.create_user(username, password, email):
                     return jsonify({"message": "User created successfully"}), 201
-                else:
-                    return jsonify({"error": "Username or email already exists"}), 409
+                return jsonify({"error": "Username or email exists"}), 409
             except Exception as e:
                 self.logger.error(f"Registration error: {e}")
                 return jsonify({"error": "Registration failed"}), 500
-
+        
         @self.app.route('/api/login', methods=['POST'])
+        @self.limiter.limit("10 per minute")
         def login():
-            """User login endpoint."""
-            if not self.db_manager:
-                return jsonify({"error": "Database manager not available"}), 503
             data = request.get_json()
+            if not data:
+                return jsonify({"error": "Invalid request"}), 400
+            
             username = data.get('username')
             password = data.get('password')
+            
+            if not username or not password:
+                return jsonify({"error": "Username and password required"}), 400
             
             try:
                 if not self.db_manager.authenticate_user(username, password):
@@ -361,77 +670,86 @@ class DigitalTwinApp:
             except Exception as e:
                 self.logger.error(f"Login error: {e}")
                 return jsonify({"error": "Login failed"}), 500
-
+        
         @self.app.route('/api/logout', methods=['POST'])
         def logout():
-            """User logout endpoint."""
             response = jsonify({"message": "Logout successful"})
             unset_jwt_cookies(response)
             return response, 200
-
+        
         @self.app.route('/api/whoami')
         @jwt_required()
+        @self.limiter.limit("120 per minute")
         def protected():
-            """Protected endpoint to check user identity."""
             return jsonify(logged_in_as=get_jwt_identity()), 200
-
-        # --- Main Pages (Kept from File 1) ---
-        # These might need @jwt_required() if you want to protect the HTML pages too,
-        # or handle redirection to a login page in the templates/JS.
-        # For simplicity, keeping them public for now.
+        
+        # ==================== PAGE ROUTES ====================
+        
         @self.app.route('/')
         def index():
-            """Main dashboard page"""
             try:
                 return render_template('index.html')
             except:
-                 return "Digital Twin API is running. Dashboard templates not found."
+                return "Digital Twin API v3.0 is running"
         
         @self.app.route('/dashboard')
-        def enhanced_dashboard():
-             try: return render_template('enhanced_dashboard.html')
-             except: return "Enhanced Dashboard - Templates not found."
+        def dashboard():
+            try:
+                return render_template('enhanced_dashboard.html')
+            except:
+                return "Dashboard - Templates not found"
         
         @self.app.route('/analytics')
         def analytics():
-             try: return render_template('analytics.html')
-             except: return "Analytics page - Templates not found."
+            try:
+                return render_template('analytics.html')
+            except:
+                return "Analytics - Templates not found"
         
         @self.app.route('/devices')
         def devices():
-             try: return render_template('devices_view.html')
-             except: return "Devices page - Templates not found."
-        
-        # --- Health Check (Kept from File 1 - Public) ---
-        @self.app.route('/health')
-        def health_check():
-            """Health check endpoint for monitoring"""
-            # ... (Existing health check logic from File 1) ...
             try:
-                db_status = self.check_database_health()
-                ai_status = self.check_ai_modules_health()
+                return render_template('devices_view.html')
+            except:
+                return "Devices - Templates not found"
+        
+        # ==================== API ENDPOINTS ====================
+        
+        @self.app.route('/health')
+        @self.limiter.exempt
+        def health_check():
+            """Health check endpoint"""
+            try:
                 status = {
-                    'status': 'healthy' if db_status.get('status') == 'healthy' and ai_status.get('status') == 'healthy' else 'partial',
+                    'status': 'healthy',
                     'timestamp': datetime.now().isoformat(),
-                    'database': db_status,
-                    'ai_modules': ai_status,
-                    'uptime': self.get_uptime(),
-                    'version': '2.1.0', # Updated version
-                    'connected_clients': len(self.connected_clients)
+                    'version': '3.0.0',
+                    'redis': self.cache.available,
+                    'postgresql': self.db_pg.available,
+                    'connected_clients': len(self.connected_clients),
+                    'uptime': str(datetime.now() - self.start_time).split('.')[0]
                 }
                 return jsonify(status), 200
             except Exception as e:
-                 self.logger.error(f"Health check failed: {e}")
-                 return jsonify({'status': 'unhealthy', 'error': str(e), 'timestamp': datetime.now().isoformat()}), 503
-        
-        # --- Core API Endpoints (Kept structure from File 1, added @jwt_required(), integrated REAL AI calls from File 2) ---
+                return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
         
         @self.app.route('/api/dashboard_data')
         @jwt_required()
+        @self.limiter.limit("120 per minute")
         def get_dashboard_data():
-            """Get main dashboard data (from cache)"""
+            """Get dashboard data with caching"""
             try:
-                data = self.get_cached_dashboard_data()
+                # Try cache first
+                cached = self.cache.get('dashboard_data')
+                if cached:
+                    return jsonify(cached)
+                
+                # Fetch from database
+                data = self._fetch_dashboard_data()
+                
+                # Cache for 30 seconds
+                self.cache.set('dashboard_data', data, ttl=30)
+                
                 return jsonify(data)
             except Exception as e:
                 self.logger.error(f"Error getting dashboard data: {e}")
@@ -439,827 +757,640 @@ class DigitalTwinApp:
         
         @self.app.route('/api/devices')
         @jwt_required()
+        @self.limiter.limit("120 per minute")
         def get_devices():
-            """Get all devices data from cache"""
+            """Get all devices"""
             try:
-                cached_data = self.get_cached_dashboard_data()
-                return jsonify(cached_data.get('devices', []))
+                cached = self.cache.get('devices_list')
+                if cached:
+                    return jsonify(cached)
+                
+                if self.db_pg.available:
+                    df = self.db_pg.get_latest_device_data(limit=1000)
+                    devices = df.to_dict('records')
+                else:
+                    devices = []
+                
+                self.cache.set('devices_list', devices, ttl=30)
+                return jsonify(devices)
             except Exception as e:
-                self.logger.error(f"Error getting devices data: {e}")
+                self.logger.error(f"Error getting devices: {e}")
                 return jsonify({'error': str(e)}), 500
         
         @self.app.route('/api/device/<device_id>')
         @jwt_required()
+        @self.limiter.limit("120 per minute")
         def get_device(device_id):
-            """Get specific device data from cache"""
+            """Get specific device"""
             try:
-                device = self.get_device_data(device_id) # Uses cached data
+                cache_key = f'device:{device_id}'
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return jsonify(cached)
+                
+                # Fetch from database
+                devices = self.cache.get('devices_list') or []
+                device = next((d for d in devices if d.get('device_id') == device_id), None)
+                
                 if device:
+                    self.cache.set(cache_key, device, ttl=30)
                     return jsonify(device)
-                else:
-                    return jsonify({'error': 'Device not found'}), 404
+                return jsonify({'error': 'Device not found'}), 404
             except Exception as e:
                 self.logger.error(f"Error getting device {device_id}: {e}")
                 return jsonify({'error': str(e)}), 500
         
-        @self.app.route('/api/analytics')
-        @jwt_required()
-        def get_analytics_data():
-            """Get analytics data for charts (Using simple generation for now)"""
-            # Kept File 1's placeholder analytics data generation.
-            # A real implementation would fetch/calculate this from DB or cache.
-            try:
-                analytics_data = self.get_analytics_data() # Uses placeholder method
-                return jsonify(analytics_data)
-            except Exception as e:
-                self.logger.error(f"Error getting analytics data: {e}")
-                return jsonify({'error': str(e)}), 500
-        
         @self.app.route('/api/alerts')
         @jwt_required()
+        @self.limiter.limit("120 per minute")
         def get_alerts():
-            """Get system alerts using the AlertManager"""
+            """Get alerts from database"""
             try:
                 limit = request.args.get('limit', 10, type=int)
                 severity = request.args.get('severity', None)
                 
-                # Use REAL AlertManager or fallback
-                devices_df = pd.DataFrame(self.get_cached_dashboard_data().get('devices', []))
-                all_alerts = []
-                if not devices_df.empty:
-                    for _, row in devices_df.iterrows():
-                        all_alerts.extend(
-                            self.alert_manager.evaluate_conditions(row.to_dict(), row['device_id'])
-                        )
+                cache_key = f'alerts:{severity}:{limit}'
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return jsonify(cached)
                 
-                # Sort by timestamp (most recent first) and apply limit/filter
-                all_alerts.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-                if severity:
-                     filtered_alerts = [a for a in all_alerts if a.get('severity') == severity]
+                if self.db_pg.available:
+                    alerts = self.db_pg.get_recent_alerts(limit=limit, severity=severity)
                 else:
-                     filtered_alerts = all_alerts
-
-                return jsonify(filtered_alerts[:limit])
-
+                    alerts = []
+                
+                self.cache.set(cache_key, alerts, ttl=10)
+                return jsonify(alerts)
             except Exception as e:
                 self.logger.error(f"Error getting alerts: {e}")
                 return jsonify({'error': str(e)}), 500
-
+        
+        @self.app.route('/api/predictions')
+        @jwt_required()
+        @self.limiter.limit("60 per minute")
+        def get_predictions():
+            """Get predictions"""
+            try:
+                device_id = request.args.get('device_id')
+                cache_key = f'predictions:{device_id}'
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return jsonify(cached)
+                
+                # Get device data
+                devices = self.cache.get('devices_list') or []
+                device_data = next((d for d in devices if d.get('device_id') == device_id), None)
+                
+                if not device_data:
+                    return jsonify({'error': 'Device not found'}), 404
+                
+                device_df = pd.DataFrame([device_data])
+                
+                # Run predictions
+                anomalies = self.analytics_engine.detect_anomalies(device_df)
+                try:
+                    failure_pred = self.analytics_engine.predict_failure(device_df)
+                except Exception as fe:
+                    self.logger.warning(f"Failure prediction failed: {fe}")
+                    failure_pred = {'error': str(fe), 'predictions': []}
+                
+                result = {
+                    'device_id': device_id,
+                    'anomaly_prediction': anomalies,
+                    'failure_prediction': failure_pred
+                }
+                
+                self.cache.set(cache_key, result, ttl=60)
+                return jsonify(result)
+            except Exception as e:
+                self.logger.error(f"Error getting predictions: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/health_scores')
+        @jwt_required()
+        @self.limiter.limit("60 per minute")
+        def get_health_scores():
+            """Get health scores"""
+            try:
+                cache_key = 'health_scores'
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return jsonify(cached)
+                
+                devices = self.cache.get('devices_list') or []
+                devices_df = pd.DataFrame(devices)
+                
+                if devices_df.empty:
+                    return jsonify({}), 200
+                
+                health_scores = self.health_calculator.calculate_device_health_scores(devices_df)
+                formatted_scores = {
+                    dev_id: {'overall_health': score * 100}
+                    for dev_id, score in health_scores.items()
+                }
+                
+                self.cache.set(cache_key, formatted_scores, ttl=60)
+                return jsonify(formatted_scores)
+            except Exception as e:
+                self.logger.error(f"Error getting health scores: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/recommendations')
+        @jwt_required()
+        @self.limiter.limit("30 per minute")
+        def get_recommendations():
+            """Get AI recommendations"""
+            try:
+                cache_key = 'recommendations'
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return jsonify(cached)
+                
+                devices = self.cache.get('devices_list') or []
+                devices_df = pd.DataFrame(devices)
+                
+                if devices_df.empty:
+                    return jsonify([]), 200
+                
+                # Prepare data
+                health_data = {}
+                if self.health_calculator:
+                    health_scores = self.health_calculator.calculate_device_health_scores(devices_df)
+                    health_data = {'device_scores': health_scores}
+                
+                pattern_data = {}
+                if self.pattern_analyzer:
+                    pattern_data = self.pattern_analyzer.analyze_temporal_patterns(
+                        devices_df, 'timestamp', ['value']
+                    )
+                
+                recommendations = self.recommendation_engine.generate_recommendations(
+                    health_data=health_data,
+                    pattern_analysis=pattern_data,
+                    historical_data=devices_df
+                )
+                
+                self.cache.set(cache_key, recommendations, ttl=120)
+                return jsonify(recommendations)
+            except Exception as e:
+                self.logger.error(f"Error getting recommendations: {e}")
+                return jsonify({'error': str(e)}), 500
+        
         @self.app.route('/api/system_metrics')
         @jwt_required()
+        @self.limiter.limit("120 per minute")
         def get_system_metrics():
-            """Get system performance metrics (Kept psutil/fallback from File 1)"""
+            """Get system metrics"""
             try:
-                metrics = self.get_system_metrics()
+                cache_key = 'system_metrics'
+                cached = self.cache.get(cache_key)
+                if cached:
+                    return jsonify(cached)
+                
+                metrics = self._get_system_metrics()
+                self.cache.set(cache_key, metrics, ttl=5)
                 return jsonify(metrics)
             except Exception as e:
                 self.logger.error(f"Error getting system metrics: {e}")
                 return jsonify({'error': str(e)}), 500
         
-        @self.app.route('/api/historical_data')
-        @jwt_required()
-        def get_historical_data_endpoint(): # Renamed to avoid conflict
-            """Get historical data for trends (Using simple generation for now)"""
-            # Kept File 1's placeholder historical data.
-            # A real implementation would query the DB.
-            try:
-                device_id = request.args.get('device_id')
-                hours = request.args.get('hours', 24, type=int)
-                metric = request.args.get('metric', 'value')
-                
-                data = self.get_historical_data(device_id, hours, metric) # Uses placeholder
-                return jsonify(data)
-            except Exception as e:
-                self.logger.error(f"Error getting historical data: {e}")
-                return jsonify({'error': str(e)}), 500
-        
-        # --- Merged /api/predictions ---
-        @self.app.route('/api/predictions')
-        @jwt_required()
-        def get_predictions():
-            """Get predictive analytics data using REAL Analytics Engine"""
-            if not self.analytics_engine:
-                 return jsonify({'error': 'Analytics engine not available'}), 503
-            try:
-                device_id = request.args.get('device_id')
-                # Get the latest data point for this device from cache
-                device_data = self.get_device_data(device_id)
-                
-                if not device_data:
-                    return jsonify({'error': 'Device not found or no data'}), 404
-                
-                device_df = pd.DataFrame([device_data])
-                
-                # Call REAL analytics engine methods
-                anomalies = self.analytics_engine.detect_anomalies(device_df)
-                
-                # Call failure prediction (handle potential errors)
-                try:
-                     failure_pred = self.analytics_engine.predict_failure(device_df)
-                except ValueError as ve: # Handle case where model might not exist yet
-                     self.logger.warning(f"Failure prediction failed for {device_id}: {ve}")
-                     failure_pred = {'error': str(ve), 'predictions': []}
-                except Exception as fe:
-                     self.logger.error(f"Failure prediction failed unexpectedly for {device_id}: {fe}")
-                     failure_pred = {'error': 'Prediction failed', 'predictions': []}
-
-                # Add time series forecast if needed (example)
-                # forecast = self.analytics_engine.time_series_analysis(device_df, 'value', 'timestamp')
-
-                return jsonify({
-                    'device_id': device_id,
-                    'anomaly_prediction': anomalies,
-                    'failure_prediction': failure_pred,
-                    # 'forecast': forecast # Optionally add forecast results
-                })
-            except Exception as e:
-                self.logger.error(f"Error getting predictions: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        # --- Merged /api/health_scores (using REAL HealthScoreCalculator) ---
-        @self.app.route('/api/health_scores')
-        @jwt_required()
-        def get_health_scores():
-            """Get health scores using REAL HealthScoreCalculator"""
-            if not self.health_calculator:
-                 return jsonify({'error': 'Health calculator not available'}), 503
-            try:
-                devices_df = pd.DataFrame(self.get_cached_dashboard_data().get('devices', []))
-                if devices_df.empty:
-                    return jsonify({}), 200 # Return empty if no devices
-
-                # Use the REAL health calculator
-                health_scores = self.health_calculator.calculate_device_health_scores(devices_df)
-                
-                # Format for API response if needed (assuming calculate_device_health_scores returns a dict {device_id: score})
-                formatted_scores = {
-                    dev_id: {'overall_health': score * 100} # Adjust structure as needed
-                    for dev_id, score in health_scores.items()
-                }
-                return jsonify(formatted_scores)
-
-            except Exception as e:
-                self.logger.error(f"Error getting health scores: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        # --- Merged /api/recommendations (using REAL RecommendationEngine) ---
-        @self.app.route('/api/recommendations')
-        @jwt_required()
-        def get_recommendations():
-            """Get AI recommendations using REAL engines"""
-            if not self.recommendation_engine or not self.health_calculator or not self.pattern_analyzer:
-                 self.logger.warning("One or more AI modules for recommendations are unavailable.")
-                 # Provide static fallback recommendations if RecommendationEngine itself is missing
-                 if not self.recommendation_engine:
-                      return jsonify(self.get_static_recommendations()) # Use static fallback
-                 # Proceed if RecommendationEngine exists, even if others are missing (it might handle partial data)
-
-            try:
-                cached_data = self.get_cached_dashboard_data()
-                devices_df = pd.DataFrame(cached_data.get('devices', []))
-                
-                if devices_df.empty:
-                    return jsonify([]), 200 # No recommendations if no data
-
-                # Prepare inputs for RecommendationEngine
-                health_data = {}
-                if self.health_calculator:
-                     health_data = self.health_calculator.calculate_device_health_scores(devices_df)
-                     # Convert health_data format if needed by RecommendationEngine
-                     health_data = {'device_scores': health_data} # Example adaptation
-                
-                pattern_data = {}
-                if self.pattern_analyzer:
-                     # Analyze recent historical data if available, otherwise use latest snapshot
-                     # Placeholder: Use snapshot for now
-                     pattern_data = self.pattern_analyzer.analyze_temporal_patterns(
-                          devices_df, 'timestamp', ['value'] # Adapt as needed
-                     )
-                
-                recommendations = self.recommendation_engine.generate_recommendations(
-                    health_data=health_data,
-                    pattern_analysis=pattern_data,
-                    historical_data=devices_df # Provide snapshot or fetch historical if needed
-                )
-                return jsonify(recommendations)
-            except Exception as e:
-                self.logger.error(f"Error getting recommendations: {e}")
-                # Fallback to static recommendations on error
-                return jsonify(self.get_static_recommendations())
-
-
-        # --- Report Generation & Export Endpoints (Kept from File 1) ---
-        # Added @jwt_required()
         @self.app.route('/api/generate_report')
         @jwt_required()
+        @self.limiter.limit("10 per hour")
         def generate_report_endpoint():
-             """Generate a health report and return its path"""
-             # ... (Existing logic from File 1, including fallback) ...
-             try:
-                self.logger.info("Generating health report via API request.")
-                if HealthReportGenerator:
-                    report_generator = HealthReportGenerator()
-                    # Fetch recent data for the report
-                    recent_data_df = self.db_manager.get_health_data_as_dataframe(limit=5000) if self.db_manager else pd.DataFrame()
-                    if recent_data_df.empty:
-                        self.logger.warning("No recent data found for report generation.")
-                        # Proceed with fallback or generate report with limited data
-                    
-                    html_path = report_generator.generate_comprehensive_report(data_df=recent_data_df, date_range_days=7)
-                    report_filename = os.path.basename(html_path)
-                    return jsonify({ 'success': True, 'report_path': f'/reports/{report_filename}', 'message': 'Health report generated successfully' })
+            """Generate report asynchronously if Celery available"""
+            try:
+                if self.celery and CELERY_AVAILABLE:
+                    task = generate_report_task.delay()
+                    return jsonify({
+                        'success': True,
+                        'task_id': task.id,
+                        'message': 'Report generation started'
+                    })
                 else:
-                    self.logger.warning("HealthReportGenerator not available. Generating fallback report.")
-                    return self._generate_fallback_report()
-             except Exception as e:
-                 self.logger.error(f"Error generating report: {e}")
-                 return jsonify({'success': False, 'error': 'Failed to generate report', 'details': str(e)}), 500
-
+                    # Synchronous fallback
+                    report_path = self._generate_report_sync()
+                    filename = os.path.basename(report_path)
+                    return jsonify({
+                        'success': True,
+                        'report_path': f'/reports/{filename}',
+                        'message': 'Report generated'
+                    })
+            except Exception as e:
+                self.logger.error(f"Report generation error: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+        
         @self.app.route('/reports/<filename>')
-        # No JWT needed if reports are public, add @jwt_required() if they should be protected
         def serve_report(filename):
-             """Serve the generated report file"""
-             # ... (Existing logic from File 1) ...
-             try:
+            """Serve report file"""
+            try:
                 reports_dir = os.path.join(os.path.dirname(__file__), '..', 'REPORTS', 'generated')
                 return send_from_directory(reports_dir, filename)
-             except Exception as e:
-                self.logger.error(f"Error serving report: {e}")
+            except Exception as e:
                 return jsonify({'error': 'Report not found'}), 404
-
+        
         @self.app.route('/api/export_data')
         @jwt_required()
+        @self.limiter.limit("10 per hour")
         def export_data_endpoint():
-             """Export data and provide download link"""
-             # ... (Existing logic from File 1) ...
-             try:
+            """Export data"""
+            try:
                 format_type = request.args.get('format', 'json')
                 date_range = request.args.get('days', 7, type=int)
-                self.logger.info(f"Exporting data. Format: {format_type}, Days: {date_range}")
                 
-                export_data_content = self.export_data(format_type, date_range) # Uses placeholder method
-                
-                exports_dir = os.path.join(os.path.dirname(__file__), '..', 'EXPORTS')
-                os.makedirs(exports_dir, exist_ok=True)
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                
-                if format_type.lower() == 'csv':
-                    filename = f'export_{timestamp}.csv'
-                    filepath = os.path.join(exports_dir, filename)
-                    if 'devices' in export_data_content and export_data_content['devices']:
-                        pd.DataFrame(export_data_content['devices']).to_csv(filepath, index=False)
-                    else:
-                         pd.DataFrame([{'message': 'No data available'}]).to_csv(filepath, index=False)
-                else: # JSON
-                    filename = f'export_{timestamp}.json'
-                    filepath = os.path.join(exports_dir, filename)
-                    with open(filepath, 'w') as f:
-                        json.dump(export_data_content, f, indent=2, default=str)
-                        
-                return jsonify({'success': True, 'message': 'Data export completed', 'export_path': f'/exports/{filename}', 'filename': filename})
-
-             except Exception as e:
-                 self.logger.error(f"Error exporting data: {e}")
-                 return jsonify({'success': False, 'error': 'Failed to export data', 'details': str(e)}), 500
-
-
+                if self.celery and CELERY_AVAILABLE:
+                    task = export_data_task.delay(format_type, date_range)
+                    return jsonify({
+                        'success': True,
+                        'task_id': task.id,
+                        'message': 'Export started'
+                    })
+                else:
+                    filepath = self._export_data_sync(format_type, date_range)
+                    filename = os.path.basename(filepath)
+                    return jsonify({
+                        'success': True,
+                        'export_path': f'/exports/{filename}',
+                        'filename': filename
+                    })
+            except Exception as e:
+                self.logger.error(f"Export error: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+        
         @self.app.route('/exports/<filename>')
-        # No JWT needed if exports are public links, add @jwt_required() otherwise
         def serve_export(filename):
-             """Serve exported data files"""
-             # ... (Existing logic from File 1) ...
-             try:
+            """Serve export file"""
+            try:
                 exports_dir = os.path.join(os.path.dirname(__file__), '..', 'EXPORTS')
                 return send_from_directory(exports_dir, filename)
-             except Exception as e:
-                self.logger.error(f"Error serving export: {e}")
-                return jsonify({'error': 'Export file not found'}), 404
+            except Exception as e:
+                return jsonify({'error': 'Export not found'}), 404
         
-        self.logger.info("All routes setup completed")
-
-    # Kept fallback report generation from File 1
-    def _generate_fallback_report(self):
-         # ... (Implementation from File 1) ...
-         try:
-            reports_dir = os.path.join(os.path.dirname(__file__), '..', 'REPORTS', 'generated')
-            os.makedirs(reports_dir, exist_ok=True)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'fallback_report_{timestamp}.html'
-            filepath = os.path.join(reports_dir, filename)
-            dashboard_data = self.get_cached_dashboard_data()
-            # Generate simple HTML content based on dashboard_data
-            html_content = "<html><head><title>Fallback Report</title></head><body>"
-            html_content += f"<h1>Fallback Health Report - {datetime.now():%Y-%m-%d %H:%M}</h1>"
-            html_content += f"<p>System Health: {dashboard_data.get('systemHealth', 'N/A')}%</p>"
-            html_content += f"<p>Active Devices: {dashboard_data.get('activeDevices', 'N/A')}/{dashboard_data.get('totalDevices', 'N/A')}</p>"
-            html_content += "<h2>Device Samples:</h2><ul>"
-            for device in dashboard_data.get('devices', [])[:5]:
-                html_content += f"<li>{device.get('device_name', 'Unknown')}: Status - {device.get('status', 'N/A')}, Health - {device.get('health_score', 0):.1%}</li>"
-            html_content += "</ul></body></html>"
-            with open(filepath, 'w') as f:
-                f.write(html_content)
-            return jsonify({'success': True, 'report_path': f'/reports/{filename}', 'message': 'Simplified fallback report generated'})
-         except Exception as e:
-             self.logger.error(f"Error generating fallback report: {e}")
-             return jsonify({'success': False, 'error': 'Failed to generate fallback report'}), 500
-
-
-    # Kept WebSocket setup from File 1
+        self.logger.info("Routes setup completed")
+    
     def setup_websocket_events(self):
-        """Setup WebSocket event handlers"""
+        """Setup optimized WebSocket events"""
         
         @self.socketio.on('connect')
         def handle_connect():
-            # ... (Existing logic from File 1) ...
-             client_id = request.sid
-             self.connected_clients[client_id] = {'connected_at': datetime.now(), 'last_ping': datetime.now()}
-             self.logger.info(f"Client {client_id} connected. Total: {len(self.connected_clients)}")
-             emit('initial_data', self.get_cached_dashboard_data())
-             join_room('device_updates')
-             join_room('alerts')
-             join_room('system_metrics')
+            """Handle WebSocket connection with JWT auth"""
+            token = request.args.get('token')
+            if not token:
+                self.logger.warning(f"Client {request.sid} connected without token")
+                disconnect()
+                return False
+            
+            try:
+                jwt_data = decode_token(token)
+                identity = jwt_data['sub']
+                session['identity'] = identity
+            except Exception as e:
+                self.logger.warning(f"Client {request.sid} auth failed: {e}")
+                disconnect()
+                return False
+            
+            client_id = request.sid
+            self.connected_clients[client_id] = {
+                'connected_at': datetime.now(),
+                'last_ping': datetime.now(),
+                'identity': identity,
+                'subscriptions': set()
+            }
+            
+            self.logger.info(f"Client {client_id} (User: {identity}) connected. Total: {len(self.connected_clients)}")
+            
+            # Send initial data
+            cached_data = self.cache.get('dashboard_data')
+            if cached_data:
+                emit('initial_data', cached_data)
         
         @self.socketio.on('disconnect')
         def handle_disconnect():
-             # ... (Existing logic from File 1) ...
+            """Handle disconnect"""
             client_id = request.sid
+            user_identity = session.get('identity', 'Unknown')
+            
             if client_id in self.connected_clients:
+                # Remove from all rooms
+                subs = self.connected_clients[client_id].get('subscriptions', set())
+                for sub in subs:
+                    if sub in self.rooms:
+                        self.rooms[sub].discard(client_id)
+                
                 del self.connected_clients[client_id]
-                self.logger.info(f"Client {client_id} disconnected. Total: {len(self.connected_clients)}")
+                self.logger.info(f"Client {client_id} (User: {user_identity}) disconnected. Total: {len(self.connected_clients)}")
         
         @self.socketio.on('ping')
         def handle_ping():
-            # ... (Existing logic from File 1) ...
+            """Handle ping"""
             client_id = request.sid
             if client_id in self.connected_clients:
-                 self.connected_clients[client_id]['last_ping'] = datetime.now()
-                 emit('pong', {'timestamp': datetime.now().isoformat()})
+                self.connected_clients[client_id]['last_ping'] = datetime.now()
+                emit('pong', {'timestamp': datetime.now().isoformat()})
         
         @self.socketio.on('subscribe')
         def handle_subscribe(data):
-            # ... (Existing logic from File 1) ...
+            """Handle subscription to specific data streams"""
             try:
                 client_id = request.sid
                 sub_type = data.get('type')
-                if sub_type in ['device_updates', 'alerts', 'system_metrics']:
+                
+                if sub_type in self.rooms:
+                    # Add to room tracking
+                    self.rooms[sub_type].add(client_id)
+                    if client_id in self.connected_clients:
+                        self.connected_clients[client_id]['subscriptions'].add(sub_type)
+                    
+                    # Join SocketIO room
                     join_room(sub_type)
                     emit('subscription_confirmed', {'type': sub_type})
                     self.logger.info(f"Client {client_id} subscribed to {sub_type}")
                 else:
                     emit('error', {'message': 'Invalid subscription type'})
             except Exception as e:
-                 self.logger.error(f"Subscription error: {e}")
-                 emit('error', {'message': 'Subscription failed'})
+                self.logger.error(f"Subscription error: {e}")
+                emit('error', {'message': 'Subscription failed'})
+        
+        @self.socketio.on('unsubscribe')
+        def handle_unsubscribe(data):
+            """Handle unsubscription"""
+            try:
+                client_id = request.sid
+                sub_type = data.get('type')
+                
+                if sub_type in self.rooms:
+                    self.rooms[sub_type].discard(client_id)
+                    if client_id in self.connected_clients:
+                        self.connected_clients[client_id]['subscriptions'].discard(sub_type)
+                    
+                    leave_room(sub_type)
+                    emit('unsubscription_confirmed', {'type': sub_type})
+                    self.logger.info(f"Client {client_id} unsubscribed from {sub_type}")
+            except Exception as e:
+                self.logger.error(f"Unsubscription error: {e}")
         
         self.logger.info("WebSocket events setup completed")
     
-    # --- Merged start_background_tasks ---
     def start_background_tasks(self):
-        """Start background tasks for real-time updates, cleanup, and retraining"""
+        """Start optimized background tasks"""
         
-        # Data Update Task (Kept core logic from File 1, using eventlet)
         def data_update_task():
-            """Background task to update data and send to clients"""
-            self.logger.info("Starting real-time data simulation task.")
+            """Update data and broadcast to subscribed clients only"""
+            self.logger.info("Starting data update task")
+            update_count = 0
+            
             while True:
                 try:
-                    # Generate data using the initialized generator (real or fallback)
+                    # Generate new data
                     new_devices_df = self.data_generator.generate_device_data(
-                        device_count=25, # Use consistent count
-                        days_of_data=0.003,  # ~5 minutes of data
+                        device_count=25,
+                        days_of_data=0.003,
                         interval_minutes=1
                     )
                     
-                    latest_devices_df = new_devices_df.loc[new_devices_df.groupby('device_id')['timestamp'].idxmax()]
+                    latest_devices_df = new_devices_df.loc[
+                        new_devices_df.groupby('device_id')['timestamp'].idxmax()
+                    ]
                     
-                    self.update_data_cache(latest_devices_df)
+                    # Store in PostgreSQL (bulk insert)
+                    if self.db_pg.available:
+                        devices_list = latest_devices_df.to_dict('records')
+                        self.db_pg.bulk_insert_device_data(devices_list)
                     
-                    if self.connected_clients:
-                        dashboard_data = self.get_cached_dashboard_data()
-                        self.socketio.emit('data_update', dashboard_data, room='device_updates')
+                    # Update cache
+                    dashboard_data = self._fetch_dashboard_data_from_df(latest_devices_df)
+                    self.cache.set('dashboard_data', dashboard_data, ttl=30)
+                    self.cache.set('devices_list', latest_devices_df.to_dict('records'), ttl=30)
                     
-                    self.check_and_send_alerts(latest_devices_df)
+                    # Broadcast only to subscribed clients (optimized)
+                    if self.rooms['device_updates']:
+                        self.socketio.emit(
+                            'data_update',
+                            dashboard_data,
+                            room='device_updates'
+                        )
                     
-                    eventlet.sleep(5)  # Update every 5 seconds
+                    # Check for alerts
+                    self._check_and_send_alerts(latest_devices_df)
+                    
+                    update_count += 1
+                    if update_count % 12 == 0:  # Log every minute
+                        self.logger.info(f"Data update cycle {update_count} completed")
+                    
+                    eventlet.sleep(5)
                     
                 except Exception as e:
-                    self.logger.error(f"Error in data update task: {e}", exc_info=True)
-                    eventlet.sleep(60) # Wait longer on error
+                    self.logger.error(f"Data update task error: {e}", exc_info=True)
+                    eventlet.sleep(60)
         
-        # Cleanup Task (Kept from File 1, using eventlet)
         def cleanup_task():
-            """Background task to cleanup disconnected clients"""
-            self.logger.info("Starting client cleanup task.")
+            """Cleanup inactive clients"""
+            self.logger.info("Starting cleanup task")
+            
             while True:
                 try:
                     current_time = datetime.now()
                     timeout_threshold = current_time - timedelta(minutes=5)
-                    disconnected_clients = [
-                         client_id for client_id, info in self.connected_clients.items()
-                         if info['last_ping'] < timeout_threshold
+                    
+                    disconnected = [
+                        cid for cid, info in self.connected_clients.items()
+                        if info['last_ping'] < timeout_threshold
                     ]
                     
-                    for client_id in disconnected_clients:
+                    for client_id in disconnected:
+                        # Remove from rooms
+                        subs = self.connected_clients[client_id].get('subscriptions', set())
+                        for sub in subs:
+                            if sub in self.rooms:
+                                self.rooms[sub].discard(client_id)
+                        
                         del self.connected_clients[client_id]
                         self.logger.info(f"Cleaned up inactive client {client_id}")
                     
-                    eventlet.sleep(300)  # Cleanup every 5 minutes
+                    eventlet.sleep(300)
                     
                 except Exception as e:
-                    self.logger.error(f"Error in cleanup task: {e}")
-                    eventlet.sleep(600) # Wait longer on error
-
-        # --- Added from File 2: Retraining Scheduler ---
-        try:
-            if self.scheduler and self.analytics_engine:
-                 # Check if job already exists to prevent duplicates on reload
-                 if not self.scheduler.get_job('model_retraining_task'):
-                      self.scheduler.add_job(
-                           id='model_retraining_task',
-                           func=self.analytics_engine.retrain_models, # Call method on the instance
-                           trigger='interval',
-                           hours=24  # Retrain once a day
-                      )
-                      self.scheduler.start()
-                      self.logger.info("Started model retraining scheduler (runs every 24h).")
-                 else:
-                      self.logger.info("Model retraining scheduler already running.")
-            elif not self.analytics_engine:
-                 self.logger.warning("Analytics engine not available, cannot start retraining scheduler.")
-            else: # Scheduler itself failed init
-                 self.logger.error("Scheduler not initialized, cannot start retraining.")
-        except Exception as e:
-            self.logger.error(f"Failed to start scheduler: {e}")
-
-        # Start Eventlet-based tasks
+                    self.logger.error(f"Cleanup task error: {e}")
+                    eventlet.sleep(600)
+        
+        def cache_warmup_task():
+            """Periodically warm up cache"""
+            self.logger.info("Starting cache warmup task")
+            
+            while True:
+                try:
+                    # Warm up dashboard data
+                    if self.db_pg.available:
+                        df = self.db_pg.get_latest_device_data(limit=100)
+                        if not df.empty:
+                            data = self._fetch_dashboard_data_from_df(df)
+                            self.cache.set('dashboard_data', data, ttl=300)
+                            self.cache.set('devices_list', df.to_dict('records'), ttl=300)
+                    
+                    eventlet.sleep(60)  # Every minute
+                    
+                except Exception as e:
+                    self.logger.error(f"Cache warmup error: {e}")
+                    eventlet.sleep(300)
+        
+        # Schedule model retraining
+        if self.scheduler and self.analytics_engine:
+            if not self.scheduler.get_job('model_retraining_task'):
+                self.scheduler.add_job(
+                    id='model_retraining_task',
+                    func=self.analytics_engine.retrain_models,
+                    trigger='interval',
+                    hours=24
+                )
+                self.scheduler.start()
+                self.logger.info("Model retraining scheduler started")
+        
+        # Start background tasks
         self.socketio.start_background_task(data_update_task)
         self.socketio.start_background_task(cleanup_task)
+        self.socketio.start_background_task(cache_warmup_task)
         
-        self.logger.info("Background tasks (Data Update, Cleanup, Retraining) initiated.")
-
-    # --- Data Retrieval/Processing Methods (Kept comprehensive versions from File 1) ---
-
-    def get_cached_dashboard_data(self):
-        """Get cached dashboard data, generate if empty"""
-        cache_age = datetime.now() - self.data_cache.get('dashboard_updated', datetime.min)
-        if 'dashboard' not in self.data_cache or cache_age > timedelta(minutes=1): # Refresh if older than 1 min or missing
-             self.logger.info("Dashboard cache miss or expired. Generating initial/fresh data...")
-             # Use generate_complete_dataset for richer initial data if available
-             try:
-                 initial_datasets = self.data_generator.generate_complete_dataset(device_count=25, days_of_data=0.1) # Generate small initial set
-                 initial_df = initial_datasets.get('device_data', pd.DataFrame())
-                 if not initial_df.empty:
-                      latest_df = initial_df.loc[initial_df.groupby('device_id')['timestamp'].idxmax()]
-                      self.update_data_cache(latest_df)
-                 else: # Fallback if generator failed
-                      fallback_df = self._create_fallback_data_generator().generate_device_data(10, 0.01, 1)
-                      latest_fallback = fallback_df.loc[fallback_df.groupby('device_id')['timestamp'].idxmax()]
-                      self.update_data_cache(latest_fallback)
-
-             except Exception as e:
-                  self.logger.error(f"Failed to generate initial data: {e}. Using fallback.")
-                  fallback_df = self._create_fallback_data_generator().generate_device_data(10, 0.01, 1)
-                  latest_fallback = fallback_df.loc[fallback_df.groupby('device_id')['timestamp'].idxmax()]
-                  self.update_data_cache(latest_fallback)
-
-
-        return self.data_cache.get('dashboard', {}) # Return empty dict if cache update failed
-
-    # Kept richer fetch_dashboard_data from File 1
-    def fetch_dashboard_data(self, devices_df):
-        """Fetch fresh dashboard data from a DataFrame"""
-        try:
-             # Ensure essential columns exist, add them with defaults if missing
-             required_cols = ['device_id', 'status', 'health_score', 'efficiency_score', 'device_type', 'value']
-             for col in required_cols:
-                  if col not in devices_df.columns:
-                       default_val = 0.0 if 'score' in col or col == 'value' else 'unknown'
-                       devices_df[col] = default_val
-                       self.logger.warning(f"Column '{col}' missing in devices_df, added default.")
-
-             devices_data = devices_df.to_dict('records')
-             total_devices = len(devices_data)
-             active_devices = devices_df[devices_df['status'] != 'offline'].shape[0]
-
-             health_scores = devices_df['health_score'].dropna()
-             avg_health = health_scores.mean() * 100 if not health_scores.empty else 0
-
-             efficiency_scores = devices_df['efficiency_score'].dropna()
-             avg_efficiency = efficiency_scores.mean() * 100 if not efficiency_scores.empty else 0
-
-             energy_usage_series = devices_df.loc[devices_df['device_type'] == 'power_meter', 'value'].dropna()
-             energy_usage = energy_usage_series.sum() if not energy_usage_series.empty else 0
-             # Fallback energy if no power meters
-             if total_devices > 0 and energy_usage == 0:
-                  energy_usage = random.uniform(800, 1500) * (active_devices / total_devices)
-
-             performance_data = self.get_performance_chart_data(avg_health, avg_efficiency, energy_usage)
-             status_distribution = self.calculate_status_distribution(devices_data)
-
-             return {
-                  'timestamp': datetime.now().isoformat(),
-                  'systemHealth': round(avg_health),
-                  'activeDevices': active_devices,
-                  'totalDevices': total_devices,
-                  'efficiency': round(avg_efficiency),
-                  'energyUsage': round(energy_usage),
-                  'energyCost': round(energy_usage * 0.12), # Assuming constant cost
-                  'performanceData': performance_data,
-                  'statusDistribution': status_distribution,
-                  'devices': devices_data
-             }
-        except Exception as e:
-            self.logger.error(f"Error fetching dashboard data: {e}", exc_info=True)
-            return {'error': str(e), 'timestamp': datetime.now().isoformat()}
-
-
-    # Kept update_data_cache from File 1
-    def update_data_cache(self, devices_df):
-        """Update cached dashboard data"""
-        try:
-            self.data_cache['dashboard'] = self.fetch_dashboard_data(devices_df)
-            self.data_cache['dashboard_updated'] = datetime.now()
-            self.last_update = datetime.now()
-        except Exception as e:
-            self.logger.error(f"Error updating data cache: {e}")
-
-    # Kept check_and_send_alerts from File 1 (uses real AlertManager now)
-    def check_and_send_alerts(self, devices_df):
-        """Check for new alerts using AlertManager and send to clients"""
-        # ... (Implementation from File 1 - already uses self.alert_manager) ...
-        if not self.alert_manager: return # Skip if no alert manager
-        try:
-             all_alerts = []
-             for _, device_row in devices_df.iterrows():
-                  device_data_dict = device_row.to_dict()
-                  try:
-                       triggered_alerts = self.alert_manager.evaluate_conditions(
-                           data=device_data_dict,
-                           device_id=device_data_dict.get('device_id')
-                       )
-                       all_alerts.extend(triggered_alerts)
-                  except Exception as eval_e:
-                       self.logger.error(f"Error evaluating alerts for {device_data_dict.get('device_id')}: {eval_e}")
-
-             # Emit alerts (consider debouncing or rate limiting in a production system)
-             for alert in all_alerts:
-                  self.socketio.emit('alert_update', alert, room='alerts')
-                  # Limit logging frequency if needed
-                  # self.logger.info(f"Alert sent: {alert.get('description')} for {alert.get('device_id')}")
-
-        except Exception as e:
-             self.logger.error(f"Error in check_and_send_alerts: {e}")
-
-
-    # Kept get_performance_chart_data from File 1
-    def get_performance_chart_data(self, system_health, efficiency, energy_usage):
-        # ... (Implementation from File 1) ...
-         try:
-            chart_data = []
-            base_time = datetime.now() - timedelta(hours=23)
-            for i in range(24):
-                timestamp = base_time + timedelta(hours=i)
-                hour_factor = math.sin(2 * math.pi * timestamp.hour / 24)
-                health_var = system_health + (10 * hour_factor) + random.gauss(0, 3)
-                eff_var = efficiency + (8 * hour_factor) + random.gauss(0, 4)
-                energy_var = energy_usage + (energy_usage * 0.2 * hour_factor) + random.gauss(0, max(1, energy_usage * 0.05)) # Avoid gauss(0,0)
-                chart_data.append({
-                    'timestamp': timestamp.strftime('%H:%M'),
-                    'systemHealth': max(0, min(100, health_var)),
-                    'efficiency': max(0, min(100, eff_var)),
-                    'energyUsage': max(0, energy_var)
-                })
-            return chart_data
-         except Exception as e:
-             self.logger.error(f"Error generating perf chart data: {e}")
-             return []
-
-
-    # Kept calculate_status_distribution from File 1
-    def calculate_status_distribution(self, devices_data):
-        # ... (Implementation from File 1) ...
-         status_counts = {'normal': 0, 'warning': 0, 'critical': 0, 'offline': 0, 'maintenance': 0, 'anomaly': 0 }
-         for device in devices_data:
-             status = device.get('status', 'normal').lower()
-             if status in status_counts:
-                 status_counts[status] += 1
-             else: # Handle unexpected statuses
-                 status_counts['normal'] += 1 # Default to normal
-         # Consolidate anomaly into critical for dashboard view if needed
-         final_distribution = {
-              'normal': status_counts['normal'],
-              'warning': status_counts['warning'],
-              'critical': status_counts['critical'] + status_counts['anomaly'],
-              'offline': status_counts['offline'],
-              'maintenance': status_counts['maintenance']
-         }
-         return final_distribution
-
-
-    # Kept get_devices_data from File 1
-    def get_devices_data(self):
-         try:
-             dashboard_data = self.get_cached_dashboard_data()
-             return dashboard_data.get('devices', [])
-         except Exception as e:
-             self.logger.error(f"Error getting devices data: {e}")
-             return []
-
-    # Kept get_device_data from File 1
-    def get_device_data(self, device_id):
-         try:
-             devices = self.get_devices_data()
-             return next((d for d in devices if d.get('device_id') == device_id), None)
-         except Exception as e:
-             self.logger.error(f"Error getting device data for {device_id}: {e}")
-             return None
-
-    # Kept get_analytics_data (placeholder) from File 1
-    def get_analytics_data(self):
-         # ... (Placeholder Implementation from File 1) ...
-         # Replace with real data fetching/calculation if needed for dedicated analytics page
-         try:
-             now = datetime.now()
-             ts = [(now - timedelta(hours=i)).strftime('%H:%M') for i in range(23,-1,-1)]
-             return {
-                 'temperature': {'labels': ts, 'values': [20+5*math.sin(i*0.1)+random.gauss(0,1) for i in range(24)]},
-                 'pressure': {'labels': ts, 'values': [1013+20*math.sin(i*0.05)+random.gauss(0,5) for i in range(24)]},
-                 # Add others
-             }
-         except Exception as e:
-             self.logger.error(f"Error getting analytics placeholder data: {e}")
-             return {}
-
-
-    # Kept get_alerts_data (placeholder) from File 1 - Used by export, API uses real one
-    def get_alerts_data(self, limit=10, severity=None):
-         # ... (Placeholder Implementation from File 1) ...
-         # This is now mainly used for the EXPORT function as a fallback/example
-         # The /api/alerts endpoint uses the real alert manager
-         try:
-             types = [('Temp high', 'warning'), ('Pressure low', 'critical'), ('Offline', 'critical')]
-             alerts = []
-             for i in range(limit * 2): # Generate more to allow filtering
-                 t, s = types[i % len(types)]
-                 if severity and s != severity: continue
-                 alerts.append({'id': str(uuid.uuid4()), 'title': t, 'severity': s, 'device_id': f'DEVICE_{i%5+1:03d}', 'timestamp': (datetime.now()-timedelta(minutes=i*10)).isoformat()})
-                 if len(alerts) >= limit: break
-             return alerts
-         except Exception as e:
-             self.logger.error(f"Error getting placeholder alerts: {e}")
-             return []
-
-
-    # Kept get_system_metrics (psutil/fallback) from File 1
-    def get_system_metrics(self):
-        # ... (psutil/fallback Implementation from File 1) ...
-        try:
-             import psutil
-             return {
-                  'timestamp': datetime.now().isoformat(),
-                  'cpu_percent': psutil.cpu_percent(interval=0.1),
-                  'memory_percent': psutil.virtual_memory().percent,
-                  'disk_percent': psutil.disk_usage('/').percent,
-                  'active_connections': len(self.connected_clients)
-             }
-        except ImportError:
-             return {
-                  'timestamp': datetime.now().isoformat(),
-                  'cpu_percent': random.uniform(10, 60),
-                  'memory_percent': random.uniform(30, 70),
-                  'disk_percent': random.uniform(40, 80),
-                  'active_connections': len(self.connected_clients)
-             }
-        except Exception as e:
-             self.logger.error(f"Error getting system metrics: {e}")
-             return {}
-
-    # Kept get_historical_data (placeholder) from File 1
-    def get_historical_data(self, device_id, hours, metric):
-        # ... (Placeholder Implementation from File 1) ...
-        # Replace with DB query in a real application
-         try:
-             now = datetime.now()
-             ts = [(now - timedelta(hours=hours-1-i)).isoformat() for i in range(hours)]
-             vals = [50 + 20*math.sin(i*0.1) + random.gauss(0,5) for i in range(hours)]
-             return {'device_id': device_id, 'metric': metric, 'timestamps': ts, 'values': [round(v,2) for v in vals]}
-         except Exception as e:
-             self.logger.error(f"Error getting placeholder historical data: {e}")
-             return {}
-
-    # Kept get_predictions_data (placeholder) from File 1 - Used by export, API uses real one
-    def get_predictions_data(self, device_id, horizon):
-         # ... (Placeholder Implementation from File 1) ...
-         # This is now mainly used for the EXPORT function as a fallback/example
-         # The /api/predictions endpoint uses the real analytics engine
-        try:
-            now = datetime.now()
-            ts = [(now + timedelta(hours=i)).isoformat() for i in range(horizon)]
-            preds = [50 + 15*math.sin(i*0.05) + random.gauss(0,2) for i in range(horizon)]
-            conf = [max(0.5, 0.95 - (i*0.02)) for i in range(horizon)]
-            return {'device_id': device_id, 'horizon_hours': horizon, 'timestamps': ts, 'predictions': [round(p,2) for p in preds], 'confidence': [round(c,3) for c in conf]}
-        except Exception as e:
-             self.logger.error(f"Error getting placeholder predictions: {e}")
-             return {}
-
-    # Kept calculate_health_scores (placeholder) from File 1 - Used by export, API uses real one
-    def calculate_health_scores(self):
-         # ... (Placeholder Implementation from File 1) ...
-         # This is now mainly used for the EXPORT function as a fallback/example
-         # The /api/health_scores endpoint uses the real health calculator
-        try:
-            devices = self.get_devices_data()
-            scores = {}
-            for dev in devices:
-                 dev_id = dev.get('device_id')
-                 health = dev.get('health_score', random.uniform(0.7, 1.0))
-                 scores[dev_id] = {'overall_health': health*100, 'components': {}} # Simplified
-            return scores
-        except Exception as e:
-            self.logger.error(f"Error calculating placeholder health scores: {e}")
-            return {}
-
-    # Kept get_recommendations (static) from File 1 - Used as fallback now
-    def get_static_recommendations(self):
-         # Renamed from get_recommendations to avoid conflict
-         # ... (Static Recommendations from File 1) ...
-         self.logger.info("Providing static fallback recommendations.")
-         return [
-              {'id': str(uuid.uuid4()), 'type': 'maintenance', 'priority': 'high', 'title': 'Check DEVICE_003 Vibration', 'description': 'Vibration levels appear elevated based on recent trends.', 'confidence': 0.75},
-              {'id': str(uuid.uuid4()), 'type': 'optimization', 'priority': 'medium', 'title': 'Review Energy Usage', 'description': 'Overall energy consumption seems higher during off-peak hours.', 'confidence': 0.65}
-         ]
-
-    # Kept export_data from File 1 (uses placeholder methods)
-    def export_data(self, format_type, date_range):
-        """Export data for analysis (uses placeholder data getters)"""
-        # ... (Implementation from File 1 - uses the placeholder getters) ...
-        try:
-             end_date = datetime.now()
-             start_date = end_date - timedelta(days=date_range)
-             # Generate sample data for export using fallback generator
-             export_df = self._create_fallback_data_generator().generate_device_data(
-                  device_count=15, days_of_data=date_range, interval_minutes=60
-             )
-             return {
-                  'metadata': {'export_timestamp': datetime.now().isoformat(), 'date_range': {'start': start_date.isoformat(), 'end': end_date.isoformat()}, 'format': format_type},
-                  'devices': export_df.to_dict('records'),
-                  'alerts': self.get_alerts_data(limit=50), # Placeholder alerts
-                  'system_metrics': self.get_system_metrics() # Placeholder/psutil metrics
-             }
-        except Exception as e:
-             self.logger.error(f"Error exporting data: {e}")
-             return {'error': str(e)}
-
-
-    # --- Health Check Methods (Kept from File 1) ---
-    def check_database_health(self):
-        """Check database health"""
-        # ... (Implementation from File 1) ...
-        if not self.db_manager: return {'status': 'error', 'message': 'DB Manager not initialized'}
-        try:
-            db_path_primary = getattr(self.db_manager, 'db_path', 'N/A')
-            db_path_users = getattr(self.db_manager, 'users_db_path', 'N/A')
-            # Basic check: try connecting
-            conn_primary = sqlite3.connect(db_path_primary)
-            conn_primary.close()
-            conn_users = sqlite3.connect(db_path_users)
-            conn_users.close()
-            return {'status': 'healthy', 'primary_path': db_path_primary, 'users_path': db_path_users}
-        except Exception as e:
-            return {'status': 'error', 'message': str(e)}
-
-    def check_ai_modules_health(self):
-        """Check AI modules health (more accurate now)"""
-        modules = {
-             'database_manager': self.db_manager is not None,
-             'analytics_engine': self.analytics_engine is not None,
-             'health_calculator': self.health_calculator is not None,
-             'alert_manager': self.alert_manager is not None and not isinstance(self.alert_manager, self._create_fallback_alert_manager().__class__), # Check if not fallback
-             'pattern_analyzer': self.pattern_analyzer is not None,
-             'recommendation_engine': self.recommendation_engine is not None,
-             'data_generator': self.data_generator is not None and not isinstance(self.data_generator, self._create_fallback_data_generator().__class__) # Check if not fallback
-        }
-        status = 'healthy'
-        if not all(modules.values()):
-            status = 'partial'
-        if not modules['database_manager'] or not modules['analytics_engine']:
-             status = 'critical_error' # Essential modules missing
-
-        return {'modules': modules, 'status': status}
-
-    # Kept get_uptime from File 1
-    def get_uptime(self):
-        if hasattr(self, 'start_time'):
-            uptime = datetime.now() - self.start_time
-            return str(uptime).split('.')[0]
-        return "Unknown"
+        self.logger.info("All background tasks started")
     
-    # --- Merged run method ---
+    # ==================== HELPER METHODS ====================
+    
+    def _fetch_dashboard_data(self):
+        """Fetch dashboard data from database"""
+        try:
+            if self.db_pg.available:
+                df = self.db_pg.get_latest_device_data(limit=100)
+                return self._fetch_dashboard_data_from_df(df)
+            return {}
+        except Exception as e:
+            self.logger.error(f"Fetch dashboard data error: {e}")
+            return {}
+    
+    def _fetch_dashboard_data_from_df(self, devices_df):
+        """Build dashboard data from DataFrame"""
+        try:
+            if devices_df.empty:
+                return {}
+            
+            devices_data = devices_df.to_dict('records')
+            total_devices = len(devices_data)
+            active_devices = devices_df[devices_df['status'] != 'offline'].shape[0]
+            
+            health_scores = devices_df['health_score'].dropna()
+            avg_health = health_scores.mean() * 100 if not health_scores.empty else 0
+            
+            efficiency_scores = devices_df['efficiency_score'].dropna()
+            avg_efficiency = efficiency_scores.mean() * 100 if not efficiency_scores.empty else 0
+            
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'systemHealth': round(avg_health),
+                'activeDevices': active_devices,
+                'totalDevices': total_devices,
+                'efficiency': round(avg_efficiency),
+                'devices': devices_data
+            }
+        except Exception as e:
+            self.logger.error(f"Build dashboard data error: {e}")
+            return {}
+    
+    def _check_and_send_alerts(self, devices_df):
+        """Check for alerts and broadcast to subscribed clients"""
+        if not self.alert_manager:
+            return
+        
+        try:
+            all_alerts = []
+            for _, device_row in devices_df.iterrows():
+                device_data = device_row.to_dict()
+                try:
+                    triggered = self.alert_manager.evaluate_conditions(
+                        data=device_data,
+                        device_id=device_data.get('device_id')
+                    )
+                    all_alerts.extend(triggered)
+                except Exception as e:
+                    self.logger.error(f"Alert evaluation error: {e}")
+            
+            # Store in database
+            if self.db_pg.available and all_alerts:
+                for alert in all_alerts:
+                    self.db_pg.insert_alert(alert)
+            
+            # Broadcast only to subscribed clients
+            if self.rooms['alerts'] and all_alerts:
+                for alert in all_alerts:
+                    self.socketio.emit('alert_update', alert, room='alerts')
+        
+        except Exception as e:
+            self.logger.error(f"Check alerts error: {e}")
+    
+    def _get_system_metrics(self):
+        """Get system metrics"""
+        try:
+            import psutil
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'cpu_percent': psutil.cpu_percent(interval=0.1),
+                'memory_percent': psutil.virtual_memory().percent,
+                'disk_percent': psutil.disk_usage('/').percent,
+                'active_connections': len(self.connected_clients),
+                'cache_available': self.cache.available,
+                'database_available': self.db_pg.available
+            }
+        except ImportError:
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'cpu_percent': random.uniform(10, 60),
+                'memory_percent': random.uniform(30, 70),
+                'disk_percent': random.uniform(40, 80),
+                'active_connections': len(self.connected_clients),
+                'cache_available': self.cache.available,
+                'database_available': self.db_pg.available
+            }
+    
+    def _generate_report_sync(self):
+        """Generate report synchronously"""
+        try:
+            if HealthReportGenerator:
+                report_gen = HealthReportGenerator()
+                recent_data_df = self.db_pg.get_latest_device_data(limit=5000) if self.db_pg.available else pd.DataFrame()
+                html_path = report_gen.generate_comprehensive_report(data_df=recent_data_df, date_range_days=7)
+                return html_path
+            return ""
+        except Exception as e:
+            self.logger.error(f"Report generation error: {e}")
+            raise
+    
+    def _export_data_sync(self, format_type, date_range):
+        """Export data synchronously"""
+        try:
+            exports_dir = os.path.join(os.path.dirname(__file__), '..', 'EXPORTS')
+            os.makedirs(exports_dir, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # Get data from cache or database
+            devices = self.cache.get('devices_list') or []
+            
+            if format_type.lower() == 'csv':
+                filename = f'export_{timestamp}.csv'
+                filepath = os.path.join(exports_dir, filename)
+                pd.DataFrame(devices).to_csv(filepath, index=False)
+            else:
+                filename = f'export_{timestamp}.json'
+                filepath = os.path.join(exports_dir, filename)
+                with open(filepath, 'w') as f:
+                    json.dump({'devices': devices}, f, indent=2, default=str)
+            
+            return filepath
+        except Exception as e:
+            self.logger.error(f"Export error: {e}")
+            raise
+    
     def run(self, host='0.0.0.0', port=5000, debug=False):
-        """Run the Flask application using SocketIO"""
+        """Run the application"""
         self.start_time = datetime.now()
-        self.logger.info(f"Starting Digital Twin Application v2.1 on {host}:{port}")
-        self.logger.info(f"Debug mode: {debug}")
+        self.logger.info(f"Starting Digital Twin Application v3.0 on {host}:{port}")
+        self.logger.info(f"Redis: {self.cache.available}, PostgreSQL: {self.db_pg.available}")
         
         try:
             self.socketio.run(
@@ -1267,53 +1398,85 @@ class DigitalTwinApp:
                 host=host,
                 port=port,
                 debug=debug,
-                use_reloader=False, # Important for background tasks
-                log_output=True # Log SocketIO messages
+                use_reloader=False,
+                log_output=True
             )
         except KeyboardInterrupt:
-            self.logger.info("Application stopped by user.")
+            self.logger.info("Application stopped by user")
             if self.scheduler and self.scheduler.running:
-                 self.scheduler.shutdown()
-                 self.logger.info("Scheduler shut down.")
+                self.scheduler.shutdown()
         except Exception as e:
-            self.logger.critical(f"Application failed to run: {e}", exc_info=True)
+            self.logger.critical(f"Application failed: {e}", exc_info=True)
             if self.scheduler and self.scheduler.running:
-                 self.scheduler.shutdown()
+                self.scheduler.shutdown()
             raise
 
-# Kept Error Handlers from File 1
-def setup_error_handlers(app):
+# ==================== CELERY TASKS ====================
+
+if CELERY_AVAILABLE:
+    @celery.task(bind=True)
+    def generate_report_task(self):
+        """Async report generation task"""
+        try:
+            app_instance = create_app()
+            report_path = app_instance._generate_report_sync()
+            return {'success': True, 'path': report_path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    @celery.task(bind=True)
+    def export_data_task(self, format_type, date_range):
+        """Async export task"""
+        try:
+            app_instance = create_app()
+            filepath = app_instance._export_data_sync(format_type, date_range)
+            return {'success': True, 'path': filepath}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+# ==================== ERROR HANDLERS ====================
+
+def setup_error_handlers(app, limiter):
     @app.errorhandler(404)
-    def not_found_error(error): return jsonify({'error': 'Not found'}), 404
+    def not_found_error(error):
+        return jsonify({'error': 'Not found'}), 404
+    
     @app.errorhandler(500)
-    def internal_error(error): return jsonify({'error': 'Internal server error'}), 500
+    def internal_error(error):
+        return jsonify({'error': 'Internal server error'}), 500
+    
+    @app.errorhandler(429)
+    def ratelimit_handler(e):
+        return jsonify(error="Rate limit exceeded", description=str(e.description)), 429
+    
     @app.errorhandler(Exception)
     def handle_exception(e):
         app.logger.error(f"Unhandled exception: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected error occurred'}), 500
 
-# Kept Application Factory from File 1
+# ==================== APPLICATION FACTORY ====================
+
 def create_app():
-    """Application factory function"""
+    """Application factory"""
     try:
         app_instance = DigitalTwinApp()
-        setup_error_handlers(app_instance.app)
+        setup_error_handlers(app_instance.app, app_instance.limiter)
         return app_instance
     except Exception as e:
-        logging.critical(f"Failed to create application instance: {e}", exc_info=True)
-        sys.exit(1) # Exit if app creation fails fundamentally
+        logging.critical(f"Failed to create application: {e}", exc_info=True)
+        sys.exit(1)
 
-# Kept Main Execution Block from File 1
+# ==================== MAIN ====================
+
 if __name__ == '__main__':
     os.environ.setdefault('FLASK_ENV', 'development')
     try:
         digital_twin_app = create_app()
         host = os.environ.get('HOST', '0.0.0.0')
         port = int(os.environ.get('PORT', 5000))
-        debug = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
+        debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
         digital_twin_app.run(host=host, port=port, debug=debug)
     except Exception as e:
-        # Logging might not be fully set up here, so print as well
         print(f"CRITICAL: Failed to start application: {e}")
         logging.critical(f"Failed to start application: {e}", exc_info=True)
         sys.exit(1)

@@ -1,42 +1,50 @@
 {
-  "recommendation_types": {
-    "maintenance": {
-      "priority_weight": 0.8,
-      "time_horizon_days": 30,
-      "confidence_threshold": 0.7
+  "metadata": {
+    "version": "1.1.0",
+    "last_updated_utc": "2025-10-19T14:30:00Z",
+    "updated_by": "system_bot",
+    "description": "Configuration for generating and prioritizing recommendations. This version adds metadata for better change tracking."
+  },
+  "configuration": {
+    "recommendation_types": {
+      "maintenance": {
+        "priority_weight": 0.8,
+        "time_horizon_days": 30,
+        "confidence_threshold": 0.7
+      },
+      "optimization": {
+        "priority_weight": 0.6,
+        "time_horizon_days": 90,
+        "confidence_threshold": 0.6
+      },
+      "operational": {
+        "priority_weight": 0.7,
+        "time_horizon_days": 7,
+        "confidence_threshold": 0.8
+      },
+      "preventive": {
+        "priority_weight": 0.5,
+        "time_horizon_days": 180,
+        "confidence_threshold": 0.5
+      }
     },
-    "optimization": {
-      "priority_weight": 0.6,
-      "time_horizon_days": 90,
-      "confidence_threshold": 0.6
+    "scoring_weights": {
+      "urgency": 0.3,
+      "impact": 0.25,
+      "feasibility": 0.2,
+      "cost_effectiveness": 0.15,
+      "risk_reduction": 0.1
     },
-    "operational": {
-      "priority_weight": 0.7,
-      "time_horizon_days": 7,
-      "confidence_threshold": 0.8
+    "thresholds": {
+      "critical_score": 0.8,
+      "high_priority": 0.7,
+      "medium_priority": 0.5,
+      "low_priority": 0.3
     },
-    "preventive": {
-      "priority_weight": 0.5,
-      "time_horizon_days": 180,
-      "confidence_threshold": 0.5
+    "filters": {
+      "min_confidence": 0.4,
+      "max_recommendations": 20,
+      "duplicate_threshold_hours": 24
     }
-  },
-  "scoring_weights": {
-    "urgency": 0.3,
-    "impact": 0.25,
-    "feasibility": 0.2,
-    "cost_effectiveness": 0.15,
-    "risk_reduction": 0.1
-  },
-  "thresholds": {
-    "critical_score": 0.8,
-    "high_priority": 0.7,
-    "medium_priority": 0.5,
-    "low_priority": 0.3
-  },
-  "filters": {
-    "min_confidence": 0.4,
-    "max_recommendations": 20,
-    "duplicate_threshold_hours": 24
   }
 }

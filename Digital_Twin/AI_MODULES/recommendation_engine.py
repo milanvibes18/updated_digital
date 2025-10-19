@@ -38,8 +38,8 @@ class RecommendationEngine:
         self.recommendation_templates = {}
         self.action_effectiveness = defaultdict(list)
         
-        # Knowledge base for recommendations
-        self.knowledge_base = self._initialize_knowledge_base()
+        # Knowledge base for recommendations (now loaded from config)
+        self.knowledge_base = self.config.get('knowledge_base', {})
         
         # Machine learning models for recommendations
         self.models = {}
@@ -124,7 +124,115 @@ class RecommendationEngine:
                         "min_confidence": 0.4,
                         "max_recommendations": 20,
                         "duplicate_threshold_hours": 24
+                    },
+                    # --- NEW: Enhanced Dynamic Knowledge Base with AND/OR logic ---
+                    "knowledge_base": {
+                        "maintenance_rules": {
+                            "critical_maintenance": {
+                                "conditions": {
+                                    "AND": [
+                                        {"key": "component_scores.maintenance.score", "op": "<", "value": 0.4}
+                                    ]
+                                },
+                                "recommendations": [
+                                    "Perform immediate inspection of maintenance-related components",
+                                    "Check all fluid levels and critical seals",
+                                    "Review maintenance logs for overdue tasks"
+                                ],
+                                "urgency": 0.9,
+                                "category": "maintenance"
+                            },
+                            "low_efficiency": {
+                                "conditions": {
+                                    "AND": [
+                                        {"key": "component_scores.efficiency.score", "op": "<", "value": 0.5}
+                                    ]
+                                },
+                                "recommendations": [
+                                    "Performance tuning required",
+                                    "Check operational parameters for efficiency loss",
+                                    "Inspect wear components related to efficiency"
+                                ],
+                                "urgency": 0.6,
+                                "category": "optimization"
+                            },
+                            "degrading_performance": {
+                                "conditions": {
+                                    "AND": [
+                                        {"key": "overall_score", "op": "<", "value": 0.7},
+                                        {"key": "trend_analysis.trend_strength", "op": ">", "value": 0.05},
+                                        {"key": "trend_analysis.trend_direction", "op": "==", "value": "degrading"}
+                                    ]
+                                },
+                                "recommendations": [
+                                    "Investigate root cause of performance degradation trend",
+                                    "Analyze components with the lowest scores",
+                                    "Update control algorithms to stabilize performance"
+                                ],
+                                "urgency": 0.7,
+                                "category": "operational"
+                            },
+                            "high_system_load": {
+                                "conditions": {
+                                    "AND": [
+                                        {"key": "system_load", "op": ">", "value": 0.9}
+                                    ]
+                                },
+                                "recommendations": [
+                                    "Implement load balancing strategies",
+                                    "Identify and optimize high-load processes",
+                                    "Consider scheduling non-critical tasks for off-peak hours"
+                                ],
+                                "urgency": 0.8,
+                                "category": "operational"
+                            },
+                            "high_risk_factor": {
+                                "conditions": {
+                                    "AND": [
+                                        {"key": "component_scores.reliability.score", "op": "<", "value": 0.6}
+                                    ]
+                                },
+                                "recommendations": [
+                                    "Inspect components related to reliability",
+                                    "Implement redundancy checks",
+                                    "Schedule preventive maintenance for high-risk components"
+                                ],
+                                "urgency": 0.7,
+                                "category": "preventive"
+                            },
+                            # --- NEW: Example of a complex rule with OR ---
+                            "critical_system_state": {
+                                "conditions": {
+                                    "OR": [
+                                        {"key": "overall_score", "op": "<", "value": 0.3},
+                                        {"key": "health_status", "op": "==", "value": "critical"},
+                                        {"key": "risk_assessment.overall_risk_level", "op": "==", "value": "critical"}
+                                    ]
+                                },
+                                "recommendations": [
+                                    "Initiate immediate system-wide safety check", 
+                                    "Alert critical response team",
+                                    "Review all active critical alerts"
+                                ],
+                                "urgency": 0.95,
+                                "category": "emergency"
+                            }
+                        },
+                        "optimization_patterns": {
+                            "energy_efficiency": [
+                                "Optimize operating schedules",
+                                "Implement load balancing",
+                                "Upgrade to efficient components"
+                            ]
+                        },
+                        "operational_guidelines": {
+                            "best_practices": [
+                                "Regular system health checks",
+                                "Maintain optimal operating conditions"
+                            ]
+                        }
                     }
+                    # --- End of Knowledge Base ---
                 }
                 
                 # Save default configuration
@@ -138,97 +246,37 @@ class RecommendationEngine:
         except Exception as e:
             self.logger.error(f"Failed to load configuration: {e}")
             return {}
-    
-    def _initialize_knowledge_base(self) -> Dict:
-        """Initialize knowledge base with recommendation rules and patterns."""
-        return {
-            'maintenance_rules': {
-                'high_temperature': {
-                    'conditions': ['temperature > 80', 'temperature_trend > 0.05'],
-                    'recommendations': [
-                        'Check cooling system',
-                        'Inspect thermal sensors',
-                        'Clean air filters',
-                        'Verify ventilation'
-                    ],
-                    'urgency': 0.8,
-                    'category': 'maintenance'
-                },
-                'high_vibration': {
-                    'conditions': ['vibration > 0.5', 'vibration_trend > 0.02'],
-                    'recommendations': [
-                        'Check bearing alignment',
-                        'Inspect mounting bolts',
-                        'Balance rotating components',
-                        'Lubricate moving parts'
-                    ],
-                    'urgency': 0.9,
-                    'category': 'maintenance'
-                },
-                'low_efficiency': {
-                    'conditions': ['efficiency < 70', 'efficiency_trend < -0.03'],
-                    'recommendations': [
-                        'Performance tuning required',
-                        'Check operational parameters',
-                        'Inspect wear components',
-                        'Update control algorithms'
-                    ],
-                    'urgency': 0.6,
-                    'category': 'optimization'
-                },
-                'pressure_anomaly': {
-                    'conditions': ['pressure_deviation > 20', 'pressure_instability > 0.1'],
-                    'recommendations': [
-                        'Check pressure regulators',
-                        'Inspect seals and gaskets',
-                        'Calibrate pressure sensors',
-                        'Verify system integrity'
-                    ],
-                    'urgency': 0.7,
-                    'category': 'maintenance'
-                }
-            },
-            'optimization_patterns': {
-                'energy_efficiency': [
-                    'Optimize operating schedules',
-                    'Implement load balancing',
-                    'Upgrade to efficient components',
-                    'Fine-tune control parameters'
-                ],
-                'performance_improvement': [
-                    'Streamline operational workflows',
-                    'Implement predictive control',
-                    'Optimize resource allocation',
-                    'Enhance monitoring systems'
-                ],
-                'cost_reduction': [
-                    'Consolidate maintenance schedules',
-                    'Implement condition-based maintenance',
-                    'Optimize inventory levels',
-                    'Reduce operational overhead'
-                ]
-            },
-            'operational_guidelines': {
-                'best_practices': [
-                    'Regular system health checks',
-                    'Maintain optimal operating conditions',
-                    'Follow recommended maintenance schedules',
-                    'Monitor key performance indicators'
-                ],
-                'safety_protocols': [
-                    'Ensure safety system functionality',
-                    'Maintain emergency procedures',
-                    'Regular safety training',
-                    'Compliance with safety standards'
-                ]
-            }
-        }
-    
+
+    # --- REMOVED: _initialize_knowledge_base method is no longer needed ---
+
+    # --- NEW: Helper function to flatten dictionaries for the rule engine ---
+    def _flatten_dict(self, d: Union[Dict, List], parent_key: str = '', sep: str = '.') -> Dict:
+        """
+        Flattens a nested dictionary or list into a single-level dictionary.
+        List items are keyed by their index.
+        """
+        items = {}
+        if isinstance(d, dict):
+            for k, v in d.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if isinstance(v, (dict, list)):
+                    items.update(self._flatten_dict(v, new_key, sep=sep))
+                else:
+                    items[new_key] = v
+        elif isinstance(d, list):
+            for i, v in enumerate(d):
+                new_key = f"{parent_key}{sep}{i}" if parent_key else str(i)
+                if isinstance(v, (dict, list)):
+                    items.update(self._flatten_dict(v, new_key, sep=sep))
+                else:
+                    items[new_key] = v
+        return items
+
     def generate_recommendations(self, 
-                               health_data: Dict,
-                               pattern_analysis: Dict = None,
-                               historical_data: pd.DataFrame = None,
-                               context: Dict = None) -> Dict:
+                                 health_data: Dict,
+                                 pattern_analysis: Dict = None,
+                                 historical_data: pd.DataFrame = None,
+                                 context: Dict = None) -> Dict:
         """
         Generate comprehensive recommendations based on system state and analysis.
         
@@ -279,8 +327,11 @@ class RecommendationEngine:
                 context_recommendations = self._generate_context_recommendations(self.current_context)
                 self._categorize_recommendations(recommendations, context_recommendations)
             
-            # 5. Knowledge base recommendations
-            kb_recommendations = self._generate_knowledge_base_recommendations(health_data, self.current_context)
+            # 5. Knowledge base recommendations (NOW DYNAMIC AND ENHANCED)
+            # This will now use the new rule engine and flattened data context
+            kb_recommendations = self._generate_knowledge_base_recommendations(
+                health_data, pattern_analysis, self.current_context
+            )
             self._categorize_recommendations(recommendations, kb_recommendations)
             
             # 6. Calculate composite scores and prioritize
@@ -640,19 +691,7 @@ class RecommendationEngine:
             
             # Operating hours recommendations
             operating_hours = context.get('operating_hours', 0)
-            if operating_hours > 8000:  # High usage
-                recommendations.append({
-                    'type': 'preventive',
-                    'title': 'High Operating Hours',
-                    'description': f'System has {operating_hours} operating hours',
-                    'action': 'Consider comprehensive system inspection',
-                    'urgency': 0.5,
-                    'impact': 0.7,
-                    'timeframe': 'within_month',
-                    'source': 'usage_analysis',
-                    'priority_level': 'medium'
-                })
-            elif operating_hours > 10000:  # Very high usage
+            if operating_hours > 10000:  # Very high usage
                 recommendations.append({
                     'type': 'maintenance',
                     'title': 'Very High Operating Hours',
@@ -663,6 +702,18 @@ class RecommendationEngine:
                     'timeframe': 'within_week',
                     'source': 'usage_analysis',
                     'priority_level': 'high'
+                })
+            elif operating_hours > 8000:  # High usage
+                recommendations.append({
+                    'type': 'preventive',
+                    'title': 'High Operating Hours',
+                    'description': f'System has {operating_hours} operating hours',
+                    'action': 'Consider comprehensive system inspection',
+                    'urgency': 0.5,
+                    'impact': 0.7,
+                    'timeframe': 'within_month',
+                    'source': 'usage_analysis',
+                    'priority_level': 'medium'
                 })
             
             # Environmental context
@@ -686,45 +737,40 @@ class RecommendationEngine:
             self.logger.error(f"Context recommendation generation error: {e}")
             return []
     
-    def _generate_knowledge_base_recommendations(self, health_data: Dict, context: Dict) -> List[Dict]:
-        """Generate recommendations based on knowledge base rules."""
+    # --- ENHANCED: Dynamic Knowledge Base Rule Engine ---
+    
+    def _generate_knowledge_base_recommendations(self, 
+                                               health_data: Dict, 
+                                               pattern_analysis: Dict, 
+                                               context: Dict) -> List[Dict]:
+        """Generate recommendations based on knowledge base rules loaded from config."""
         try:
             recommendations = []
-            maintenance_rules = self.knowledge_base.get('maintenance_rules', {})
+            rules = self.knowledge_base.get('maintenance_rules', {})
             
-            # Check each maintenance rule
-            for rule_name, rule_config in maintenance_rules.items():
-                conditions = rule_config.get('conditions', [])
-                rule_recommendations = rule_config.get('recommendations', [])
-                urgency = rule_config.get('urgency', 0.5)
-                category = rule_config.get('category', 'maintenance')
+            # --- NEW: Create a comprehensive, flattened data context ---
+            # This makes *all* data from all sources available to the rule engine
+            data_context = {}
+            if health_data:
+                data_context.update(self._flatten_dict(health_data))
+            if pattern_analysis:
+                data_context.update(self._flatten_dict(pattern_analysis))
+            if context:
+                # Context is already flat, so just update
+                data_context.update(context)
+            
+            # Evaluate each rule from the knowledge base
+            for rule_name, rule_config in rules.items():
+                conditions = rule_config.get('conditions', {})
                 
-                # Simple condition checking (would be more sophisticated in real implementation)
-                rule_triggered = False
-                
-                if rule_name == 'high_temperature' and health_data:
-                    component_scores = health_data.get('component_scores', {})
-                    temp_related = any('temp' in comp.lower() for comp in component_scores.keys())
-                    if temp_related:
-                        temp_score = min([data.get('score', 1.0) for comp, data in component_scores.items() if 'temp' in comp.lower()], default=1.0)
-                        if temp_score < 0.6:
-                            rule_triggered = True
-                
-                elif rule_name == 'high_vibration' and health_data:
-                    component_scores = health_data.get('component_scores', {})
-                    vibration_related = any('vibr' in comp.lower() for comp in component_scores.keys())
-                    if vibration_related:
-                        vib_score = min([data.get('score', 1.0) for comp, data in component_scores.items() if 'vibr' in comp.lower()], default=1.0)
-                        if vib_score < 0.6:
-                            rule_triggered = True
-                
-                elif rule_name == 'low_efficiency' and health_data:
-                    component_scores = health_data.get('component_scores', {})
-                    efficiency_score = component_scores.get('efficiency', {}).get('score', 1.0)
-                    if efficiency_score < 0.7:
-                        rule_triggered = True
+                # --- NEW: Call the enhanced recursive rule evaluator ---
+                rule_triggered = self._evaluate_rule(conditions, data_context)
                 
                 if rule_triggered:
+                    rule_recommendations = rule_config.get('recommendations', [])
+                    urgency = rule_config.get('urgency', 0.5)
+                    category = rule_config.get('category', 'maintenance')
+                    
                     for rec_text in rule_recommendations:
                         recommendations.append({
                             'type': category,
@@ -732,7 +778,7 @@ class RecommendationEngine:
                             'description': f'Knowledge base rule triggered: {rule_name}',
                             'action': rec_text,
                             'urgency': urgency,
-                            'impact': 0.7,
+                            'impact': 0.7,  # Default impact for KB rules
                             'timeframe': 'within_week' if urgency > 0.7 else 'within_month',
                             'source': 'knowledge_base',
                             'priority_level': 'high' if urgency > 0.7 else 'medium'
@@ -743,7 +789,96 @@ class RecommendationEngine:
         except Exception as e:
             self.logger.error(f"Knowledge base recommendation generation error: {e}")
             return []
-    
+
+    # --- NEW: Enhanced recursive rule evaluation (supports AND/OR) ---
+    def _evaluate_rule(self, conditions: Dict, data_context: Dict) -> bool:
+        """
+        Recursively evaluate a set of conditions (AND/OR) against the data context.
+        """
+        try:
+            if "AND" in conditions:
+                # All conditions in the list must be true
+                return all(self._evaluate_rule(cond, data_context) for cond in conditions["AND"])
+            
+            elif "OR" in conditions:
+                # Any condition in the list can be true
+                return any(self._evaluate_rule(cond, data_context) for cond in conditions["OR"])
+            
+            elif "key" in conditions:
+                # This is a base condition to check
+                return self._check_condition(conditions, data_context)
+            
+            else:
+                # Malformed rule structure
+                self.logger.warning(f"Skipping malformed rule condition block: {conditions}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error evaluating rule block '{conditions}': {e}")
+            return False
+
+    # --- NEW: Enhanced condition checker with robust type handling ---
+    def _check_condition(self, condition: Dict, data_context: Dict) -> bool:
+        """
+        Check a single condition (e.g., {"key": "x", "op": ">", "value": 5}).
+        Handles type conversion for numeric and string comparisons.
+        """
+        key = condition.get("key")
+        op = condition.get("op")
+        rule_value = condition.get("value")
+
+        if key is None or op is None or rule_value is None:
+            self.logger.warning(f"Skipping malformed condition: {condition}")
+            return False
+
+        actual_value = data_context.get(key)
+        
+        if actual_value is None:
+            # Data required by the rule is not available in the context
+            # self.logger.debug(f"Rule key '{key}' not in data context.")
+            return False
+        
+        # --- Robust Comparison Logic ---
+        try:
+            # Try numeric comparison first
+            num_actual = float(actual_value)
+            num_rule = float(rule_value)
+            
+            if op == '<':
+                return num_actual < num_rule
+            if op == '>':
+                return num_actual > num_rule
+            if op == '<=':
+                return num_actual <= num_rule
+            if op == '>=':
+                return num_actual >= num_rule
+            if op == '==':
+                return num_actual == num_rule
+            if op == '!=':
+                return num_actual != num_rule
+
+        except (ValueError, TypeError):
+            # Fallback to string comparison for '==' and '!='
+            str_actual = str(actual_value)
+            str_rule = str(rule_value)
+            
+            if op == '==':
+                return str_actual == str_rule
+            if op == '!=':
+                return str_actual != str_rule
+            
+            # Cannot perform <, > on non-numeric types
+            self.logger.warning(
+                f"Cannot perform numeric op '{op}' on non-numeric values: "
+                f"'{key}' (Value: {actual_value}) vs Rule Value: {rule_value}"
+            )
+            return False
+        
+        self.logger.warning(f"Unknown operator in rule: {op}")
+        return False
+        
+    # --- End of Enhancement ---
+
     def _categorize_recommendations(self, recommendations: Dict, new_recommendations: List[Dict]):
         """Categorize recommendations into appropriate buckets."""
         try:
@@ -911,8 +1046,8 @@ class RecommendationEngine:
         try:
             total = 0
             categories = ['emergency_recommendations', 'maintenance_recommendations',
-                         'optimization_recommendations', 'operational_recommendations',
-                         'preventive_recommendations']
+                        'optimization_recommendations', 'operational_recommendations',
+                        'preventive_recommendations']
             
             for category in categories:
                 total += len(recommendations.get(category, []))
@@ -928,7 +1063,7 @@ class RecommendationEngine:
         try:
             # Sort by urgency and impact
             urgent_recs = [rec for rec in recommendations 
-                          if rec.get('urgency', 0) > 0.7 or rec.get('priority_level') == 'critical']
+                           if rec.get('urgency', 0) > 0.7 or rec.get('priority_level') == 'critical']
             
             urgent_recs.sort(key=lambda x: (x.get('urgency', 0), x.get('impact', 0)), reverse=True)
             
@@ -1194,6 +1329,8 @@ class RecommendationEngine:
 # Example usage and testing
 if __name__ == "__main__":
     # Initialize recommendation engine
+    # This will create a new 'CONFIG/recommendation_config.json' if it doesn't exist,
+    # now with the new enhanced rule structure.
     rec_engine = RecommendationEngine()
     
     # Sample health data
@@ -1203,16 +1340,16 @@ if __name__ == "__main__":
         'component_scores': {
             'performance': {'score': 0.7},
             'reliability': {'score': 0.8},
-            'efficiency': {'score': 0.4},  # Low efficiency
+            'efficiency': {'score': 0.4},  # Low efficiency (triggers 'low_efficiency' rule)
             'safety': {'score': 0.9},
-            'maintenance': {'score': 0.3}   # Critical maintenance needed
+            'maintenance': {'score': 0.3}  # Critical maintenance (triggers 'critical_maintenance' rule)
         },
         'trend_analysis': {
-            'trend_direction': 'degrading',
+            'trend_direction': 'degrading', # Triggers 'degrading_performance' rule
             'trend_strength': 0.08
         },
         'risk_assessment': {
-            'overall_risk_level': 'medium',
+            'overall_risk_level': 'high', # Could trigger 'critical_system_state' rule
             'risk_factors': [
                 {
                     'component': 'efficiency',
@@ -1271,13 +1408,13 @@ if __name__ == "__main__":
     
     # Context information
     sample_context = {
-        'system_load': 0.95,  # High load
+        'system_load': 0.95,  # High load (triggers 'high_system_load' rule)
         'operating_hours': 8760,  # Full year
         'last_maintenance': '2024-01-01',
         'location': 'factory_floor_a'
     }
     
-    print("=== DIGITAL TWIN RECOMMENDATION ENGINE DEMO ===\n")
+    print("=== DIGITAL TWIN RECOMMENDATION ENGINE DEMO (ENHANCED) ===\n")
     
     # Generate recommendations
     print("1. Generating comprehensive recommendations...")
@@ -1289,68 +1426,68 @@ if __name__ == "__main__":
     )
     
     # Display results
-    print(f"   Total recommendations generated: {recommendations['summary']['total_recommendations']}")
-    print(f"   Emergency: {len(recommendations['emergency_recommendations'])}")
-    print(f"   Maintenance: {len(recommendations['maintenance_recommendations'])}")
-    print(f"   Optimization: {len(recommendations['optimization_recommendations'])}")
-    print(f"   Operational: {len(recommendations['operational_recommendations'])}")
-    print(f"   Preventive: {len(recommendations['preventive_recommendations'])}")
+    print(f"    Total recommendations generated: {recommendations['summary']['total_recommendations']}")
+    print(f"    Emergency: {len(recommendations['emergency_recommendations'])}")
+    print(f"    Maintenance: {len(recommendations['maintenance_recommendations'])}")
+    print(f"    Optimization: {len(recommendations['optimization_recommendations'])}")
+    print(f"    Operational: {len(recommendations['operational_recommendations'])}")
+    print(f"    Preventive: {len(recommendations['preventive_recommendations'])}")
     print()
     
     # Show top recommendations
     print("2. Top Priority Recommendations:")
     top_recs = recommendations['summary']['top_recommendations']
     for i, rec in enumerate(top_recs, 1):
-        print(f"   {i}. [{rec['priority'].upper()}] {rec['title']}")
-        print(f"      Score: {rec['score']:.3f} | Timeframe: {rec['timeframe']}")
+        print(f"    {i}. [{rec['priority'].upper()}] {rec['title']}")
+        print(f"       Score: {rec['score']:.3f} | Timeframe: {rec['timeframe']}")
     print()
     
     # Show emergency recommendations
     if recommendations['emergency_recommendations']:
-        print("3. Emergency Recommendations:")
+        print("3. Emergency Recommendations (from Knowledge Base):")
         for rec in recommendations['emergency_recommendations']:
-            print(f"   • {rec['title']}")
-            print(f"     Action: {rec['action']}")
-            print(f"     Urgency: {rec['urgency']:.2f} | Impact: {rec['impact']:.2f}")
+            print(f"    • {rec['title']} (Source: {rec['source']})")
+            print(f"      Action: {rec['action']}")
+            print(f"      Urgency: {rec['urgency']:.2f} | Impact: {rec['impact']:.2f}")
         print()
     
     # Show maintenance recommendations
     if recommendations['maintenance_recommendations']:
         print("4. Critical Maintenance Recommendations:")
         for rec in recommendations['maintenance_recommendations'][:3]:
-            print(f"   • {rec['title']}")
-            print(f"     Action: {rec['action']}")
-            print(f"     Priority: {rec.get('priority_level', 'unknown')}")
+            print(f"    • {rec['title']} (Source: {rec['source']})")
+            print(f"      Action: {rec['action']}")
+            print(f"      Priority: {rec.get('priority_level', 'unknown')}")
         print()
     
     # Show next actions
     print("5. Immediate Next Actions:")
     next_actions = recommendations['summary']['next_actions']
     for i, action in enumerate(next_actions, 1):
-        print(f"   {i}. {action['action']}")
-        print(f"      Category: {action['category']} | Timeframe: {action['timeframe']}")
+        print(f"    {i}. {action['action']}")
+        print(f"       Category: {action['category']} | Timeframe: {action['timeframe']}")
     print()
     
     # Impact estimation
     print("6. Estimated Impact of Recommendations:")
     impact = recommendations['summary']['estimated_impact']
-    print(f"   Estimated Improvement: {impact['estimated_improvement']*100:.1f}%")
-    print(f"   Confidence: {impact['confidence']*100:.1f}%")
-    print(f"   Impact Areas: {', '.join(impact['impact_areas'])}")
+    print(f"    Estimated Improvement: {impact['estimated_improvement']*100:.1f}%")
+    print(f"    Confidence: {impact['confidence']*100:.1f}%")
+    print(f"    Impact Areas: {', '.join(impact['impact_areas'])}")
     print()
     
     # Export recommendations
     print("7. Exporting recommendations...")
     export_path = rec_engine.export_recommendations(recommendations)
-    print(f"   Recommendations exported to: {export_path}")
+    print(f"    Recommendations exported to: {export_path}")
     
     # Statistics
     print("\n8. Recommendation Engine Statistics:")
     stats = rec_engine.get_recommendation_statistics()
-    print(f"   Total recommendation sessions: {stats['total_sessions']}")
-    print(f"   Total recommendations generated: {stats['total_recommendations']}")
+    print(f"    Total recommendation sessions: {stats['total_sessions']}")
+    print(f"    Total recommendations generated: {stats['total_recommendations']}")
     if stats['total_sessions'] > 0:
-        print(f"   Average recommendations per session: {stats['average_per_session']:.1f}")
+        print(f"    Average recommendations per session: {stats['average_per_session']:.1f}")
     print()
     
     # Simulate effectiveness feedback
@@ -1358,7 +1495,7 @@ if __name__ == "__main__":
     if recommendations['maintenance_recommendations']:
         # Simulate high effectiveness for first maintenance recommendation
         rec_engine.update_recommendation_effectiveness("maintenance_001", 0.85)
-        print("   Updated effectiveness score for maintenance recommendation")
+        print("    Updated effectiveness score for maintenance recommendation")
     
     print("\n=== RECOMMENDATION ENGINE DEMO COMPLETED ===")
     print("\nKey Findings:")
@@ -1368,3 +1505,4 @@ if __name__ == "__main__":
     print("- Context-aware suggestions for current operating conditions")
     print("- Comprehensive scoring and prioritization of all recommendations")
     print("- Actionable next steps with clear timeframes and priorities")
+    print("- **NEW**: Enhanced Knowledge Base rules (e.g., 'critical_system_state') were evaluated using AND/OR logic and a fully flattened data context.")

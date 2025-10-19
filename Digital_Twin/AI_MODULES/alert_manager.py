@@ -277,7 +277,7 @@ class AlertManager:
             return []
     
     def _evaluate_single_rule(self, rule_name: str, rule_config: Dict, data: Dict, 
-                             device_id: str, current_time: datetime) -> Optional[Dict]:
+                              device_id: str, current_time: datetime) -> Optional[Dict]:
         """Evaluate a single alert rule."""
         try:
             metric = rule_config.get('metric')
@@ -487,11 +487,16 @@ class AlertManager:
                 self.logger.info(f"Alert rate limited: {alert['id']}")
                 return
             
-            # Store alert
-            self._store_alert(alert)
+            # --- MODIFIED: Store notification timestamps ---
+            # Initialize notifications list
+            alert['notifications_sent'] = []
             
-            # Send notifications
+            # Send notifications (this will populate 'notifications_sent')
             self._send_notifications(alert)
+            
+            # Store alert (now includes notification info in the history copy)
+            self._store_alert(alert)
+            # --- END MODIFICATION ---
             
             # Setup escalation if needed
             self._setup_escalation(alert)
@@ -632,7 +637,7 @@ class AlertManager:
             # Add to active alerts
             self.active_alerts[alert['id']] = alert
             
-            # Add to history
+            # Add to history (make a copy to capture current state)
             self.alert_history.append(alert.copy())
             
             # Clean up old resolved alerts from active alerts
@@ -671,6 +676,12 @@ class AlertManager:
                         handler = self.notification_handlers.get(channel)
                         if handler:
                             handler(alert)
+                            # --- NEW: Record timestamped notification ---
+                            alert['notifications_sent'].append({
+                                'channel': channel,
+                                'timestamp': datetime.now().isoformat()
+                            })
+                            # --- END NEW ---
                     except Exception as e:
                         self.logger.error(f"Notification sending error ({channel}): {e}")
                         
@@ -739,6 +750,13 @@ class AlertManager:
                         handler = self.notification_handlers.get(channel)
                         if handler:
                             handler(escalation_alert)
+                            # --- NEW: Record escalation notification ---
+                            alert['notifications_sent'].append({
+                                'channel': channel,
+                                'timestamp': datetime.now().isoformat(),
+                                'level': level
+                            })
+                            # --- END NEW ---
                             
                     except Exception as e:
                         self.logger.error(f"Escalation notification error ({channel}): {e}")
@@ -901,6 +919,46 @@ class AlertManager:
         except Exception as e:
             self.logger.error(f"Get active alerts error: {e}")
             return []
+
+    # --- NEW: Function to get historical alerts (for AlertCard.tsx) ---
+    def get_alert_history(self, limit: int = 100, device_id: str = None, severity: str = None) -> List[Dict]:
+        """
+        Get list of historical alerts (active and resolved) with optional filtering.
+        Useful for populating dashboards (e.g., AlertCard.tsx).
+        
+        Args:
+            limit (int): Maximum number of alerts to return.
+            device_id (str, optional): Filter by device ID.
+            severity (str, optional): Filter by severity (e.g., 'critical', 'warning').
+            
+        Returns:
+            List[Dict]: A list of alert objects, sorted newest first.
+        """
+        try:
+            # Get a snapshot of the history (deque items in reverse order - newest first)
+            historical_alerts = list(reversed(self.alert_history))
+            
+            filtered_alerts = []
+            
+            for alert in historical_alerts:
+                if device_id and alert.get('device_id') != device_id:
+                    continue
+                    
+                if severity and alert.get('severity') != severity:
+                    continue
+                    
+                filtered_alerts.append(alert.copy())
+                
+                if len(filtered_alerts) >= limit:
+                    break
+            
+            # The list is already sorted newest-first due to list(reversed(deque))
+            return filtered_alerts
+            
+        except Exception as e:
+            self.logger.error(f"Get alert history error: {e}")
+            return []
+    # --- END NEW ---
     
     def get_alert_statistics(self) -> Dict:
         """Get comprehensive alert statistics."""
@@ -1069,6 +1127,20 @@ if __name__ == "__main__":
     final_stats = alert_manager.get_alert_statistics()
     print(f"   Remaining active alerts: {final_stats['current_status']['active_alerts']}")
     print()
+
+    # --- NEW: Test Historical Alert Retrieval (for AlertCard.tsx) ---
+    print("8. Testing Historical Alert Retrieval (for AlertCard.tsx)...")
+    history = alert_manager.get_alert_history(limit=5)
+    print(f"   Retrieved {len(history)} recent alerts from history:")
+    for alert in history:
+        print(f"   - [{alert['status'].upper()}] {alert['description']} (Severity: {alert['severity']})")
+        # Check for the new notification data
+        if alert['notifications_sent']:
+            print(f"     Notifications sent: {len(alert['notifications_sent'])}")
+            for notif in alert['notifications_sent']:
+                print(f"     - {notif['channel']} at {notif['timestamp']}")
+    print()
+    # --- END NEW ---
     
     # Stop the alert manager
     alert_manager.stop()
@@ -1080,6 +1152,8 @@ if __name__ == "__main__":
     print("- Alert suppression and rate limiting")
     print("- Alert correlation and grouping")
     print("- Notification routing (placeholder implementations)")
+    print("- --- NEW: Timestamped notification tracking on alert objects ---")
     print("- Escalation management")
     print("- Alert acknowledgment and resolution")
+    print("- --- NEW: Historical alert retrieval via get_alert_history() ---")
     print("- Comprehensive statistics and monitoring")

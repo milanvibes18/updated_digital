@@ -3,6 +3,10 @@
 Secure Database Manager
 Handles all database interactions, including data encryption/decryption,
 user authentication, data integrity, and audit logging.
+
+Uses AES-256-GCM for authenticated encryption.
+Requires ENCRYPTION_KEY environment variable to be set with a 32-byte,
+base64-encoded key.
 """
 
 import sqlite3
@@ -12,10 +16,14 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
-from cryptography.fernet import Fernet
 import base64
 import os
 import sys
+import unittest
+
+# --- NEW Imports for AES-256-GCM ---
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 
 # --- Added from File 2 ---
 import pandas as pd
@@ -43,16 +51,13 @@ class SecureDatabaseManager:
     """
 
     # --- Merged Feature (__init__) ---
-    def __init__(self, 
-                 db_path=DEFAULT_PRIMARY_DB, 
-                 users_db_path=DEFAULT_USERS_DB, 
-                 encryption_key_path="CONFIG/encryption.key", 
-                 salt_key_path="CONFIG/salt.key"):
+    # REFACTORED: Removed key/salt paths, now loaded from env.
+    def __init__(self,
+                 db_path=DEFAULT_PRIMARY_DB,
+                 users_db_path=DEFAULT_USERS_DB):
         
         self.db_path = db_path
         self.users_db_path = users_db_path  # From File 2
-        self.encryption_key_path = encryption_key_path
-        self.salt_key_path = salt_key_path
         
         # Setup logging (From File 1)
         self.logger = self._setup_logging()
@@ -60,11 +65,9 @@ class SecureDatabaseManager:
         # Ensure directories exist (Merged)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.users_db_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(self.encryption_key_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(self.salt_key_path).parent.mkdir(parents=True, exist_ok=True)
         
-        # Initialize encryption (From File 1 - Superior)
-        self.fernet = self._initialize_encryption()
+        # Initialize encryption (REFACTORED)
+        self.aes_gcm_key = self._initialize_encryption()
         
         # Initialize databases (Merged)
         self._initialize_database()  # Initializes data/audit/device tables
@@ -93,64 +96,56 @@ class SecureDatabaseManager:
         
         return logger
 
-    # --- Kept from File 1 (Superior Key/Salt Generation) ---
-    def _generate_key(self):
-        """Generate a new encryption key."""
-        return Fernet.generate_key()
+    # --- NEW: Static method for key generation ---
+    @staticmethod
+    def generate_key_for_env() -> str:
+        """
+        Generates a 32-byte (256-bit) key, base64-encoded for env vars.
+        """
+        key = secrets.token_bytes(32)  # 32 bytes = 256 bits
+        return base64.b64encode(key).decode('utf-8')
 
-    # --- Kept from File 1 ---
-    def _generate_salt(self):
-        """Generate a new salt for key derivation."""
-        return secrets.token_bytes(32)
-
-    # --- Kept from File 1 (Superior Initialization) ---
+    # --- REFACTORED: Load key from Environment Variable ---
     def _initialize_encryption(self):
-        """Initialize encryption with key management."""
+        """
+        Initialize encryption by loading the 32-byte key from
+        the ENCRYPTION_KEY environment variable.
+        """
         try:
-            # Load or generate encryption key
-            if os.path.exists(self.encryption_key_path):
-                with open(self.encryption_key_path, 'rb') as key_file:
-                    key = key_file.read()
-            else:
-                key = self._generate_key()
-                with open(self.encryption_key_path, 'wb') as key_file:
-                    key_file.write(key)
-                os.chmod(self.encryption_key_path, 0o600)  # Restrict permissions
+            key_b64 = os.environ.get("ENCRYPTION_KEY")
+            if not key_b64:
+                self.logger.error("ENCRYPTION_KEY environment variable not set.")
+                raise ValueError("ENCRYPTION_KEY not set")
+            
+            key = base64.b64decode(key_b64)
+            
+            if len(key) != 32:
+                self.logger.error(
+                    f"ENCRYPTION_KEY must be 32 bytes (256-bit), but got {len(key)} bytes."
+                )
+                raise ValueError("Invalid key length")
                 
-            # Load or generate salt
-            if os.path.exists(self.salt_key_path):
-                with open(self.salt_key_path, 'rb') as salt_file:
-                    salt = salt_file.read()
-            else:
-                salt = self._generate_salt()
-                with open(self.salt_key_path, 'wb') as salt_file:
-                    salt_file.write(salt)
-                os.chmod(self.salt_key_path, 0o600)
-                
-            # Create Fernet instance
-            fernet = Fernet(key)
-            self.logger.info("Encryption initialized successfully")
-            return fernet
+            self.logger.info("AES-256-GCM Encryption key loaded successfully")
+            return key
             
         except Exception as e:
             self.logger.error(f"Failed to initialize encryption: {e}")
             raise
 
-    # --- Kept from File 1 (Core Secure Tables) ---
+    # --- REFACTORED: Removed data_hash column ---
     def _initialize_database(self):
         """Initialize the secure database with required tables."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
-                # Create health data table (with data_hash)
+                # Create health data table (REMOVED data_hash)
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS health_data (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         device_id TEXT NOT NULL,
                         timestamp DATETIME NOT NULL,
                         encrypted_data TEXT NOT NULL,
-                        data_hash TEXT NOT NULL,
                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
@@ -222,46 +217,64 @@ class SecureDatabaseManager:
             self.logger.error(f"Failed to initialize user database: {e}")
             raise
 
-    # --- Kept from File 1 (Superior Encryption) ---
+    # --- REFACTORED: Use AES-256-GCM ---
     def encrypt_data(self, data):
-        """Encrypt data using Fernet encryption."""
+        """Encrypt data using AES-256-GCM."""
         try:
             if isinstance(data, dict):
                 data = json.dumps(data)
             elif not isinstance(data, (str, bytes)):
                 data = str(data)
-                
+            
             if isinstance(data, str):
-                data = data.encode()
-                
-            encrypted = self.fernet.encrypt(data)
-            return base64.b64encode(encrypted).decode()
+                data = data.encode('utf-8')
+            
+            aesgcm = AESGCM(self.aes_gcm_key)
+            nonce = secrets.token_bytes(12)  # GCM standard 96-bit nonce
+            
+            # encrypt() returns ciphertext + 16-byte authentication tag
+            ciphertext_with_tag = aesgcm.encrypt(nonce, data, None) 
+            
+            # Store as nonce + (ciphertext + tag), all base64 encoded
+            combined = nonce + ciphertext_with_tag
+            return base64.b64encode(combined).decode('utf-8')
             
         except Exception as e:
             self.logger.error(f"Failed to encrypt data: {e}")
             raise
 
-    # --- Kept from File 1 (Superior Decryption) ---
+    # --- REFACTORED: Use AES-256-GCM ---
     def decrypt_data(self, encrypted_data):
-        """Decrypt data using Fernet encryption."""
+        """Decrypt data using AES-256-GCM and verify integrity."""
         try:
-            encrypted_bytes = base64.b64decode(encrypted_data.encode())
-            decrypted = self.fernet.decrypt(encrypted_bytes)
-            return decrypted.decode()
+            combined_bytes = base64.b64decode(encrypted_data.encode('utf-8'))
             
+            # Extract the 12-byte nonce
+            nonce = combined_bytes[:12]
+            # Extract the remaining (ciphertext + tag)
+            ciphertext_with_tag = combined_bytes[12:]
+            
+            if len(nonce) != 12:
+                 raise ValueError("Invalid encrypted data format: nonce length incorrect")
+
+            aesgcm = AESGCM(self.aes_gcm_key)
+            
+            # decrypt() will raise InvalidTag exception if auth fails
+            decrypted = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
+            
+            return decrypted.decode('utf-8')
+            
+        except (base64.binascii.Error, ValueError) as e:
+            self.logger.error(f"Failed to decrypt data (format/padding error): {e}")
+            raise
+        except InvalidTag:
+            self.logger.warning("Failed to decrypt data: DATA TAMPERING DETECTED (InvalidTag)")
+            raise
         except Exception as e:
             self.logger.error(f"Failed to decrypt data: {e}")
             raise
 
-    # --- Kept from File 1 (Critical for Integrity) ---
-    def _calculate_hash(self, data):
-        """Calculate SHA-256 hash of data for integrity verification."""
-        if isinstance(data, dict):
-            data = json.dumps(data, sort_keys=True)
-        elif not isinstance(data, str):
-            data = str(data)
-            
-        return hashlib.sha256(data.encode()).hexdigest()
+    # --- REMOVED: _calculate_hash (redundant with AES-GCM) ---
 
     # --- Kept from File 1 (Critical for Auditing) ---
     def log_audit_event(self, action, user_id=None, table_name=None, record_id=None, 
@@ -273,7 +286,7 @@ class SecureDatabaseManager:
                 
                 cursor.execute('''
                     INSERT INTO audit_log (action, user_id, table_name, record_id, 
-                                         old_values, new_values, ip_address, user_agent)
+                                           old_values, new_values, ip_address, user_agent)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (action, user_id, table_name, record_id, 
                       json.dumps(old_values) if old_values else None,
@@ -341,12 +354,11 @@ class SecureDatabaseManager:
             self.log_audit_event(action="AUTH_ERROR", user_id=username, new_values={"error": str(e)})
             return False
 
-    # --- Kept from File 1 (Superior Secure Insert) ---
+    # --- REFACTORED: Removed data_hash ---
     def insert_health_data(self, device_id, data, user_id=None):
-        """Insert encrypted health data with integrity verification."""
+        """Insert encrypted health data."""
         try:
-            # Calculate hash before encryption
-            data_hash = self._calculate_hash(data)
+            # Hash calculation removed (now handled by GCM)
             
             # Encrypt the data
             encrypted_data = self.encrypt_data(data)
@@ -355,9 +367,9 @@ class SecureDatabaseManager:
                 cursor = conn.cursor()
                 
                 cursor.execute('''
-                    INSERT INTO health_data (device_id, timestamp, encrypted_data, data_hash)
-                    VALUES (?, ?, ?, ?)
-                ''', (device_id, datetime.now(), encrypted_data, data_hash))
+                    INSERT INTO health_data (device_id, timestamp, encrypted_data)
+                    VALUES (?, ?, ?)
+                ''', (device_id, datetime.now(), encrypted_data))
                 
                 record_id = cursor.lastrowid
                 conn.commit()
@@ -368,7 +380,7 @@ class SecureDatabaseManager:
                     user_id=user_id,
                     table_name="health_data",
                     record_id=str(record_id),
-                    new_values={"device_id": device_id, "data_hash": data_hash}
+                    new_values={"device_id": device_id} # Removed data_hash
                 )
                 
                 self.logger.info(f"Health data inserted for device {device_id}")
@@ -378,15 +390,16 @@ class SecureDatabaseManager:
             self.logger.error(f"Failed to insert health data: {e}")
             raise
 
-    # --- Kept from File 1 (Superior Secure Get with Integrity Check) ---
+    # --- REFACTORED: Removed manual integrity check ---
     def get_health_data(self, device_id=None, start_date=None, end_date=None, limit=None):
-        """Retrieve and decrypt health data with integrity verification."""
+        """Retrieve and decrypt health data (integrity verified by AES-GCM)."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row # Use Row factory
                 cursor = conn.cursor()
                 
-                query = "SELECT id, device_id, timestamp, encrypted_data, data_hash FROM health_data WHERE 1=1"
+                # Removed data_hash from query
+                query = "SELECT id, device_id, timestamp, encrypted_data FROM health_data WHERE 1=1"
                 params = []
                 
                 if device_id:
@@ -413,7 +426,7 @@ class SecureDatabaseManager:
                 results = []
                 for row in rows:
                     try:
-                        # Decrypt data
+                        # Decrypt data (this will raise InvalidTag if tampered)
                         decrypted_data = self.decrypt_data(row['encrypted_data'])
                         
                         # Parse JSON if applicable
@@ -422,12 +435,7 @@ class SecureDatabaseManager:
                         except json.JSONDecodeError:
                             data = decrypted_data
                         
-                        # Verify integrity
-                        calculated_hash = self._calculate_hash(data)
-                        if calculated_hash != row['data_hash']:
-                            self.logger.warning(f"DATA TAMPERING DETECTED for record {row['id']}")
-                            self.log_audit_event(action="INTEGRITY_FAIL", record_id=row['id'], table_name="health_data")
-                            continue
+                        # Manual hash verification removed
                         
                         results.append({
                             'id': row['id'],
@@ -436,6 +444,11 @@ class SecureDatabaseManager:
                             'data': data
                         })
                         
+                    except InvalidTag:
+                        # This catches tampering
+                        self.logger.warning(f"DATA TAMPERING DETECTED for record {row['id']}. Skipping.")
+                        self.log_audit_event(action="INTEGRITY_FAIL", record_id=row['id'], table_name="health_data")
+                        continue
                     except Exception as e:
                         self.logger.error(f"Failed to process record {row['id']}: {e}")
                         continue
@@ -481,6 +494,7 @@ class SecureDatabaseManager:
             return pd.DataFrame()
 
     # --- All Device/Session/Audit methods below are Kept from File 1 ---
+    # (These are unchanged as their core logic was sound)
 
     def register_device(self, device_id, device_name, device_type, location=None, config=None):
         """Register a new device with encrypted configuration."""
@@ -733,14 +747,95 @@ class SecureDatabaseManager:
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")
 
-# --- Merged Feature (Combined __main__ for Testing) ---
-if __name__ == "__main__":
-    # Setup basic logging to console for testing
-    logging.basicConfig(level=logging.INFO, 
-                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# --- NEW: Unit Test Class for Encryption ---
+class TestEncryption(unittest.TestCase):
+    """Tests the new AES-GCM encryption/decryption."""
     
+    def setUp(self):
+        """Set up a dummy key and a manager instance for testing."""
+        # Generate a temporary key for this test run
+        self.test_key = SecureDatabaseManager.generate_key_for_env()
+        os.environ["ENCRYPTION_KEY"] = self.test_key
+        
+        # Use in-memory databases for testing
+        self.db_manager = SecureDatabaseManager(
+            db_path=":memory:", 
+            users_db_path=":memory:"
+        )
+    
+    def test_encrypt_decrypt_roundtrip_str(self):
+        """Test encrypting and decrypting a simple string."""
+        original_str = "This is a secret message!"
+        encrypted = self.db_manager.encrypt_data(original_str)
+        decrypted = self.db_manager.decrypt_data(encrypted)
+        self.assertEqual(original_str, decrypted)
+        self.assertNotEqual(original_str, encrypted)
+
+    def test_encrypt_decrypt_roundtrip_dict(self):
+        """Test encrypting and decrypting a dictionary."""
+        original_dict = {"patient_id": 123, "data": {"bp": "120/80"}}
+        encrypted = self.db_manager.encrypt_data(original_dict)
+        decrypted_str = self.db_manager.decrypt_data(encrypted)
+        decrypted_dict = json.loads(decrypted_str)
+        self.assertEqual(original_dict, decrypted_dict)
+
+    def test_tampered_data_fails(self):
+        """Test that tampered ciphertext fails decryption."""
+        original_str = "Sensitive info"
+        encrypted = self.db_manager.encrypt_data(original_str)
+        
+        # Tamper the data
+        encrypted_bytes = base64.b64decode(encrypted.encode('utf-8'))
+        # Flip a bit in the ciphertext (last byte, which is part of the tag)
+        tampered_bytes = encrypted_bytes[:-1] + bytes([encrypted_bytes[-1] ^ 1])
+        tampered_encrypted_str = base64.b64encode(tampered_bytes).decode('utf-8')
+
+        with self.assertRaises(InvalidTag):
+            self.db_manager.decrypt_data(tampered_encrypted_str)
+
+    def test_tampered_nonce_fails(self):
+        """Test that tampered nonce fails decryption."""
+        original_str = "Sensitive info"
+        encrypted = self.db_manager.encrypt_data(original_str)
+        
+        # Tamper the nonce
+        encrypted_bytes = base64.b64decode(encrypted.encode('utf-8'))
+        # Flip a bit in the nonce (first byte)
+        tampered_bytes = bytes([encrypted_bytes[0] ^ 1]) + encrypted_bytes[1:]
+        tampered_encrypted_str = base64.b64encode(tampered_bytes).decode('utf-8')
+
+        with self.assertRaises(InvalidTag):
+            self.db_manager.decrypt_data(tampered_encrypted_str)
+
+    def test_different_data_different_ciphertext(self):
+        """Test that encrypting the same data twice yields different ciphertext."""
+        original_str = "Data to be encrypted"
+        encrypted1 = self.db_manager.encrypt_data(original_str)
+        encrypted2 = self.db_manager.encrypt_data(original_str)
+        self.assertNotEqual(encrypted1, encrypted2, "Nonces should be different, producing different ciphertext")
+
+    def tearDown(self):
+        """Clean up environment variable."""
+        if "ENCRYPTION_KEY" in os.environ:
+            del os.environ["ENCRYPTION_KEY"]
+
+def run_demo():
+    """Runs the original demo, assuming ENCRYPTION_KEY is set."""
+    
+    print("\n--- Running SecureDatabaseManager Demo ---")
+    
+    if not os.environ.get("ENCRYPTION_KEY"):
+        print("\nFATAL: ENCRYPTION_KEY environment variable not set.")
+        print("Please run 'python secure_database_manager.py generate_key' first.")
+        print("Then, set the environment variable and run this demo again.")
+        sys.exit(1)
+
     # Initialize secure database manager
-    db_manager = SecureDatabaseManager()
+    # Use test paths for the demo to avoid clobbering real dbs
+    db_manager = SecureDatabaseManager(
+        db_path="DATABASE/demo_secure_database.db",
+        users_db_path="DATABASE/demo_users.db"
+    )
     
     print("\n--- Testing User Management (from File 2) ---")
     db_manager.create_user("admin", "securepassword123", "admin@digitaltwin.com")
@@ -798,3 +893,39 @@ if __name__ == "__main__":
     
     # Close
     db_manager.close()
+    
+    print("\n--- Demo Complete ---")
+    print(f"Demo databases created at {db_manager.db_path} and {db_manager.users_db_path}")
+
+# --- REFACTORED: Main execution block for testing and key generation ---
+if __name__ == "__main__":
+    # Setup basic logging to console
+    logging.basicConfig(level=logging.INFO, 
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    if len(sys.argv) > 1:
+        if sys.argv[1] == 'generate_key':
+            print("--- New Base64-Encoded 256-bit (32-byte) AES Key ---")
+            print("Set this as your ENCRYPTION_KEY environment variable:")
+            print(SecureDatabaseManager.generate_key_for_env())
+        
+        elif sys.argv[1] == 'test':
+            print("--- Running Encryption Unit Tests ---")
+            # Run tests
+            suite = unittest.TestSuite()
+            suite.addTest(unittest.makeSuite(TestEncryption))
+            runner = unittest.TextTestRunner()
+            runner.run(suite)
+        
+        elif sys.argv[1] == 'run_demo':
+            run_demo()
+        
+        else:
+            print(f"Unknown command: {sys.argv[1]}")
+            print("Usage: python secure_database_manager.py [generate_key|test|run_demo]")
+    
+    else:
+        print("Usage: python secure_database_manager.py [generate_key|test|run_demo]")
+        print(" - generate_key: Generate a new encryption key for your .env file")
+        print(" - test:           Run internal unit tests for encryption")
+        print(" - run_demo:       Run the full demo (requires ENCRYPTION_KEY to be set)")

@@ -3,40 +3,75 @@ import pandas as pd
 import logging
 import json
 import pickle
+import joblib
+import sys
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from collections import defaultdict, deque
 import warnings
-warnings.filterwarnings('ignore')
 
-# Statistical and ML imports
+# --- Add project root to path ---
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# --- ML Imports ---
+warnings.filterwarnings('ignore')
 from scipy import stats
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.metrics import mean_squared_error
-from sklearn.ensemble import IsolationForest
+from sklearn.metrics import mean_squared_error, classification_report
+from sklearn.ensemble import IsolationForest, RandomForestRegressor
+from sklearn.model_selection import train_test_split
+
+# --- Import other AI Modules ---
+try:
+    # This is key for model-based scoring
+    from AI_MODULES.predictive_analytics_engine import PredictiveAnalyticsEngine
+    ANALYTICS_ENGINE_AVAILABLE = True
+    print("PredictiveAnalyticsEngine loaded for model-based scoring.")
+except ImportError:
+    PredictiveAnalyticsEngine = None
+    ANALYTICS_ENGINE_AVAILABLE = False
+    print("Warning: PredictiveAnalyticsEngine not found. Model-based scoring will be disabled.")
+
 
 class HealthScoreCalculator:
     """
     Advanced health score calculation system for Digital Twin applications.
-    Calculates comprehensive health metrics including overall system health,
-    component health, predictive health trends, and risk assessments.
+    Calculates comprehensive health metrics using two methods:
+    1. Formula-Based: A weighted average of key performance components.
+    2. Model-Based: A trained ML model that uses component scores AND
+       live predictions (anomalies, failures) from the analytics engine.
+    The final score is a blend of these two methods.
     """
     
-    def __init__(self, config_path: str = "CONFIG/health_score_config.json"):
+    def __init__(self, 
+                 config_path: str = "CONFIG/health_score_config.json",
+                 model_path: str = "ANALYTICS/models/"):
+        
         self.config_path = Path(config_path)
+        self.model_path = Path(model_path)
+        self.model_path.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logging()
         
         # Health score configuration
         self.config = self._load_config()
         
         # Health score history
-        self.health_history = deque(maxlen=1000)
-        self.component_history = defaultdict(lambda: deque(maxlen=500))
+        # --- REFINED ---
+        # Increased history size to provide more data for component calculations
+        self.health_history = deque(maxlen=2000) 
+        self.component_history = defaultdict(lambda: deque(maxlen=1000)) # Device-specific history
         
-        # Scoring models and scalers
-        self.scoring_models = {}
-        self.scalers = {}
+        # --- Model-Based Scoring Attributes ---
+        self.scoring_model_name = "health_scorer.pkl"
+        self.scoring_model = None
+        self.scoring_model_metadata = {}
+        # Load the analytics engine to get predictive features
+        self.analytics_engine = PredictiveAnalyticsEngine() if ANALYTICS_ENGINE_AVAILABLE else None
+        self._load_scoring_model()
         
         # Thresholds and weights
         self.health_thresholds = self.config.get('thresholds', {
@@ -49,9 +84,10 @@ class HealthScoreCalculator:
         # Component weights for overall health calculation
         self.component_weights = self.config.get('component_weights', {})
         
-        # Baseline values for comparison
-        self.baseline_values = {}
-        self.baseline_updated = {}
+        # --- REFINED: Adaptive EMA Baselines ---
+        # Replaces self.baseline_values
+        self.baseline_emas = {} # Stores {'metric_key': {'mean': ema_mean, 'std': ema_std}}
+        self.baseline_ema_alpha = self.config.get('baseline_ema_alpha', 0.1) # Learning rate for baselines
         
     def _setup_logging(self):
         """Setup logging for health score calculator."""
@@ -87,19 +123,24 @@ class HealthScoreCalculator:
                         "good": 0.8,
                         "excellent": 0.95
                     },
-                    "component_weights": {
-                        "temperature": 0.2,
-                        "pressure": 0.15,
-                        "vibration": 0.25,
-                        "efficiency": 0.2,
-                        "uptime": 0.2
-                    },
-                    "score_components": {
+                    "component_weights": { # Weights for FORMULA-based score
                         "performance": 0.3,
                         "reliability": 0.25,
                         "efficiency": 0.2,
                         "safety": 0.15,
                         "maintenance": 0.1
+                    },
+                    "model_blending": { 
+                        "formula_weight": 0.5, # 50% formula
+                        "model_weight": 0.5    # 50% ML model
+                    },
+                    # --- REFINED: Added EMA Alpha ---
+                    "baseline_ema_alpha": 0.1, # Slow learning rate for adaptive baselines
+                    # --- REFINED: Added Safety Ranges ---
+                    "safety_ranges": {
+                        "temperature": {'min': -10, 'max': 80, 'optimal_min': 15, 'optimal_max': 35},
+                        "pressure": {'min': 900, 'max': 1100, 'optimal_min': 1000, 'optimal_max': 1020},
+                        "vibration": {'min': 0, 'max': 1.0, 'optimal_min': 0, 'optimal_max': 0.3}
                     },
                     "anomaly_detection": {
                         "contamination": 0.1,
@@ -107,7 +148,7 @@ class HealthScoreCalculator:
                     },
                     "trend_analysis": {
                         "window_size": 50,
-                        "trend_threshold": 0.05
+                        "trend_threshold": 0.01
                     },
                     "risk_assessment": {
                         "failure_probability_weight": 0.4,
@@ -124,233 +165,311 @@ class HealthScoreCalculator:
                 return default_config
                 
         except Exception as e:
-            self.logger.error(f"Health history clear error: {e}")
+            self.logger.error(f"Failed to load configuration: {e}")
+            return {} # Return empty dict on failure
 
+    # --- Model-Based Scoring Methods ---
 
-# Example usage and testing
-if __name__ == "__main__":
-    # Initialize health score calculator
-    health_calculator = HealthScoreCalculator()
-    
-    # Generate sample data for testing
-    np.random.seed(42)
-    
-    # Sample device data with realistic sensor readings
-    device_data = {
-        'device_A': pd.DataFrame({
-            'timestamp': pd.date_range('2024-01-01', periods=100, freq='H'),
-            'temperature': np.random.normal(25, 3, 100),  # Good temperature range
-            'pressure': np.random.normal(1013, 5, 100),   # Normal pressure
-            'vibration': np.random.exponential(0.1, 100), # Low vibration (good)
-            'efficiency': np.random.beta(3, 2, 100) * 100, # High efficiency
-            'uptime': np.random.choice([1, 0], 100, p=[0.95, 0.05])  # 95% uptime
-        }),
-        
-        'device_B': pd.DataFrame({
-            'timestamp': pd.date_range('2024-01-01', periods=100, freq='H'),
-            'temperature': np.random.normal(35, 8, 100),   # Higher temperature
-            'pressure': np.random.normal(1020, 15, 100),   # Higher pressure variation
-            'vibration': np.random.exponential(0.3, 100),  # Higher vibration
-            'efficiency': np.random.beta(2, 3, 100) * 100, # Lower efficiency
-            'uptime': np.random.choice([1, 0], 100, p=[0.85, 0.15])  # 85% uptime
-        }),
-        
-        'device_C': pd.DataFrame({
-            'timestamp': pd.date_range('2024-01-01', periods=100, freq='H'),
-            'temperature': np.random.normal(45, 12, 100),  # High temperature (critical)
-            'pressure': np.random.normal(1050, 25, 100),   # High pressure
-            'vibration': np.random.exponential(0.8, 100),  # High vibration (bad)
-            'efficiency': np.random.beta(1, 4, 100) * 100, # Poor efficiency
-            'uptime': np.random.choice([1, 0], 100, p=[0.70, 0.30])  # 70% uptime
-        })
-    }
-    
-    print("=== DIGITAL TWIN HEALTH SCORE CALCULATOR DEMO ===\n")
-    
-    # 1. Calculate individual device health scores
-    print("1. Calculating individual device health scores:")
-    individual_results = {}
-    
-    for device_id, data in device_data.items():
-        result = health_calculator.calculate_overall_health_score(data, device_id)
-        individual_results[device_id] = result
-        
-        print(f"   {device_id}:")
-        print(f"      Health Score: {result['overall_score']:.3f}")
-        print(f"      Status: {result['health_status']}")
-        print(f"      Trend: {result['trend_analysis']['trend_direction']}")
-        print(f"      Risk Level: {result['risk_assessment']['overall_risk_level']}")
-        print()
-    
-    # 2. Calculate fleet health score
-    print("2. Calculating fleet health score:")
-    fleet_result = health_calculator.calculate_fleet_health_score(device_data)
-    
-    print(f"   Fleet Health Score: {fleet_result['fleet_health_score']:.3f}")
-    print(f"   Fleet Status: {fleet_result['fleet_health_status']}")
-    print(f"   Healthy Devices: {fleet_result['fleet_analytics']['healthy_devices']}")
-    print(f"   Warning Devices: {fleet_result['fleet_analytics']['warning_devices']}")
-    print(f"   Critical Devices: {fleet_result['fleet_analytics']['critical_devices']}")
-    print()
-    
-    # 3. Show best and worst performing devices
-    print("3. Device Performance Ranking:")
-    print("   Best Performing:")
-    for device in fleet_result['best_performing_devices'][:3]:
-        print(f"      {device['device_id']}: {device['score']:.3f}")
-    
-    print("   Worst Performing:")
-    for device in fleet_result['worst_performing_devices'][-3:]:
-        print(f"      {device['device_id']}: {device['score']:.3f}")
-    print()
-    
-    # 4. Show recommendations
-    print("4. Fleet Recommendations:")
-    for i, rec in enumerate(fleet_result['fleet_recommendations'][:5], 1):
-        print(f"   {i}. [{rec['priority'].upper()}] {rec['action']}")
-        print(f"      Timeline: {rec['timeframe']}")
-    print()
-    
-    # 5. Risk assessment summary
-    print("5. Fleet Risk Assessment:")
-    risk = fleet_result['fleet_risk_assessment']
-    print(f"   Fleet Risk Level: {risk['fleet_risk_level']}")
-    print(f"   High Risk Devices: {len(risk['high_risk_devices'])}")
-    print(f"   Medium Risk Devices: {len(risk['medium_risk_devices'])}")
-    print(f"   Low Risk Devices: {len(risk['low_risk_devices'])}")
-    print()
-    
-    # 6. Health history and trends
-    print("6. Health History Analysis:")
-    history = health_calculator.get_health_history(limit=10)
-    print(f"   Total health records: {len(history)}")
-    
-    if history:
-        recent_scores = [h['overall_score'] for h in history[-5:]]
-        print(f"   Recent scores: {[round(s, 3) for s in recent_scores]}")
-    
-    # 7. Export configuration
-    print("\n7. Exporting configuration...")
-    config_path = health_calculator.export_health_configuration()
-    print(f"   Configuration exported to: {config_path}")
-    
-    # 8. Statistics
-    print("\n8. Health Scoring Statistics:")
-    stats = health_calculator.get_health_statistics()
-    print(f"   Total health records: {stats['history_summary']['total_health_records']}")
-    print(f"   Devices tracked: {stats['history_summary']['devices_tracked']}")
-    print(f"   Average health score: {stats['history_summary']['average_health_score']:.3f}")
-    print(f"   Baseline metrics: {stats['configuration_summary']['baseline_metrics']}")
-    
-    print("\n=== HEALTH SCORE ANALYSIS COMPLETED ===")
-    print("\nKey Insights:")
-    print(f"- Device A: Excellent health ({individual_results['device_A']['overall_score']:.3f})")
-    print(f"- Device B: Moderate health ({individual_results['device_B']['overall_score']:.3f})")
-    print(f"- Device C: Critical health ({individual_results['device_C']['overall_score']:.3f})")
-    print(f"- Fleet requires immediate attention for critical devices")
-    print(f"- Predictive maintenance recommended for warning-level devices").logger.error(f"Failed to load configuration: {e}")
+    def _load_scoring_model(self):
+        """Load the trained health scoring ML model from disk."""
+        model_file = self.model_path / self.scoring_model_name
+        try:
+            if model_file.exists():
+                model_data = joblib.load(model_file)
+                self.scoring_model = model_data.get('model')
+                self.scoring_model_metadata = model_data.get('metadata', {})
+                self.logger.info(f"Health scoring model '{self.scoring_model_name}' loaded.")
+            else:
+                self.logger.info(f"Health scoring model not found. Will use formula-based scoring.")
+        except Exception as e:
+            self.logger.error(f"Failed to load health scoring model: {e}")
 
-    
+    def _save_scoring_model(self):
+        """Save the trained health scoring ML model to disk."""
+        if self.scoring_model is None:
+            self.logger.warning("No health scoring model to save.")
+            return
+
+        model_file = self.model_path / self.scoring_model_name
+        try:
+            model_data = {
+                'model': self.scoring_model,
+                'metadata': self.scoring_model_metadata
+            }
+            joblib.dump(model_data, model_file)
+            self.logger.info(f"Health scoring model saved to '{model_file}'")
+        except Exception as e:
+            self.logger.error(f"Failed to save health scoring model: {e}")
+
+    def train_health_scorer(self, data: pd.DataFrame, failure_labels: pd.Series) -> Dict:
+        """
+        Trains an ML model to predict health score (1 - failure_prob).
+        
+        Args:
+            data: DataFrame of historical sensor data.
+            failure_labels: Series of 0s (healthy) and 1s (failure)
+                            corresponding to the data.
+                            
+        Returns:
+            Dictionary with training results.
+        """
+        if not self.analytics_engine:
+            msg = "AnalyticsEngine not available. Cannot train model-based scorer."
+            self.logger.error(msg)
+            return {'error': msg}
+
+        self.logger.info(f"Starting health scorer training with {len(data)} samples...")
+        
+        # We want to predict "health" (0 to 1), so we invert failure labels.
+        health_labels = 1 - failure_labels
+        
+        # --- Feature Engineering ---
+        # We will train the model on the outputs of our component scores
+        # and the outputs of the predictive analytics engine.
+        features_list = []
+        
+        # This is slow (row-by-row) but demonstrates the concept.
+        # For production, this should be vectorized.
+        # --- REFINED --- 
+        # Use a sliding window to give component calculators enough data
+        window_size = 50 # Make this larger if more history is needed
+        
+        for i in range(window_size, len(data)):
+            # --- REFINED --- 
+            # Use a window of data, not just a single row
+            window_data = data.iloc[i-window_size:i]
+            current_row = data.iloc[i:i+1] # For predictive features
+            
+            features = {}
+            
+            # 1. Get component scores
+            num_data = window_data.select_dtypes(include=[np.number])
+            features['performance'] = self._calculate_performance_score(num_data)['score']
+            features['reliability'] = self._calculate_reliability_score(num_data, window_data)['score']
+            features['efficiency'] = self._calculate_efficiency_score(num_data)['score']
+            features['safety'] = self._calculate_safety_score(num_data)['score']
+            features['maintenance'] = self._calculate_maintenance_score(num_data, window_data)['score']
+            
+            # 2. Get predictive features (from the *current* state)
+            try:
+                # Use a fast anomaly model for training
+                # This call *must* match the one in calculate_overall_health_score
+                anomaly_res = self.analytics_engine.detect_anomalies(current_row, model_name="anomaly_detector")
+                features['anomaly_score'] = anomaly_res.get('anomaly_scores', [0.0])[0]
+                
+                # Use failure predictor
+                fail_res = self.analytics_engine.predict_failure(current_row)
+                features['failure_prob'] = fail_res.get('failure_probabilities', [0.0])[0]
+            except Exception:
+                features['anomaly_score'] = 0.0
+                features['failure_prob'] = 0.0
+
+            features_list.append(features)
+
+        X = pd.DataFrame(features_list)
+        # Adjust labels to match the features (we lost 'window_size' rows)
+        y = health_labels.iloc[window_size:] 
+        
+        # Save feature names for prediction
+        self.scoring_model_metadata['features'] = list(X.columns)
+        
+        # --- Model Training ---
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # We use a Regressor to predict a continuous health score from 0 to 1
+        model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+        model.fit(X_train, y_train)
+        
+        self.scoring_model = model
+        
+        # --- Evaluation ---
+        y_pred = model.predict(X_test)
+        mse = mean_squared_error(y_test, y_pred)
+        
+        # Get feature importances
+        importances = dict(zip(X.columns, model.feature_importances_))
+        
+        self.scoring_model_metadata['training_mse'] = mse
+        self.scoring_model_metadata['feature_importances'] = importances
+        self.scoring_model_metadata['trained_at'] = datetime.now().isoformat()
+        
+        # Save the trained model
+        self._save_scoring_model()
+        
+        self.logger.info(f"Health scorer training complete. Test MSE: {mse:.4f}")
+        
+        return {
+            'status': 'success',
+            'test_mse': mse,
+            'feature_importances': importances,
+            'features': list(X.columns)
+        }
+
+    # --- End New Methods ---
+
     def calculate_overall_health_score(self, data: pd.DataFrame, 
-                                     device_id: str = None,
-                                     timestamp: datetime = None) -> Dict:
+                                       device_id: str = None,
+                                       timestamp: datetime = None,
+                                       use_model: bool = True) -> Dict:
         """
         Calculate overall health score for a system or device.
         
+        This now calculates a HYBRID score:
+        - formula_based_score: Weighted average of components.
+        - model_based_score: ML model prediction using components + predictive analytics.
+        - overall_score: A blend of the two.
+        
         Args:
-            data: DataFrame with sensor/system data
+            data: DataFrame with *new* sensor/system data (can be single row for real-time)
             device_id: Optional device identifier
             timestamp: Optional timestamp for the calculation
+            use_model: (bool) Whether to attempt using the ML model
             
         Returns:
             Dictionary containing health score and components
         """
         try:
-            self.logger.info(f"Calculating overall health score for device: {device_id or 'system'}")
+            self.logger.info(f"Calculating health score for device: {device_id or 'system'}")
             
             if timestamp is None:
                 timestamp = datetime.now()
             
+            # --- FIX: HISTORY-AWARE CALCULATION ---
+            # Component scores (trends, variance, etc.) need history.
+            # The 'data' param represents the *newest* data. We combine it with stored history.
+            
+            historical_data_list = []
+            if device_id and device_id in self.component_history:
+                # Get historical data points (just the data, not the full result dicts)
+                for entry in self.component_history[device_id]:
+                    # Assuming data was stored in history (we'll add this in _store_health_score)
+                    if 'data' in entry:
+                         historical_data_list.append(entry['data'])
+            
+            if historical_data_list:
+                # Combine history + new data
+                historical_df = pd.concat(historical_data_list, ignore_index=True)
+                # Ensure no duplicates if data is re-sent
+                combined_data = pd.concat([historical_df, data], ignore_index=True).drop_duplicates()
+            else:
+                combined_data = data
+            
+            # Use the combined (historical) data for component calculations
+            # Use the *latest* data (the 'data' param) for predictive features
+            
             # Prepare data
-            numeric_data = data.select_dtypes(include=[np.number])
+            numeric_data_history = combined_data.select_dtypes(include=[np.number]) # For components
+            numeric_data_latest = data.select_dtypes(include=[np.number]) # For predictions
             
-            if numeric_data.empty:
-                return self._create_error_result("No numeric data available")
+            if numeric_data_latest.empty:
+                return self._create_error_result("No numeric data available in new packet")
+            if numeric_data_history.empty:
+                 # No history, just use current data
+                 numeric_data_history = numeric_data_latest
             
-            # Calculate component scores
+            # --- 1. Calculate Component Scores (using historical data) ---
             component_scores = {}
+            component_scores['performance'] = self._calculate_performance_score(numeric_data_history)
+            component_scores['reliability'] = self._calculate_reliability_score(numeric_data_history, combined_data)
+            component_scores['efficiency'] = self._calculate_efficiency_score(numeric_data_history)
+            component_scores['safety'] = self._calculate_safety_score(numeric_data_history)
+            component_scores['maintenance'] = self._calculate_maintenance_score(numeric_data_history, combined_data)
             
-            # 1. Performance Score
-            performance_score = self._calculate_performance_score(numeric_data)
-            component_scores['performance'] = performance_score
-            
-            # 2. Reliability Score
-            reliability_score = self._calculate_reliability_score(numeric_data, data)
-            component_scores['reliability'] = reliability_score
-            
-            # 3. Efficiency Score
-            efficiency_score = self._calculate_efficiency_score(numeric_data)
-            component_scores['efficiency'] = efficiency_score
-            
-            # 4. Safety Score
-            safety_score = self._calculate_safety_score(numeric_data)
-            component_scores['safety'] = safety_score
-            
-            # 5. Maintenance Score
-            maintenance_score = self._calculate_maintenance_score(numeric_data, data)
-            component_scores['maintenance'] = maintenance_score
-            
-            # Calculate weighted overall score
-            score_weights = self.config.get('score_components', {})
-            overall_score = 0.0
+            # --- 2. Calculate Formula-Based Score ---
+            score_weights = self.config.get('component_weights', {})
+            formula_based_score = 0.0
             total_weight = 0.0
             
             for component, score_data in component_scores.items():
                 if isinstance(score_data, dict) and 'score' in score_data:
-                    weight = score_weights.get(component, 0.2)
-                    overall_score += score_data['score'] * weight
+                    weight = score_weights.get(component, 0.2) # Default 0.2 if not in config
+                    formula_based_score += score_data['score'] * weight
                     total_weight += weight
             
             if total_weight > 0:
-                overall_score = overall_score / total_weight
+                formula_based_score = formula_based_score / total_weight
             else:
-                overall_score = 0.5  # Default neutral score
+                formula_based_score = np.mean([cs['score'] for cs in component_scores.values()]) # Simple average
             
-            # Determine health status
+            # --- 3. Calculate Model-Based Score (using latest data) ---
+            model_based_score = None
+            calculation_method = "formula_based"
+            model_inputs = {}
+
+            if use_model and self.scoring_model and self.analytics_engine:
+                try:
+                    # 3a. Get component score inputs (these are now history-aware)
+                    model_inputs['performance'] = component_scores['performance']['score']
+                    model_inputs['reliability'] = component_scores['reliability']['score']
+                    model_inputs['efficiency'] = component_scores['efficiency']['score']
+                    model_inputs['safety'] = component_scores['safety']['score']
+                    model_inputs['maintenance'] = component_scores['maintenance']['score']
+                    
+                    # 3b. Get live predictive inputs (using *latest* data)
+                    
+                    # --- FIX: Ensure prediction features match training features ---
+                    # Call must be identical to the one in train_health_scorer
+                    anomaly_res = self.analytics_engine.detect_anomalies(data, model_name="anomaly_detector")
+                    fail_res = self.analytics_engine.predict_failure(data)
+                    
+                    # Data extraction must be identical to the one in train_health_scorer
+                    model_inputs['anomaly_score'] = anomaly_res.get('anomaly_scores', [0.0])[0]
+                    model_inputs['failure_prob'] = fail_res.get('failure_probabilities', [0.0])[0]
+                    # --- END FIX ---
+
+                    # 3c. Predict
+                    # Ensure features are in the same order as during training
+                    model_features = self.scoring_model_metadata.get('features', list(model_inputs.keys()))
+                    input_vector = [model_inputs.get(f, 0.0) for f in model_features]
+                    
+                    model_based_score = self.scoring_model.predict([input_vector])[0]
+                    model_based_score = max(0.0, min(1.0, model_based_score)) # Clamp prediction
+                    calculation_method = "hybrid"
+
+                except Exception as e:
+                    self.logger.warning(f"Model-based scoring failed, falling back to formula. Error: {e}")
+                    model_based_score = None
+                    calculation_method = "formula_fallback"
+
+            # --- 4. Blend Scores ---
+            if model_based_score is not None:
+                blend_weights = self.config.get('model_blending', {'formula_weight': 0.5, 'model_weight': 0.5})
+                fw = blend_weights['formula_weight']
+                mw = blend_weights['model_weight']
+                overall_score = (formula_based_score * fw) + (model_based_score * mw)
+            else:
+                overall_score = formula_based_score # Fallback
+            
+            # --- 5. Finalize Result ---
             health_status = self._determine_health_status(overall_score)
-            
-            # Calculate trend
             trend_analysis = self._calculate_health_trend(device_id, overall_score)
-            
-            # Risk assessment
             risk_assessment = self._calculate_risk_assessment(component_scores, overall_score)
             
-            # Create result
             result = {
                 'device_id': device_id,
                 'timestamp': timestamp.isoformat(),
                 'overall_score': round(overall_score, 3),
                 'health_status': health_status,
+                'calculation_method': calculation_method,
+                'formula_score': round(formula_based_score, 3),
+                'model_score': round(model_based_score, 3) if model_based_score is not None else None,
                 'component_scores': component_scores,
+                'model_inputs': model_inputs if model_based_score is not None else {},
                 'trend_analysis': trend_analysis,
                 'risk_assessment': risk_assessment,
                 'recommendations': self._generate_health_recommendations(component_scores, overall_score),
-                'data_quality': self._assess_data_quality(data),
-                'calculation_metadata': {
-                    'data_points': len(data),
-                    'numeric_columns': list(numeric_data.columns),
-                    'calculation_time': datetime.now().isoformat()
-                }
+                'data_quality': self._assess_data_quality(data), # Quality of the *new* packet
+                'historical_data_points': len(combined_data) # Info
             }
             
             # Store in history
-            self._store_health_score(result)
+            self._store_health_score(result, data) # --- REFINED: Pass data to be stored
             
-            self.logger.info(f"Health score calculated: {overall_score:.3f} ({health_status})")
+            self.logger.info(f"Health score calculated: {overall_score:.3f} ({health_status}) using {calculation_method}")
             return result
             
         except Exception as e:
-            self.logger.error(f"Overall health score calculation error: {e}")
+            self.logger.error(f"Overall health score calculation error: {e}", exc_info=True)
             return self._create_error_result(str(e))
     
     def _calculate_performance_score(self, data: pd.DataFrame) -> Dict:
@@ -364,11 +483,16 @@ if __name__ == "__main__":
                 ['efficiency', 'throughput', 'output', 'performance', 'speed', 'rate']
             )]
             
-            if not performance_cols:
-                # Use all numeric data as performance indicators
-                performance_cols = data.columns.tolist()
-            
             scores = []
+            
+            if not performance_cols:
+                # --- REFINED: Safer Fallback ---
+                self.logger.warning("No performance columns found. Returning neutral score.")
+                return {
+                    'score': 0.7, # Assume 'good' if no data
+                    'metrics': {},
+                    'summary': self._summarize_score_component(0.7, 'performance')
+                }
             
             for col in performance_cols:
                 col_data = data[col].dropna()
@@ -376,8 +500,9 @@ if __name__ == "__main__":
                 if len(col_data) == 0:
                     continue
                 
-                # Calculate performance metrics
-                col_score = self._calculate_metric_score(col_data, col, 'performance')
+                # REFINED: Pass 'higher_is_better'
+                is_better = 'consumption' not in col.lower() and 'energy' not in col.lower()
+                col_score = self._calculate_metric_score(col_data, col, 'performance', higher_is_better=is_better)
                 
                 performance_metrics[col] = {
                     'score': col_score,
@@ -388,7 +513,7 @@ if __name__ == "__main__":
                 
                 scores.append(col_score)
             
-            overall_performance = np.mean(scores) if scores else 0.5
+            overall_performance = np.mean(scores) if scores else 0.7 # Neutral score
             
             return {
                 'score': round(overall_performance, 3),
@@ -414,7 +539,7 @@ if __name__ == "__main__":
                 col_data = numeric_data[col].dropna()
                 if len(col_data) > 1:
                     cv = col_data.std() / (col_data.mean() + 1e-8)  # Coefficient of variation
-                    consistency_score = 1.0 / (1.0 + cv)  # Lower variation = higher score
+                    consistency_score = 1.0 / (1.0 + abs(cv)) 
                     consistency_scores.append(consistency_score)
                     
                     reliability_metrics[f'{col}_consistency'] = {
@@ -425,13 +550,20 @@ if __name__ == "__main__":
             if consistency_scores:
                 scores.append(np.mean(consistency_scores))
             
-            # 2. Uptime/availability (if timestamp data is available)
-            if 'timestamp' in full_data.columns:
-                uptime_score = self._calculate_uptime_score(full_data)
-                scores.append(uptime_score)
-                reliability_metrics['uptime'] = {'score': uptime_score}
+            # 2. Uptime/availability (if 'uptime' col exists or timestamp gaps)
+            if 'uptime' in full_data.columns:
+                 uptime_score = full_data['uptime'].mean() # Assumes uptime is 0 or 1
+            elif 'timestamp' in full_data.columns:
+                 uptime_score = self._calculate_uptime_score(full_data)
+            else:
+                 uptime_score = 0.8 # Default
+                 
+            scores.append(uptime_score)
+            reliability_metrics['uptime'] = {'score': uptime_score}
             
-            # 3. Anomaly-based reliability
+            # 3. Anomaly-based reliability (using local model)
+            # This is intentionally kept separate from the main AI engine
+            # to provide an independent, heuristic-based signal for the formula score.
             anomaly_score = self._calculate_anomaly_based_reliability(numeric_data)
             scores.append(anomaly_score)
             reliability_metrics['anomaly_based'] = {'score': anomaly_score}
@@ -467,28 +599,24 @@ if __name__ == "__main__":
                 if len(col_data) == 0:
                     continue
                 
-                # For efficiency metrics, higher values are generally better
-                # Normalize to 0-1 range
-                if col_data.std() > 0:
-                    normalized_data = (col_data - col_data.min()) / (col_data.max() - col_data.min())
-                    efficiency_score = normalized_data.mean()
-                else:
-                    efficiency_score = 0.8  # Stable efficiency
+                higher_is_better = 'consumption' not in col.lower() and 'energy' not in col.lower()
+                efficiency_score = self._calculate_metric_score(col_data, col, 'efficiency', higher_is_better)
                 
                 efficiency_metrics[col] = {
                     'score': round(efficiency_score, 3),
-                    'mean_efficiency': float(col_data.mean()),
-                    'efficiency_trend': self._calculate_simple_trend(col_data)
+                    'mean_value': float(col_data.mean()),
+                    'trend': self._calculate_simple_trend(col_data)
                 }
                 
                 scores.append(efficiency_score)
             
             # If no specific efficiency columns, calculate general efficiency
-            if not scores:
+            if not scores and not data.empty:
                 # Use overall data stability as efficiency indicator
-                overall_cv = np.mean([data[col].std() / (data[col].mean() + 1e-8) 
-                                    for col in data.columns if data[col].std() > 0])
-                efficiency_score = 1.0 / (1.0 + overall_cv)
+                all_cvs = [data[col].std() / (data[col].mean() + 1e-8) 
+                           for col in data.columns if data[col].std() > 0]
+                overall_cv = np.mean(all_cvs) if all_cvs else 0
+                efficiency_score = 1.0 / (1.0 + abs(overall_cv))
                 scores.append(efficiency_score)
                 
                 efficiency_metrics['general_stability'] = {
@@ -540,13 +668,13 @@ if __name__ == "__main__":
                 
                 scores.append(safety_score)
             
-            # If no specific safety columns, use general anomaly detection
-            if not scores:
+            # If no specific safety columns, use general anomaly detection (local model)
+            if not scores and not data.empty:
                 general_safety = self._calculate_general_safety_score(data)
                 scores.append(general_safety)
                 safety_metrics['general_safety'] = {'score': general_safety}
             
-            overall_safety = np.mean(scores) if scores else 0.8  # Default to good safety
+            overall_safety = np.mean(scores) if scores else 0.8 # Default to good safety
             
             return {
                 'score': round(overall_safety, 3),
@@ -577,11 +705,13 @@ if __name__ == "__main__":
                 
                 if len(col_data) > 5:
                     # Check for increasing trend (bad for maintenance)
-                    trend_score = 1.0 - abs(self._calculate_simple_trend(col_data))
-                    scores.append(max(0.0, trend_score))
+                    trend = self._calculate_simple_trend(col_data)
+                    trend_score = max(0.0, min(1.0, 1.0 - trend * 5)) 
+                    scores.append(trend_score)
                     
                     maintenance_metrics[f'{col}_degradation'] = {
                         'trend_score': round(trend_score, 3),
+                        'trend_slope': trend,
                         'current_level': float(col_data.iloc[-1] if len(col_data) > 0 else 0)
                     }
             
@@ -607,58 +737,90 @@ if __name__ == "__main__":
         except Exception as e:
             self.logger.error(f"Maintenance score calculation error: {e}")
             return {'score': 0.7, 'error': str(e)}
-    
-    def _calculate_metric_score(self, data: pd.Series, metric_name: str, score_type: str) -> float:
-        """Calculate score for a specific metric."""
+
+    # --- REFINED: Sub-Calculator with Adaptive EMA Baseline ---
+
+    def _calculate_metric_score(self, data: pd.Series, metric_name: str, score_type: str, 
+                                higher_is_better: bool = True) -> float:
+        """
+        Calculate score for a specific metric based on deviation from an
+        adaptive Exponential Moving Average (EMA) baseline.
+        """
         try:
-            # Get baseline if available
             baseline_key = f"{metric_name}_{score_type}"
+            current_mean = data.mean()
+            current_std = data.std()
             
-            if baseline_key in self.baseline_values:
-                baseline = self.baseline_values[baseline_key]
+            # Get or initialize EMA baseline
+            if baseline_key in self.baseline_emas:
+                baseline = self.baseline_emas[baseline_key]
+                baseline_mean = baseline['mean']
+                baseline_std = baseline['std']
                 
-                # Calculate deviation from baseline
-                current_mean = data.mean()
-                deviation = abs(current_mean - baseline['mean']) / (baseline['std'] + 1e-8)
+                # Update EMA
+                alpha = self.baseline_ema_alpha
+                new_ema_mean = (alpha * current_mean) + ((1 - alpha) * baseline_mean)
+                new_ema_std = (alpha * current_std) + ((1 - alpha) * baseline_std)
                 
-                # Convert deviation to score (0-1 range)
-                score = np.exp(-deviation)  # Exponential decay
-                
-            else:
-                # No baseline available, use data quality metrics
-                if len(data) > 1:
-                    # Use coefficient of variation as quality indicator
-                    cv = data.std() / (data.mean() + 1e-8)
-                    score = 1.0 / (1.0 + cv)
-                else:
-                    score = 0.5  # Neutral score for single data point
-                
-                # Store as baseline for future comparisons
-                self.baseline_values[baseline_key] = {
-                    'mean': float(data.mean()),
-                    'std': float(data.std()),
-                    'updated': datetime.now().isoformat()
+                self.baseline_emas[baseline_key] = {
+                    'mean': float(new_ema_mean),
+                    'std': float(new_ema_std)
                 }
+            else:
+                # Initialize baseline
+                self.baseline_emas[baseline_key] = {
+                    'mean': float(current_mean),
+                    'std': float(current_std)
+                }
+                # On first run, use current data for baseline
+                baseline_mean = current_mean
+                baseline_std = current_std
             
+            # Use the baseline *before* the update for calculation
+            # This scores the current data against the "known normal"
+            safe_std = baseline_std + 1e-8
+            
+            # Calculate deviation (Z-score)
+            deviation = (current_mean - baseline_mean) / safe_std
+            
+            if higher_is_better:
+                # Good if deviation is positive or zero
+                # Penalize negative deviation (Gaussian)
+                score = np.exp(-0.5 * (min(0, deviation) ** 2))
+            else:
+                # (e.g., 'consumption')
+                # Good if deviation is negative or zero
+                # Penalize positive deviation (Gaussian)
+                score = np.exp(-0.5 * (max(0, deviation) ** 2))
+                
             return max(0.0, min(1.0, score))  # Clamp to [0, 1]
             
         except Exception as e:
             self.logger.error(f"Metric score calculation error: {e}")
             return 0.5
     
+    # --- Other Sub-Calculators (Largely Unchanged) ---
+
     def _calculate_simple_trend(self, data: pd.Series) -> float:
-        """Calculate simple linear trend."""
+        """Calculate simple linear trend slope."""
         try:
             if len(data) < 3:
                 return 0.0
             
             x = np.arange(len(data))
-            slope, _, _, _, _ = stats.linregress(x, data.values)
+            # Filter out NaNs
+            valid_indices = ~data.isnull()
+            if valid_indices.sum() < 3:
+                return 0.0
+                
+            x_valid = x[valid_indices]
+            y_valid = data.values[valid_indices]
             
-            # Normalize slope by data range
-            data_range = data.max() - data.min()
+            slope, _, _, _, _ = stats.linregress(x_valid, y_valid)
+            
+            data_range = y_valid.max() - y_valid.min()
             if data_range > 0:
-                normalized_slope = slope / data_range
+                normalized_slope = slope / data_range 
             else:
                 normalized_slope = 0.0
             
@@ -669,23 +831,25 @@ if __name__ == "__main__":
             return 0.0
     
     def _calculate_uptime_score(self, data: pd.DataFrame) -> float:
-        """Calculate uptime/availability score."""
+        """Calculate uptime/availability score based on timestamp gaps."""
         try:
             if 'timestamp' not in data.columns:
                 return 0.8  # Default good uptime
             
-            timestamps = pd.to_datetime(data['timestamp'])
+            timestamps = pd.to_datetime(data['timestamp']).dropna()
             timestamps = timestamps.sort_values()
             
             if len(timestamps) < 2:
                 return 0.8
             
-            # Calculate gaps between data points
             time_diffs = timestamps.diff().dropna()
+            if time_diffs.empty:
+                return 0.8
+                
             expected_interval = time_diffs.median()
             
-            # Count gaps larger than 2x expected interval as downtime
-            downtime_gaps = time_diffs[time_diffs > 2 * expected_interval]
+            # Count gaps larger than 3x expected interval as downtime
+            downtime_gaps = time_diffs[time_diffs > 3 * expected_interval]
             total_downtime = downtime_gaps.sum()
             total_time = timestamps.max() - timestamps.min()
             
@@ -700,14 +864,18 @@ if __name__ == "__main__":
             return 0.8
     
     def _calculate_anomaly_based_reliability(self, data: pd.DataFrame) -> float:
-        """Calculate reliability based on anomaly detection."""
+        """Calculate reliability based on anomaly detection (local model)."""
         try:
-            # Use Isolation Forest for anomaly detection
             if len(data) < 10:
                 return 0.8
             
+            # Fill NaNs before scaling
+            data_filled = data.fillna(data.mean())
+            if data_filled.empty:
+                return 0.8
+                
             scaler = StandardScaler()
-            data_scaled = scaler.fit_transform(data.fillna(data.mean()))
+            data_scaled = scaler.fit_transform(data_filled)
             
             iso_forest = IsolationForest(
                 contamination=self.config.get('anomaly_detection', {}).get('contamination', 0.1),
@@ -716,7 +884,6 @@ if __name__ == "__main__":
             
             anomaly_predictions = iso_forest.fit_predict(data_scaled)
             
-            # Calculate reliability as 1 - anomaly_rate
             anomaly_rate = (anomaly_predictions == -1).mean()
             reliability_score = 1.0 - anomaly_rate
             
@@ -727,14 +894,10 @@ if __name__ == "__main__":
             return 0.7
     
     def _calculate_safety_range_score(self, data: pd.Series, column_name: str) -> float:
-        """Calculate safety score based on operating ranges."""
+        """Calculate safety score based on operating ranges from config."""
         try:
-            # Define safety ranges for common parameters
-            safety_ranges = {
-                'temperature': {'min': -10, 'max': 80, 'optimal_min': 15, 'optimal_max': 35},
-                'pressure': {'min': 900, 'max': 1100, 'optimal_min': 1000, 'optimal_max': 1020},
-                'vibration': {'min': 0, 'max': 1.0, 'optimal_min': 0, 'optimal_max': 0.3},
-            }
+            # --- REFINED: Read ranges from config ---
+            safety_ranges = self.config.get('safety_ranges', {})
             
             # Find applicable range
             applicable_range = None
@@ -746,7 +909,13 @@ if __name__ == "__main__":
             if applicable_range is None:
                 # Use statistical approach for unknown parameters
                 q25, q75 = data.quantile([0.25, 0.75])
-                iqr = q75 - q25
+                iqr = q75 - q75
+                # Handle cases where iqr is 0
+                if iqr < 1e-6:
+                    iqr = data.std() + 1e-6
+                    if iqr < 1e-6:
+                        return 0.8 # Not enough variance to judge
+                        
                 applicable_range = {
                     'min': q25 - 1.5 * iqr,
                     'max': q75 + 1.5 * iqr,
@@ -755,14 +924,14 @@ if __name__ == "__main__":
                 }
             
             # Calculate scores
-            in_safe_range = ((data >= applicable_range['min']) & 
-                           (data <= applicable_range['max'])).mean()
+            in_safe_range_pct = ((data >= applicable_range['min']) & 
+                                (data <= applicable_range['max'])).mean()
             
-            in_optimal_range = ((data >= applicable_range['optimal_min']) & 
-                              (data <= applicable_range['optimal_max'])).mean()
+            in_optimal_range_pct = ((data >= applicable_range['optimal_min']) & 
+                                    (data <= applicable_range['optimal_max'])).mean()
             
-            # Weighted score: 70% for safe range, 30% for optimal range
-            safety_score = 0.7 * in_safe_range + 0.3 * in_optimal_range
+            # Weighted score: 50% for just being safe, 50% for being optimal.
+            safety_score = 0.5 * in_safe_range_pct + 0.5 * in_optimal_range_pct
             
             return max(0.0, min(1.0, safety_score))
             
@@ -790,21 +959,23 @@ if __name__ == "__main__":
             return 0.0
     
     def _calculate_general_safety_score(self, data: pd.DataFrame) -> float:
-        """Calculate general safety score using anomaly detection."""
+        """Calculate general safety score using anomaly detection (local model)."""
         try:
-            # Use isolation forest for general anomaly detection
             if len(data) < 5:
                 return 0.8
             
+            data_filled = data.fillna(data.mean())
+            if data_filled.empty:
+                return 0.8
+                
             scaler = StandardScaler()
-            data_scaled = scaler.fit_transform(data.fillna(data.mean()))
+            data_scaled = scaler.fit_transform(data_filled)
             
             iso_forest = IsolationForest(contamination=0.05, random_state=42)
             anomalies = iso_forest.fit_predict(data_scaled)
             
-            # Higher anomaly rate = lower safety score
             anomaly_rate = (anomalies == -1).mean()
-            safety_score = 1.0 - 2 * anomaly_rate  # Amplify impact of anomalies
+            safety_score = 1.0 - 2 * anomaly_rate # Amplify impact
             
             return max(0.0, min(1.0, safety_score))
             
@@ -813,57 +984,44 @@ if __name__ == "__main__":
             return 0.8
     
     def _calculate_maintenance_schedule_score(self, data: pd.DataFrame) -> float:
-        """Calculate maintenance schedule adherence score."""
-        try:
-            # This is a placeholder - would need actual maintenance schedule data
-            # For now, return a default score
-            return 0.8
-            
-        except Exception as e:
-            self.logger.error(f"Maintenance schedule score calculation error: {e}")
-            return 0.8
+        """Calculate maintenance schedule adherence score. (Placeholder)"""
+        return 0.8
     
     def _calculate_performance_degradation(self, data: pd.DataFrame) -> float:
-        """Calculate performance degradation score."""
+        """Calculate performance degradation score based on trend."""
         try:
             if len(data) < 10:
                 return 0.8
             
-            # Calculate degradation for each column
             degradation_scores = []
             
-            for col in data.columns:
+            perf_cols = [col for col in data.columns if any(
+                keyword in col.lower() for keyword in 
+                ['efficiency', 'throughput', 'output', 'performance']
+            )]
+            
+            for col in perf_cols:
                 col_data = data[col].dropna()
-                
                 if len(col_data) < 5:
                     continue
                 
-                # Split data into early and recent periods
-                split_point = len(col_data) // 2
-                early_data = col_data.iloc[:split_point]
-                recent_data = col_data.iloc[split_point:]
-                
-                # Compare performance (assuming higher values are better for most metrics)
-                if len(early_data) > 0 and len(recent_data) > 0:
-                    performance_change = recent_data.mean() / (early_data.mean() + 1e-8)
-                    
-                    # Convert to score (1.0 = no change, >1.0 = improvement, <1.0 = degradation)
-                    if performance_change >= 1.0:
-                        score = min(1.0, performance_change - 0.5)  # Cap improvement benefit
-                    else:
-                        score = performance_change
-                    
-                    degradation_scores.append(score)
-            
+                # Higher is better, so a negative trend is bad.
+                trend = self._calculate_simple_trend(col_data)
+                # Score = 1.0 for flat/positive trend, decreases with negative trend.
+                score = max(0.0, min(1.0, 1.0 + trend * 5)) # *5 amplifies trend impact
+                degradation_scores.append(score)
+
             if degradation_scores:
                 return np.mean(degradation_scores)
             else:
-                return 0.8
+                return 0.8 # Default if no perf columns
                 
         except Exception as e:
             self.logger.error(f"Performance degradation calculation error: {e}")
             return 0.8
-    
+
+    # --- Helper & Utility Methods (Largely Unchanged) ---
+
     def _determine_health_status(self, score: float) -> str:
         """Determine health status based on score."""
         thresholds = self.health_thresholds
@@ -895,7 +1053,7 @@ if __name__ == "__main__":
                 }
             
             # Extract scores from history
-            scores = [entry.get('overall_score', entry.get('score', 0.5)) for entry in history[-10:]]
+            scores = [entry.get('overall_score', 0.5) for entry in history[-20:]] # Use last 20 points
             scores.append(current_score)
             
             # Calculate trend
@@ -960,10 +1118,7 @@ if __name__ == "__main__":
             else:
                 overall_risk = 'minimal'
             
-            # Failure probability estimation
             failure_probability = self._estimate_failure_probability(overall_score, component_scores)
-            
-            # Time to failure estimation
             time_to_failure = self._estimate_time_to_failure(overall_score, component_scores)
             
             return {
@@ -982,21 +1137,17 @@ if __name__ == "__main__":
     def _estimate_failure_probability(self, overall_score: float, component_scores: Dict) -> Dict:
         """Estimate probability of failure."""
         try:
-            # Simple probability model based on health score
             base_probability = 1.0 - overall_score
             
-            # Adjust based on component scores
             critical_components = 0
             for component, score_data in component_scores.items():
                 if isinstance(score_data, dict) and 'score' in score_data:
                     if score_data['score'] < self.health_thresholds['critical']:
                         critical_components += 1
             
-            # Increase probability if critical components exist
             adjusted_probability = base_probability * (1.0 + 0.5 * critical_components)
             adjusted_probability = min(1.0, adjusted_probability)
             
-            # Time-based probabilities
             probabilities = {
                 'next_24_hours': adjusted_probability * 0.1,
                 'next_week': adjusted_probability * 0.3,
@@ -1007,7 +1158,7 @@ if __name__ == "__main__":
             
             return {
                 'probabilities': probabilities,
-                'confidence': 0.7,  # Model confidence
+                'confidence': 0.7, 
                 'model_type': 'health_score_based'
             }
             
@@ -1025,7 +1176,6 @@ if __name__ == "__main__":
                     'status': 'healthy_no_prediction'
                 }
             
-            # Simple linear model: time inversely proportional to (1 - health_score)
             degradation_rate = 1.0 - overall_score
             
             if degradation_rate <= 0:
@@ -1035,18 +1185,17 @@ if __name__ == "__main__":
                     'status': 'no_degradation_detected'
                 }
             
-            # Estimate days to critical threshold
+            # This is a very simple model, a real RUL model would be better
             days_to_critical = (overall_score - self.health_thresholds['critical']) / (degradation_rate * 0.01)
-            days_to_critical = max(1, days_to_critical)  # At least 1 day
+            days_to_critical = max(1, days_to_critical) 
             
-            # Estimate days to complete failure
             days_to_failure = overall_score / (degradation_rate * 0.01)
             days_to_failure = max(1, days_to_failure)
             
             return {
                 'estimated_days_to_critical': round(days_to_critical),
                 'estimated_days_to_failure': round(days_to_failure),
-                'confidence': 0.6,  # Medium confidence for simple model
+                'confidence': 0.6, 
                 'model_type': 'linear_degradation'
             }
             
@@ -1126,11 +1275,10 @@ if __name__ == "__main__":
                     'timeframe': 'within_week'
                 })
             
-            # Sort by priority
             priority_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
             recommendations.sort(key=lambda x: priority_order.get(x['priority'], 4))
             
-            return recommendations[:10]  # Limit to top 10 recommendations
+            return recommendations[:10] 
             
         except Exception as e:
             self.logger.error(f"Recommendation generation error: {e}")
@@ -1140,21 +1288,22 @@ if __name__ == "__main__":
         """Assess quality of input data."""
         try:
             total_cells = data.size
+            if total_cells == 0:
+                return {'overall_quality_score': 0.0, 'quality_level': 'no_data'}
+                
             missing_cells = data.isnull().sum().sum()
-            missing_percentage = (missing_cells / total_cells) * 100 if total_cells > 0 else 0
+            missing_percentage = (missing_cells / total_cells) * 100
             
-            # Check for data completeness
             completeness_score = 1.0 - (missing_percentage / 100)
             
-            # Check for data freshness (if timestamp available)
             freshness_score = 1.0  # Default
             if 'timestamp' in data.columns:
                 try:
                     latest_timestamp = pd.to_datetime(data['timestamp']).max()
-                    time_since_last = datetime.now() - latest_timestamp.to_pydatetime()
+                    # Use utcnow() for timezone-aware comparison
+                    time_since_last = datetime.utcnow() - latest_timestamp.to_pydatetime().replace(tzinfo=None)
                     hours_since = time_since_last.total_seconds() / 3600
                     
-                    # Fresher data gets higher score
                     if hours_since <= 1:
                         freshness_score = 1.0
                     elif hours_since <= 24:
@@ -1163,10 +1312,9 @@ if __name__ == "__main__":
                         freshness_score = 0.6
                     else:
                         freshness_score = 0.3
-                except:
+                except Exception:
                     pass
             
-            # Check for data consistency (low variance in key metrics)
             consistency_scores = []
             numeric_cols = data.select_dtypes(include=[np.number]).columns
             
@@ -1174,12 +1322,11 @@ if __name__ == "__main__":
                 col_data = data[col].dropna()
                 if len(col_data) > 1:
                     cv = col_data.std() / (col_data.mean() + 1e-8)
-                    consistency_score = 1.0 / (1.0 + cv)
+                    consistency_score = 1.0 / (1.0 + abs(cv))
                     consistency_scores.append(consistency_score)
             
             overall_consistency = np.mean(consistency_scores) if consistency_scores else 0.8
             
-            # Overall data quality score
             quality_score = 0.4 * completeness_score + 0.3 * freshness_score + 0.3 * overall_consistency
             
             return {
@@ -1248,7 +1395,7 @@ if __name__ == "__main__":
             'improvement_potential': round((1.0 - score) * 100, 1) if score < 1.0 else 0
         }
     
-    def _store_health_score(self, result: Dict):
+    def _store_health_score(self, result: Dict, data: pd.DataFrame): # --- REFINED: Added data param ---
         """Store health score in history."""
         try:
             # Store overall health score
@@ -1262,13 +1409,17 @@ if __name__ == "__main__":
             # Store component scores if device-specific
             if result.get('device_id'):
                 device_id = result['device_id']
-                self.component_history[device_id].append({
+                # --- REFINED: Store the data that was used ---
+                # This is critical for the history-aware calculation
+                history_entry = {
                     'timestamp': result['timestamp'],
                     'overall_score': result['overall_score'],
-                    'component_scores': result['component_scores'],
-                    'health_status': result['health_status']
-                })
-            
+                    'component_scores': result['component_scores'], # Store component scores for analysis
+                    'health_status': result['health_status'],
+                    'data': data # Store the actual data packet
+                }
+                self.component_history[device_id].append(history_entry)
+                
         except Exception as e:
             self.logger.error(f"Health score storage error: {e}")
     
@@ -1290,7 +1441,6 @@ if __name__ == "__main__":
             else:
                 history = list(self.health_history)
             
-            # Sort by timestamp and limit results
             history.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
             return history[:limit]
             
@@ -1303,7 +1453,7 @@ if __name__ == "__main__":
         Calculate health scores for an entire fleet of devices.
         
         Args:
-            fleet_data: Dictionary mapping device_ids to their data DataFrames
+            fleet_data: Dictionary mapping device_ids to their *latest* data DataFrames
             
         Returns:
             Dictionary containing fleet health analysis
@@ -1317,6 +1467,8 @@ if __name__ == "__main__":
             # Calculate individual device scores
             for device_id, data in fleet_data.items():
                 try:
+                    # The calculate_overall_health_score function is now history-aware,
+                    # so we just pass the new data and the device_id.
                     device_result = self.calculate_overall_health_score(data, device_id)
                     fleet_results[device_id] = device_result
                     
@@ -1332,7 +1484,6 @@ if __name__ == "__main__":
                 fleet_health_score = np.mean(device_scores)
                 fleet_health_status = self._determine_health_status(fleet_health_score)
                 
-                # Fleet analytics
                 fleet_analytics = {
                     'total_devices': len(fleet_data),
                     'healthy_devices': len([s for s in device_scores if s >= self.health_thresholds['good']]),
@@ -1344,20 +1495,16 @@ if __name__ == "__main__":
                     'max_score': round(max(device_scores), 3)
                 }
                 
-                # Identify best and worst performing devices
                 device_performance = [(device_id, result.get('overall_score', 0)) 
-                                    for device_id, result in fleet_results.items() 
-                                    if not result.get('error')]
+                                      for device_id, result in fleet_results.items() 
+                                      if not result.get('error')]
                 
                 device_performance.sort(key=lambda x: x[1], reverse=True)
                 
-                best_devices = device_performance[:5]  # Top 5
-                worst_devices = device_performance[-5:]  # Bottom 5
+                best_devices = device_performance[:5]
+                worst_devices = device_performance[-5:]
                 
-                # Fleet-wide risk assessment
                 fleet_risk = self._calculate_fleet_risk_assessment(fleet_results)
-                
-                # Fleet recommendations
                 fleet_recommendations = self._generate_fleet_recommendations(fleet_results, fleet_analytics)
                 
                 result = {
@@ -1422,7 +1569,6 @@ if __name__ == "__main__":
                         'score': result.get('overall_score', 0)
                     })
             
-            # Determine fleet-wide risk level
             total_devices = len([r for r in fleet_results.values() if not r.get('error')])
             high_risk_count = len(risk_summary['high_risk_devices'])
             medium_risk_count = len(risk_summary['medium_risk_devices'])
@@ -1457,7 +1603,6 @@ if __name__ == "__main__":
         try:
             recommendations = []
             
-            # Critical device recommendations
             critical_devices = fleet_analytics.get('critical_devices', 0)
             if critical_devices > 0:
                 recommendations.append({
@@ -1468,7 +1613,6 @@ if __name__ == "__main__":
                     'timeframe': 'immediate'
                 })
             
-            # Warning device recommendations
             warning_devices = fleet_analytics.get('warning_devices', 0)
             if warning_devices > fleet_analytics.get('total_devices', 1) * 0.3:  # >30% in warning
                 recommendations.append({
@@ -1479,7 +1623,6 @@ if __name__ == "__main__":
                     'timeframe': 'within_week'
                 })
             
-            # Performance optimization
             avg_score = fleet_analytics.get('average_score', 0)
             if avg_score < self.health_thresholds['good']:
                 recommendations.append({
@@ -1490,7 +1633,6 @@ if __name__ == "__main__":
                     'timeframe': 'within_month'
                 })
             
-            # Preventive maintenance
             if fleet_analytics.get('score_std', 0) > 0.2:  # High variation in scores
                 recommendations.append({
                     'priority': 'medium',
@@ -1507,27 +1649,40 @@ if __name__ == "__main__":
             return []
     
     def update_baseline_values(self, data: pd.DataFrame, device_id: str = None):
-        """Update baseline values for health score calculations."""
+        """
+        Update baseline EMA values for health score calculations.
+        This is now handled automatically by _calculate_metric_score.
+        This function can be used to "prime" the baselines.
+        """
         try:
             numeric_data = data.select_dtypes(include=[np.number])
             
             for col in numeric_data.columns:
-                baseline_key = f"{col}_baseline"
-                if device_id:
-                    baseline_key = f"{device_id}_{baseline_key}"
-                
                 col_data = numeric_data[col].dropna()
                 if len(col_data) > 0:
-                    self.baseline_values[baseline_key] = {
-                        'mean': float(col_data.mean()),
-                        'std': float(col_data.std()),
-                        'min': float(col_data.min()),
-                        'max': float(col_data.max()),
-                        'updated': datetime.now().isoformat(),
-                        'sample_size': len(col_data)
-                    }
+                    # Prime all component types
+                    for score_type in ['performance', 'efficiency', 'safety', 'maintenance']:
+                        baseline_key = f"{col}_{score_type}"
+                        
+                        current_mean = col_data.mean()
+                        current_std = col_data.std()
+                        
+                        if baseline_key not in self.baseline_emas:
+                            self.baseline_emas[baseline_key] = {
+                                'mean': float(current_mean),
+                                'std': float(current_std)
+                            }
+                        else:
+                            # Update existing EMA
+                            alpha = self.baseline_ema_alpha
+                            baseline_mean = self.baseline_emas[baseline_key]['mean']
+                            baseline_std = self.baseline_emas[baseline_key]['std']
+                            new_ema_mean = (alpha * current_mean) + ((1 - alpha) * baseline_mean)
+                            new_ema_std = (alpha * current_std) + ((1 - alpha) * baseline_std)
+                            self.baseline_emas[baseline_key]['mean'] = new_ema_mean
+                            self.baseline_emas[baseline_key]['std'] = new_ema_std
             
-            self.logger.info(f"Baseline values updated for {len(numeric_data.columns)} metrics")
+            self.logger.info(f"Baseline EMA values updated for {len(numeric_data.columns)} metrics")
             
         except Exception as e:
             self.logger.error(f"Baseline update error: {e}")
@@ -1543,7 +1698,7 @@ if __name__ == "__main__":
                 'configuration': self.config,
                 'health_thresholds': self.health_thresholds,
                 'component_weights': self.component_weights,
-                'baseline_values': self.baseline_values,
+                'baseline_emas': self.baseline_emas, # --- REFINED ---
                 'export_timestamp': datetime.now().isoformat(),
                 'health_history_count': len(self.health_history),
                 'component_history_count': {k: len(v) for k, v in self.component_history.items()}
@@ -1566,7 +1721,6 @@ if __name__ == "__main__":
             with open(input_path, 'r') as f:
                 import_data = json.load(f)
             
-            # Update configuration
             if 'configuration' in import_data:
                 self.config.update(import_data['configuration'])
             
@@ -1576,9 +1730,16 @@ if __name__ == "__main__":
             if 'component_weights' in import_data:
                 self.component_weights.update(import_data['component_weights'])
             
-            if 'baseline_values' in import_data:
-                self.baseline_values.update(import_data['baseline_values'])
-            
+            # --- REFINED ---
+            if 'baseline_emas' in import_data:
+                self.baseline_emas.update(import_data['baseline_emas'])
+            elif 'baseline_values' in import_data: # For backwards compatibility
+                self.logger.warning("Importing old 'baseline_values'. Converting to 'baseline_emas'.")
+                # Simple conversion: treat old baselines as initial EMA values
+                for key, vals in import_data['baseline_values'].items():
+                    if key not in self.baseline_emas:
+                        self.baseline_emas[key] = {'mean': vals.get('mean', 0), 'std': vals.get('std', 1)}
+
             self.logger.info(f"Health configuration imported from {input_path}")
             
         except Exception as e:
@@ -1592,7 +1753,9 @@ if __name__ == "__main__":
                 'configuration_summary': {
                     'thresholds': self.health_thresholds,
                     'component_weights': self.component_weights,
-                    'baseline_metrics': len(self.baseline_values)
+                    'model_blending': self.config.get('model_blending'),
+                    'model_loaded': self.scoring_model is not None,
+                    'baseline_metrics': len(self.baseline_emas) # --- REFINED ---
                 },
                 'history_summary': {
                     'total_health_records': len(self.health_history),
@@ -1601,7 +1764,7 @@ if __name__ == "__main__":
                 },
                 'recent_activity': list(self.health_history)[-5:] if self.health_history else [],
                 'system_status': {
-                    'baseline_coverage': len(self.baseline_values),
+                    'baseline_coverage': len(self.baseline_emas), # --- REFINED ---
                     'active_monitoring': len(self.component_history),
                     'last_calculation': self.health_history[-1]['timestamp'] if self.health_history else None
                 }
@@ -1626,4 +1789,157 @@ if __name__ == "__main__":
                 self.logger.info("All health history cleared")
                 
         except Exception as e:
-            self
+            self.logger.error(f"Health history clear error: {e}")
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Initialize health score calculator
+    health_calculator = HealthScoreCalculator()
+    
+    # --- NEW: Check if we can train the scoring model ---
+    if ANALYTICS_ENGINE_AVAILABLE and health_calculator.analytics_engine:
+        print("\n--- Training Health Scorer Model (DEMO) ---")
+        # Generate sample data with clear failure labels for training
+        np.random.seed(42)
+        train_size = 500
+        train_data = pd.DataFrame({
+            'timestamp': pd.date_range('2023-01-01', periods=train_size, freq='H'),
+            'temperature': np.random.normal(25, 5, train_size),
+            'pressure': np.random.normal(1013, 10, train_size),
+            'vibration': np.random.exponential(0.1, train_size),
+            'efficiency': np.random.normal(90, 5, train_size),
+            'uptime': 1.0
+        })
+        failure_labels = pd.Series(np.zeros(train_size))
+        
+        failure_indices = np.random.choice(train_data.index[100:], 50, replace=False)
+        train_data.loc[failure_indices, 'temperature'] += np.random.uniform(30, 50, 50)
+        train_data.loc[failure_indices, 'vibration'] += np.random.uniform(0.5, 1.5, 50)
+        train_data.loc[failure_indices, 'efficiency'] -= np.random.uniform(20, 40, 50)
+        failure_labels.loc[failure_indices] = 1
+        
+        # Train the model
+        train_result = health_calculator.train_health_scorer(train_data, failure_labels)
+        print(f"Health Scorer trained. MSE: {train_result.get('test_mse', 'N/A'):.4f}")
+        print("Feature Importances:")
+        for f, imp in train_result.get('feature_importances', {}).items():
+            print(f"  - {f}: {imp:.3f}")
+    else:
+        print("\n--- Skipping Health Scorer Model Training (AnalyticsEngine not found) ---")
+
+    # --- Generate sample data for testing ---
+    np.random.seed(42)
+    
+    device_data = {
+        'device_A': pd.DataFrame({ # Healthy device
+            'timestamp': pd.date_range('2024-01-01', periods=100, freq='H'),
+            'temperature': np.random.normal(25, 3, 100),
+            'pressure': np.random.normal(1013, 5, 100),
+            'vibration': np.random.exponential(0.1, 100),
+            'efficiency': np.random.uniform(90, 95, 100),
+            'uptime': 1.0
+        }),
+        
+        'device_B': pd.DataFrame({ # Warning device
+            'timestamp': pd.date_range('2024-01-01', periods=100, freq='H'),
+            'temperature': np.random.normal(35, 8, 100),
+            'pressure': np.random.normal(1020, 15, 100),
+            'vibration': np.random.exponential(0.3, 100),
+            'efficiency': np.random.uniform(80, 85, 100),
+            'uptime': 1.0
+        }),
+        
+        'device_C': pd.DataFrame({ # Critical device
+            'timestamp': pd.date_range('2024-01-01', periods=100, freq='H'),
+            'temperature': np.random.normal(45, 12, 100),
+            'pressure': np.random.normal(1050, 25, 100),
+            'vibration': np.random.exponential(0.8, 100),
+            'efficiency': np.random.uniform(60, 70, 100),
+            'uptime': 1.0
+        })
+    }
+    
+    print("\n=== DIGITAL TWIN HEALTH SCORE CALCULATOR DEMO ===\n")
+    
+    # --- REFINED DEMO ---
+    # Prime the history with the first 99 data points
+    print("1. Priming device history...")
+    for device_id, data in device_data.items():
+        # Get all but the last row
+        history_data = data.iloc[:-1]
+        # We can pass the whole history at once
+        # In a real system, this would be a loop
+        health_calculator.calculate_overall_health_score(history_data, device_id)
+        
+    print("History primed.")
+    
+    # 1. Calculate individual device health scores using *only the last row*
+    print("\n2. Calculating individual device health scores (real-time):")
+    individual_results = {}
+    
+    for device_id, data in device_data.items():
+        # Use only the *last row* for a "real-time" score
+        real_time_data = data.iloc[-1:] 
+        
+        # The function will automatically pull history for this device_id
+        result = health_calculator.calculate_overall_health_score(real_time_data, device_id)
+        individual_results[device_id] = result
+        
+        print(f"    {device_id}:")
+        print(f"        Health Score: {result['overall_score']:.3f} (Method: {result['calculation_method']})")
+        print(f"        (Formula: {result['formula_score']:.3f}, Model: {result.get('model_score', 'N/A')})")
+        print(f"        Status: {result['health_status']}")
+        print(f"        Risk Level: {result['risk_assessment']['overall_risk_level']}")
+        print(f"        (Used {result['historical_data_points']} data points for component scores)")
+        print()
+    
+    # 2. Calculate fleet health score (using latest data for each)
+    print("3. Calculating fleet health score (using latest data):")
+    # We already calculated the latest scores, so we can just use the results
+    # But for a real demo, we'd call the fleet function
+    latest_fleet_data = {dev_id: data.iloc[-1:] for dev_id, data in device_data.items()}
+    fleet_result = health_calculator.calculate_fleet_health_score(latest_fleet_data)
+    
+    print(f"    Fleet Health Score: {fleet_result['fleet_health_score']:.3f}")
+    print(f"    Fleet Status: {fleet_result['fleet_health_status']}")
+    print(f"    Healthy Devices: {fleet_result['fleet_analytics']['healthy_devices']}")
+    print(f"    Warning Devices: {fleet_result['fleet_analytics']['warning_devices']}")
+    print(f"    Critical Devices: {fleet_result['fleet_analytics']['critical_devices']}")
+    print()
+    
+    # 3. Show best and worst performing devices
+    print("4. Device Performance Ranking:")
+    print("    Best Performing:")
+    for device in fleet_result['best_performing_devices'][:3]:
+        print(f"        {device['device_id']}: {device['score']:.3f}")
+    
+    print("    Worst Performing:")
+    for device in fleet_result['worst_performing_devices'][-3:]:
+        print(f"        {device['device_id']}: {device['score']:.3f}")
+    print()
+    
+    # 4. Show recommendations
+    print("5. Fleet Recommendations:")
+    for i, rec in enumerate(fleet_result['fleet_recommendations'][:5], 1):
+        print(f"    {i}. [{rec['priority'].upper()}] {rec['action']}")
+        print(f"        Timeline: {rec['timeframe']}")
+    print()
+    
+    # 5. Risk assessment summary
+    print("6. Fleet Risk Assessment:")
+    risk = fleet_result['fleet_risk_assessment']
+    print(f"    Fleet Risk Level: {risk['fleet_risk_level']}")
+    print(f"    High Risk Devices: {len(risk['high_risk_devices'])}")
+    print(f"    Medium Risk Devices: {len(risk['medium_risk_devices'])}")
+    print(f"    Low Risk Devices: {len(risk['low_risk_devices'])}")
+    print()
+    
+    # 6. Statistics
+    print("7. Health Scoring Statistics:")
+    stats = health_calculator.get_health_statistics()
+    print(f"    Total health records: {stats['history_summary']['total_health_records']}")
+    print(f"    Devices tracked: {stats['history_summary']['devices_tracked']}")
+    print(f"    Model Loaded: {stats['configuration_summary']['model_loaded']}")
+    print(f"    Baseline metrics (EMAs): {stats['configuration_summary']['baseline_metrics']}")
+    
+    print("\n=== HEALTH SCORE ANALYSIS COMPLETED ===")

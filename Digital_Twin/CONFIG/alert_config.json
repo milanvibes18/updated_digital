@@ -1,118 +1,126 @@
 {
-  "alert_rules": {
-    "temperature_high": {
-      "metric": "temperature",
-      "operator": ">",
-      "threshold": 80,
-      "severity": "warning",
-      "duration": 300,
-      "description": "Temperature above normal operating range"
-    },
-    "temperature_critical": {
-      "metric": "temperature",
-      "operator": ">",
-      "threshold": 95,
-      "severity": "critical",
-      "duration": 60,
-      "description": "Temperature at critical level"
-    },
-    "vibration_high": {
-      "metric": "vibration",
-      "operator": ">",
-      "threshold": 0.5,
-      "severity": "warning",
-      "duration": 180,
-      "description": "High vibration detected"
-    },
-    "efficiency_low": {
-      "metric": "efficiency",
-      "operator": "<",
-      "threshold": 70,
-      "severity": "info",
-      "duration": 600,
-      "description": "System efficiency below optimal"
-    }
+  "metadata": {
+    "version": "1.1.0",
+    "last_updated_utc": "2025-10-19T14:30:00Z",
+    "updated_by": "system_bot",
+    "description": "Configuration for alert rules, notification channels, and escalation policies. This version adds metadata and replaces hardcoded secrets with placeholders."
   },
-  "thresholds": {
-    "health_score_critical": 0.3,
-    "health_score_warning": 0.6,
-    "anomaly_threshold": 0.8,
-    "failure_probability_high": 0.7
-  },
-  "notification_channels": {
-    "email": {
-      "enabled": true,
-      "smtp_server": "smtp.gmail.com",
-      "smtp_port": 587,
-      "username": "newmilan91@gmail.com",
-      "password": "486258",
-      "recipients": [
-        "admin@company.com",
-        "maintenance@company.com"
-      ]
+  "configuration": {
+    "alert_rules": {
+      "temperature_high": {
+        "metric": "temperature",
+        "operator": ">",
+        "threshold": 80,
+        "severity": "warning",
+        "duration": 300,
+        "description": "Temperature above normal operating range"
+      },
+      "temperature_critical": {
+        "metric": "temperature",
+        "operator": ">",
+        "threshold": 95,
+        "severity": "critical",
+        "duration": 60,
+        "description": "Temperature at critical level"
+      },
+      "vibration_high": {
+        "metric": "vibration",
+        "operator": ">",
+        "threshold": 0.5,
+        "severity": "warning",
+        "duration": 180,
+        "description": "High vibration detected"
+      },
+      "efficiency_low": {
+        "metric": "efficiency",
+        "operator": "<",
+        "threshold": 70,
+        "severity": "info",
+        "duration": 600,
+        "description": "System efficiency below optimal"
+      }
     },
-    "slack": {
-      "enabled": false,
-      "webhook_url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
-      "channel": "#alerts"
+    "thresholds": {
+      "health_score_critical": 0.3,
+      "health_score_warning": 0.6,
+      "anomaly_threshold": 0.8,
+      "failure_probability_high": 0.7
     },
-    "webhook": {
-      "enabled": false,
-      "url": "http://your-webhook-endpoint.com/alerts",
-      "method": "POST"
-    }
-  },
-  "escalation_policies": {
-    "default": {
-      "levels": [
-        {
-          "delay_minutes": 0,
-          "channels": [
-            "email"
-          ]
-        },
-        {
-          "delay_minutes": 15,
-          "channels": [
-            "email",
-            "slack"
-          ]
-        }
-      ]
+    "notification_channels": {
+      "email": {
+        "enabled": true,
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 587,
+        "username": "newmilan91@gmail.com",
+        "password": "env_SMTP_PASSWORD",
+        "recipients": [
+          "admin@company.com",
+          "maintenance@company.com"
+        ]
+      },
+      "slack": {
+        "enabled": false,
+        "webhook_url": "env_SLACK_WEBHOOK_URL",
+        "channel": "#alerts"
+      },
+      "webhook": {
+        "enabled": false,
+        "url": "env_WEBHOOK_URL",
+        "method": "POST"
+      }
     },
-    "critical": {
-      "levels": [
-        {
-          "delay_minutes": 0,
-          "channels": [
-            "email",
-            "slack"
-          ]
-        },
-        {
-          "delay_minutes": 5,
-          "channels": [
-            "email",
-            "slack"
-          ]
-        }
-      ]
-    }
-  },
-  "suppression_rules": {
-    "duplicate_window_minutes": 5,
-    "burst_limit": 10,
-    "burst_window_minutes": 1
-  },
-  "correlation_rules": {
-    "temperature_vibration": {
-      "metrics": [
-        "temperature",
-        "vibration"
-      ],
-      "correlation_threshold": 0.7,
-      "window_minutes": 10,
-      "action": "create_correlated_alert"
+    "escalation_policies": {
+      "default": {
+        "levels": [
+          {
+            "delay_minutes": 0,
+            "channels": [
+              "email"
+            ]
+          },
+          {
+            "delay_minutes": 15,
+            "channels": [
+              "email",
+              "slack"
+            ]
+          }
+        ]
+      },
+      "critical": {
+        "levels": [
+          {
+            "delay_minutes": 0,
+            "channels": [
+              "email",
+              "slack"
+            ]
+          },
+          {
+            "delay_minutes": 5,
+            "channels": [
+              "email",
+              "slack"
+            ]
+          }
+        ]
+      }
+    },
+    "suppression_rules": {
+      "duplicate_window_minutes": 5,
+      "burst_limit": 10,
+      "burst_window_minutes": 1
+    },
+    "correlation_rules": {
+      "temperature_vibration": {
+        "metrics": [
+          "temperature",
+          "vibration"
+        ],
+        "correlation_threshold": 0.7,
+        "window_minutes": 10,
+        "action": "create_correlated_alert"
+      }
     }
   }
 }

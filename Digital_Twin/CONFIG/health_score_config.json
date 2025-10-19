@@ -1,34 +1,42 @@
 {
-  "thresholds": {
-    "critical": 0.3,
-    "warning": 0.6,
-    "good": 0.8,
-    "excellent": 0.95
+  "metadata": {
+    "version": "1.1.0",
+    "last_updated_utc": "2025-10-19T14:30:00Z",
+    "updated_by": "system_bot",
+    "description": "Configuration for calculating the digital twin's health score. This version introduces metadata for traceability."
   },
-  "component_weights": {
-    "temperature": 0.2,
-    "pressure": 0.15,
-    "vibration": 0.25,
-    "efficiency": 0.2,
-    "uptime": 0.2
-  },
-  "score_components": {
-    "performance": 0.3,
-    "reliability": 0.25,
-    "efficiency": 0.2,
-    "safety": 0.15,
-    "maintenance": 0.1
-  },
-  "anomaly_detection": {
-    "contamination": 0.1,
-    "sensitivity": 0.8
-  },
-  "trend_analysis": {
-    "window_size": 50,
-    "trend_threshold": 0.05
-  },
-  "risk_assessment": {
-    "failure_probability_weight": 0.4,
-    "consequence_weight": 0.6
+  "configuration": {
+    "thresholds": {
+      "critical": 0.3,
+      "warning": 0.6,
+      "good": 0.8,
+      "excellent": 0.95
+    },
+    "component_weights": {
+      "temperature": 0.2,
+      "pressure": 0.15,
+      "vibration": 0.25,
+      "efficiency": 0.2,
+      "uptime": 0.2
+    },
+    "score_components": {
+      "performance": 0.3,
+      "reliability": 0.25,
+      "efficiency": 0.2,
+      "safety": 0.15,
+      "maintenance": 0.1
+    },
+    "anomaly_detection": {
+      "contamination": 0.1,
+      "sensitivity": 0.8
+    },
+    "trend_analysis": {
+      "window_size": 50,
+      "trend_threshold": 0.05
+    },
+    "risk_assessment": {
+      "failure_probability_weight": 0.4,
+      "consequence_weight": 0.6
+    }
   }
 }

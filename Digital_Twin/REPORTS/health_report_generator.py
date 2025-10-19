@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Health Report Generator for Digital Twin System
-Generates comprehensive HTML and PDF reports for system health analysis.
+Generates comprehensive HTML and PDF reports for system health analysis,
+including data-driven predictions and actionable recommendations.
 """
 
 import os
@@ -91,10 +92,10 @@ class HealthReportGenerator:
         return logger
     
     def generate_comprehensive_report(self, 
-                                    device_ids: List[str] = None,
-                                    date_range_days: int = 30,
-                                    include_predictions: bool = True,
-                                    include_recommendations: bool = True) -> str:
+                                      device_ids: List[str] = None,
+                                      date_range_days: int = 30,
+                                      include_predictions: bool = True,
+                                      include_recommendations: bool = True) -> str:
         """
         Generate a comprehensive health report.
         
@@ -122,12 +123,14 @@ class HealthReportGenerator:
             # Generate predictions if requested
             predictions = {}
             if include_predictions:
-                predictions = self._generate_predictions(report_data)
+                # Pass health_analysis to be used for predictions
+                predictions = self._generate_predictions(report_data, health_analysis)
             
             # Generate recommendations if requested
             recommendations = {}
             if include_recommendations:
-                recommendations = self._generate_recommendations(report_data, health_analysis)
+                # Pass health_analysis and new predictions
+                recommendations = self._generate_recommendations(report_data, health_analysis, predictions)
             
             # Compile report data
             full_report_data = {
@@ -135,7 +138,7 @@ class HealthReportGenerator:
                     'generated_at': datetime.now().isoformat(),
                     'report_type': 'Comprehensive Health Report',
                     'date_range_days': date_range_days,
-                    'devices_analyzed': len(report_data.get('devices', [])),
+                    'devices_analyzed': len(set(d['device_id'] for d in report_data.get('devices', []))),
                     'version': self.report_config['version']
                 },
                 'summary': self._generate_executive_summary(report_data, health_analysis),
@@ -248,19 +251,33 @@ class HealthReportGenerator:
             # Sample devices
             devices = []
             device_names = ['Temperature Sensor 01', 'Pressure Sensor 01', 'Vibration Sensor 01', 
-                          'Humidity Sensor 01', 'Power Meter 01']
+                            'Humidity Sensor 01', 'Power Meter 01']
             
             for i, device_name in enumerate(device_names):
+                health = 0.9 - (i * 0.1) # Start with different healths
+                efficiency = 0.95 - (i * 0.05)
+                
                 for timestamp in timestamps[::6]:  # Every 6 hours
+                    # Introduce a declining trend for device 3
+                    if 'Vibration' in device_name:
+                        health -= 0.005
+                    
+                    # Introduce a slight improvement for device 1
+                    if 'Temperature' in device_name:
+                         health += 0.001
+                         
+                    health = max(0.2, min(1.0, health + np.random.normal(0, 0.02)))
+                    efficiency = max(0.3, min(1.0, efficiency + np.random.normal(0, 0.01)))
+                    
                     device_data = {
                         'device_id': f'DEVICE_{i+1:03d}',
                         'device_name': device_name,
                         'device_type': device_name.split()[0].lower() + '_sensor',
                         'timestamp': timestamp.isoformat(),
                         'value': 50 + 20 * np.sin(i * 0.1) + np.random.normal(0, 5),
-                        'health_score': max(0.2, min(1.0, 0.8 + np.random.normal(0, 0.15))),
-                        'efficiency_score': max(0.3, min(1.0, 0.85 + np.random.normal(0, 0.1))),
-                        'status': np.random.choice(['normal', 'warning', 'critical'], p=[0.8, 0.15, 0.05]),
+                        'health_score': health,
+                        'efficiency_score': efficiency,
+                        'status': 'critical' if health < 0.6 else ('warning' if health < 0.75 else 'normal'),
                         'location': f'Floor {(i % 3) + 1}',
                         'unit': '°C' if 'temperature' in device_name.lower() else 'units'
                     }
@@ -268,12 +285,14 @@ class HealthReportGenerator:
             
             # Sample system metrics
             system_metrics = []
+            disk = 70.0
             for timestamp in timestamps[::12]:  # Every 12 hours
+                disk = min(95, disk + np.random.uniform(0.1, 0.5)) # Disk usage creeping up
                 system_metrics.append({
                     'timestamp': timestamp.isoformat(),
                     'cpu_usage_percent': np.random.uniform(20, 80),
                     'memory_usage_percent': np.random.uniform(40, 85),
-                    'disk_usage_percent': np.random.uniform(50, 90),
+                    'disk_usage_percent': disk,
                     'network_io_mbps': np.random.uniform(10, 100),
                     'active_connections': np.random.randint(50, 200)
                 })
@@ -288,7 +307,7 @@ class HealthReportGenerator:
                     'timestamp': timestamp.isoformat(),
                     'power_consumption_kw': power_consumption,
                     'energy_consumed_kwh': cumulative_energy,
-                    'efficiency_percent': np.random.uniform(80, 95),
+                    'efficiency_percent': np.random.uniform(80, 95), # Fluctuate efficiency
                     'cost_usd': cumulative_energy * 0.12
                 })
             
@@ -319,7 +338,7 @@ class HealthReportGenerator:
             analysis = {
                 'overall_health': {
                     'current': df['health_score'].mean() * 100,
-                    'trend': self._calculate_trend(df.groupby('timestamp')['health_score'].mean()),
+                    'trend': self._calculate_trend(df.groupby(pd.Grouper(key='timestamp', freq='D'))['health_score'].mean()),
                     'distribution': self._calculate_health_distribution(df)
                 },
                 'device_analysis': {},
@@ -378,7 +397,8 @@ class HealthReportGenerator:
     def _calculate_trend(self, series: pd.Series) -> str:
         """Calculate trend direction from a time series"""
         try:
-            if len(series) < 2:
+            series = series.dropna()
+            if len(series) < 3:
                 return 'stable'
             
             # Linear regression for trend
@@ -386,9 +406,12 @@ class HealthReportGenerator:
             coeffs = np.polyfit(x, series.values, 1)
             slope = coeffs[0]
             
-            if slope > 0.01:
+            # Normalize slope by the mean to get a relative sense of change
+            normalized_slope = slope / (series.mean() + 1e-6)
+            
+            if normalized_slope > 0.05:
                 return 'improving'
-            elif slope < -0.01:
+            elif normalized_slope < -0.05:
                 return 'declining'
             else:
                 return 'stable'
@@ -462,18 +485,18 @@ class HealthReportGenerator:
             
             plt.figure(figsize=(12, 6))
             
-            # Plot health trends for top 5 devices
-            device_counts = df['device_id'].value_counts().head(5)
+            # Plot health trends for all unique devices (up to 10)
+            device_ids = df['device_id'].unique()
             
-            for device_id in device_counts.index:
+            for device_id in device_ids[:10]:
                 device_data = df[df['device_id'] == device_id].sort_values('timestamp')
                 plt.plot(device_data['timestamp'], device_data['health_score'] * 100, 
-                        marker='o', label=device_data['device_name'].iloc[0])
+                         marker='o', markersize=4, linestyle='-', label=device_data['device_name'].iloc[0])
             
             plt.title('Device Health Trends Over Time', fontsize=16, fontweight='bold')
             plt.xlabel('Time')
             plt.ylabel('Health Score (%)')
-            plt.legend()
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
             plt.grid(True, alpha=0.3)
             plt.xticks(rotation=45)
             plt.tight_layout()
@@ -501,14 +524,32 @@ class HealthReportGenerator:
             df = pd.DataFrame(devices_data)
             
             # Get latest status for each device
-            latest_status = df.groupby('device_id')['status'].last()
-            status_counts = latest_status.value_counts()
+            latest_scores = df.loc[df.groupby('device_id')['timestamp'].idxmax()]
+            latest_scores['status_label'] = latest_scores['health_score'].apply(lambda x: self._determine_health_status(x * 100))
+            status_counts = latest_scores['status_label'].value_counts()
+            
+            labels = status_counts.index
+            sizes = status_counts.values
+            
+            color_map = {
+                'excellent': '#27ae60',
+                'good': '#3498db',
+                'fair': '#f39c12',
+                'poor': '#e74c3c'
+            }
+            colors = [color_map.get(label, '#bdc3c7') for label in labels]
             
             plt.figure(figsize=(8, 8))
-            colors = ['#27ae60', '#f39c12', '#e74c3c']
-            plt.pie(status_counts.values, labels=status_counts.index, autopct='%1.1f%%', 
-                   colors=colors, startangle=90)
-            plt.title('Device Status Distribution', fontsize=16, fontweight='bold')
+            plt.pie(sizes, labels=labels, autopct='%1.1f%%', 
+                    colors=colors, startangle=90, pctdistance=0.85)
+            
+            # Draw a circle at the center to make it a donut chart
+            centre_circle = plt.Circle((0,0),0.70,fc='white')
+            fig = plt.gcf()
+            fig.gca().add_artist(centre_circle)
+            
+            plt.title('Device Health Distribution', fontsize=16, fontweight='bold')
+            plt.axis('equal') # Equal aspect ratio ensures that pie is drawn as a circle.
             
             # Save to base64
             img_buffer = BytesIO()
@@ -534,6 +575,7 @@ class HealthReportGenerator:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             
             fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            fig.suptitle('System Performance Metrics Over Time', fontsize=16, fontweight='bold')
             
             # CPU Usage
             axes[0,0].plot(df['timestamp'], df['cpu_usage_percent'], color='#3498db', linewidth=2)
@@ -555,7 +597,11 @@ class HealthReportGenerator:
             axes[1,1].set_title('Network I/O (Mbps)')
             axes[1,1].grid(True, alpha=0.3)
             
-            plt.tight_layout()
+            for ax_row in axes:
+                for ax in ax_row:
+                    ax.tick_params(axis='x', rotation=30)
+                    
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
             
             # Save to base64
             img_buffer = BytesIO()
@@ -580,22 +626,24 @@ class HealthReportGenerator:
             df = pd.DataFrame(energy_data)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+            fig, (ax1) = plt.subplots(1, 1, figsize=(12, 6))
             
             # Power consumption
             ax1.plot(df['timestamp'], df['power_consumption_kw'], color='#9b59b6', linewidth=2)
             ax1.set_title('Power Consumption Over Time')
-            ax1.set_ylabel('Power (kW)')
+            ax1.set_ylabel('Power (kW)', color='#9b59b6')
+            ax1.tick_params(axis='y', labelcolor='#9b59b6')
             ax1.grid(True, alpha=0.3)
             
-            # Cumulative energy
-            ax2.plot(df['timestamp'], df['energy_consumed_kwh'], color='#34495e', linewidth=2)
-            ax2.set_title('Cumulative Energy Consumption')
-            ax2.set_ylabel('Energy (kWh)')
-            ax2.set_xlabel('Time')
-            ax2.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
+            # Energy efficiency
+            ax2 = ax1.twinx()
+            ax2.plot(df['timestamp'], df['efficiency_percent'], color='#16a085', linestyle='--', linewidth=2)
+            ax2.set_ylabel('Efficiency (%)', color='#16a085')
+            ax2.tick_params(axis='y', labelcolor='#16a085')
+            ax2.set_ylim(0, 100)
+
+            fig.suptitle('Energy Consumption and Efficiency', fontsize=16, fontweight='bold')
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
             
             # Save to base64
             img_buffer = BytesIO()
@@ -627,6 +675,7 @@ class HealthReportGenerator:
             
             device_summary['health_score'] *= 100
             device_summary['efficiency_score'] *= 100
+            device_summary = device_summary.sort_values('health_score', ascending=False)
             
             plt.figure(figsize=(12, 8))
             
@@ -634,15 +683,15 @@ class HealthReportGenerator:
             width = 0.35
             
             plt.bar(x - width/2, device_summary['health_score'], width, 
-                   label='Health Score', color='#3498db', alpha=0.8)
+                    label='Avg. Health Score', color='#3498db', alpha=0.8)
             plt.bar(x + width/2, device_summary['efficiency_score'], width, 
-                   label='Efficiency Score', color='#27ae60', alpha=0.8)
+                    label='Avg. Efficiency Score', color='#27ae60', alpha=0.8)
             
             plt.xlabel('Devices')
             plt.ylabel('Score (%)')
-            plt.title('Device Performance Comparison')
+            plt.title('Device Performance Comparison (Average)', fontsize=16, fontweight='bold')
             plt.xticks(x, [f"{name}\n({id})" for id, name in zip(device_summary['device_id'], device_summary['device_name'])], 
-                      rotation=45, ha='right')
+                       rotation=45, ha='right')
             plt.legend()
             plt.grid(True, alpha=0.3, axis='y')
             plt.tight_layout()
@@ -740,53 +789,174 @@ class HealthReportGenerator:
         
         return recommendations
     
-    def _generate_predictions(self, data: Dict) -> Dict:
-        """Generate predictive analysis"""
-        # Placeholder for predictive analysis
-        return {
-            'health_forecast': {
-                'next_7_days': 'Stable',
-                'next_30_days': 'Slight decline expected',
-                'confidence': 0.75
-            },
-            'maintenance_predictions': [
-                {'device_id': 'DEVICE_001', 'days_until_maintenance': 15, 'confidence': 0.8},
-                {'device_id': 'DEVICE_003', 'days_until_maintenance': 8, 'confidence': 0.9}
-            ]
+    def _generate_predictions(self, data: Dict, health_analysis: Dict) -> Dict:
+        """Generate predictive analysis based on trends."""
+        self.logger.info("Generating predictive analysis")
+        predictions = {
+            'health_forecast': {},
+            'maintenance_predictions': []
         }
+        
+        devices_data = data.get('devices', [])
+        if not devices_data:
+            return predictions
+
+        df = pd.DataFrame(devices_data)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        # Convert timestamps to numerical values (e.g., hours from start) for regression
+        df['time_numeric'] = (df['timestamp'] - df['timestamp'].min()).dt.total_seconds() / 3600.0
+        
+        # 1. Overall Health Forecast
+        try:
+            overall_trend = health_analysis.get('overall_health', {}).get('trend', 'stable')
+            overall_score = health_analysis.get('overall_health', {}).get('current', 75)
+            
+            if overall_trend == 'declining':
+                forecast_7 = f"Likely to decline further. Current score: {overall_score:.1f}%"
+                forecast_30 = "Potential for significant decline if unaddressed."
+            elif overall_trend == 'improving':
+                forecast_7 = f"Likely to continue improving. Current score: {overall_score:.1f}%"
+                forecast_30 = "Positive outlook."
+            else:
+                forecast_7 = f"Expected to remain stable around {overall_score:.1f}%."
+                forecast_30 = "Stable outlook."
+            
+            predictions['health_forecast'] = {
+                'next_7_days': forecast_7,
+                'next_30_days': forecast_30,
+                'confidence': 0.80 # Simplified confidence
+            }
+        except Exception as e:
+            self.logger.warning(f"Could not generate overall health forecast: {e}")
+
+        # 2. Predictive Maintenance
+        critical_threshold = 0.5 # Health score of 50%
+        
+        for device_id, analysis in health_analysis.get('device_analysis', {}).items():
+            if analysis['trend'] == 'declining':
+                device_df = df[df['device_id'] == device_id].sort_values('time_numeric')
+                
+                if len(device_df) < 3: # Not enough data for regression
+                    continue
+                    
+                try:
+                    # Perform linear regression
+                    x = device_df['time_numeric']
+                    y = device_df['health_score']
+                    coeffs = np.polyfit(x, y, 1)
+                    slope = coeffs[0]
+                    intercept = coeffs[1]
+                    
+                    if slope < -0.001: # Ensure it's a meaningful decline
+                        current_time = x.iloc[-1]
+                        
+                        # Calculate time (in hours) until health hits critical_threshold
+                        # y = mx + c => x = (y - c) / m
+                        time_to_critical = (critical_threshold - intercept) / slope
+                        
+                        hours_until_maintenance = time_to_critical - current_time
+                        days_until_maintenance = hours_until_maintenance / 24.0
+                        
+                        if 0 < days_until_maintenance <= 60: # Only report for next 60 days
+                            predictions['maintenance_predictions'].append({
+                                'device_id': device_id,
+                                'device_name': analysis['device_name'], # Add device name
+                                'days_until_maintenance': round(days_until_maintenance, 1),
+                                'confidence': 0.85 # Simplified
+                            })
+                            
+                except Exception as e:
+                    self.logger.warning(f"Could not predict maintenance for {device_id}: {e}")
+        
+        # Sort predictions by urgency
+        predictions['maintenance_predictions'].sort(key=lambda x: x['days_until_maintenance'])
+        
+        return predictions
     
-    def _generate_recommendations(self, data: Dict, health_analysis: Dict) -> Dict:
-        """Generate AI-powered recommendations"""
+    def _generate_recommendations(self, data: Dict, health_analysis: Dict, predictions: Dict) -> Dict:
+        """Generate AI-powered recommendations based on analysis and predictions."""
+        self.logger.info("Generating data-driven recommendations")
         recommendations = {
             'immediate_actions': [],
             'short_term_actions': [],
             'long_term_actions': []
         }
         
-        # Immediate actions for critical devices
+        # 1. Immediate Actions (from critical devices and urgent predictions)
         critical_devices = health_analysis.get('critical_devices', [])
-        for device in critical_devices[:3]:  # Top 3 critical
+        predicted_maintenance = {p['device_id']: p for p in predictions.get('maintenance_predictions', [])}
+        
+        for device in critical_devices:
             recommendations['immediate_actions'].append({
                 'priority': 'Critical',
-                'action': f"Inspect {device['device_name']} (Health: {device['health_score']:.1f}%)",
+                'action': f"Inspect {device['device_name']} ({device['device_id']}). Current health is critical at {device['health_score']:.1f}%.",
                 'timeline': 'Within 24 hours'
             })
+            if device['device_id'] in predicted_maintenance:
+                del predicted_maintenance[device['device_id']] # Avoid duplication
         
-        # Short-term recommendations
-        if health_analysis.get('overall_health', {}).get('trend') == 'declining':
-            recommendations['short_term_actions'].append({
-                'priority': 'High',
-                'action': 'Conduct comprehensive system health assessment',
-                'timeline': 'Within 1 week'
+        # Add predictions that are urgent but not yet in 'critical' list
+        for device_id, pred in predicted_maintenance.items():
+            if pred['days_until_maintenance'] <= 7:
+                recommendations['immediate_actions'].append({
+                    'priority': 'Critical',
+                    'action': f"Schedule urgent maintenance for {pred['device_name']} ({device_id}). Predicted to fail within {pred['days_until_maintenance']} days.",
+                    'timeline': 'Within 48 hours'
+                })
+
+        # 2. Short-term Actions (declining trends, 'fair' status)
+        for device_id, analysis in health_analysis.get('device_analysis', {}).items():
+            if analysis['status'] == 'fair' and device_id not in predicted_maintenance:
+                recommendations['short_term_actions'].append({
+                    'priority': 'High',
+                    'action': f"Monitor {analysis['device_name']} ({device_id}). Health is 'fair' at {analysis['current_health']:.1f}%.",
+                    'timeline': 'Within 1 week'
+                })
+            elif analysis['trend'] == 'declining' and device_id not in predicted_maintenance and analysis['status'] != 'poor':
+                    recommendations['short_term_actions'].append({
+                    'priority': 'High',
+                    'action': f"Investigate {analysis['device_name']} ({device_id}). Health is declining but not yet critical.",
+                    'timeline': 'Within 2 weeks'
+                })
+        
+        # Check system metrics
+        if data.get('system_metrics'):
+            sys_df = pd.DataFrame(data['system_metrics'])
+            if not sys_df.empty:
+                avg_disk = sys_df['disk_usage_percent'].mean()
+                if avg_disk > 85:
+                    recommendations['short_term_actions'].append({
+                        'priority': 'Medium',
+                        'action': f"Archive old data or expand storage. Average disk usage is high at {avg_disk:.1f}%.",
+                        'timeline': 'Within 1 month'
+                    })
+
+        # 3. Long-term Actions (energy, top performers)
+        if data.get('energy_data'):
+            energy_df = pd.DataFrame(data['energy_data'])
+            if not energy_df.empty:
+                avg_efficiency = energy_df['efficiency_percent'].mean()
+                if avg_efficiency < 85:
+                    recommendations['long_term_actions'].append({
+                        'priority': 'Medium',
+                        'action': f"Review system for energy optimization. Average energy efficiency is {avg_efficiency:.1f}%.",
+                        'timeline': 'Within 3 months'
+                    })
+        
+        if health_analysis.get('top_performers'):
+            recommendations['long_term_actions'].append({
+                'priority': 'Low',
+                'action': "Analyze top-performing devices to establish benchmarks and best-practice maintenance schedules.",
+                'timeline': 'Within 6 months'
             })
-        
-        # Long-term recommendations
-        recommendations['long_term_actions'].append({
-            'priority': 'Medium',
-            'action': 'Implement predictive maintenance program',
-            'timeline': 'Within 3 months'
-        })
-        
+
+        if not any(recommendations.values()):
+            recommendations['short_term_actions'].append({
+                'priority': 'Info',
+                'action': 'System operating normally. Continue routine monitoring.',
+                'timeline': 'Ongoing'
+            })
+            
         return recommendations
     
     def _generate_html_report(self, report_data: Dict) -> str:
@@ -809,12 +979,21 @@ class HealthReportGenerator:
             color: #333;
         }
         .header {
-            background: linear-gradient(135deg, #2c3e50, #3498db);
+            background: linear-gradient(135deg, {{ config.color_scheme.primary }}, {{ config.color_scheme.secondary }});
             color: white;
             padding: 30px;
             text-align: center;
             border-radius: 10px;
             margin-bottom: 30px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 2.5rem;
+        }
+        .header h2 {
+            margin: 10px 0 0;
+            font-weight: 300;
         }
         .summary-cards {
             display: grid;
@@ -827,11 +1006,13 @@ class HealthReportGenerator:
             padding: 25px;
             border-radius: 10px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            border-left: 5px solid #3498db;
+            border-left: 5px solid {{ config.color_scheme.secondary }};
         }
-        .card.success { border-left-color: #27ae60; }
-        .card.warning { border-left-color: #f39c12; }
-        .card.danger { border-left-color: #e74c3c; }
+        .card.success { border-left-color: {{ config.color_scheme.success }}; }
+        .card.warning { border-left-color: {{ config.color_scheme.warning }}; }
+        .card.danger { border-left-color: {{ config.color_scheme.danger }}; }
+        .card.info { border-left-color: {{ config.color_scheme.info }}; }
+        
         .chart-container {
             background: white;
             padding: 20px;
@@ -846,7 +1027,7 @@ class HealthReportGenerator:
         .metric-value {
             font-size: 2.5rem;
             font-weight: bold;
-            color: #2c3e50;
+            color: {{ config.color_scheme.primary }};
         }
         .metric-label {
             color: #7f8c8d;
@@ -862,12 +1043,15 @@ class HealthReportGenerator:
         .recommendation-item {
             padding: 15px;
             margin: 10px 0;
-            border-left: 4px solid #3498db;
+            border-left: 4px solid {{ config.color_scheme.secondary }};
             background: #f8f9fa;
         }
-        .priority-critical { border-left-color: #e74c3c; }
-        .priority-high { border-left-color: #f39c12; }
-        .priority-medium { border-left-color: #3498db; }
+        .priority-critical { border-left-color: {{ config.color_scheme.danger }}; }
+        .priority-high { border-left-color: {{ config.color_scheme.warning }}; }
+        .priority-medium { border-left-color: {{ config.color_scheme.secondary }}; }
+        .priority-low { border-left-color: {{ config.color_scheme.info }}; }
+        .priority-info { border-left-color: #bdc3c7; }
+        
         .device-table {
             width: 100%;
             border-collapse: collapse;
@@ -882,7 +1066,7 @@ class HealthReportGenerator:
             border-bottom: 1px solid #eee;
         }
         .device-table th {
-            background: #3498db;
+            background: {{ config.color_scheme.secondary }};
             color: white;
         }
         .status-excellent { background: #d4edda; color: #155724; }
@@ -898,21 +1082,19 @@ class HealthReportGenerator:
     </style>
 </head>
 <body>
-    <!-- Header -->
     <div class="header">
         <h1>{{ config.system_name }}</h1>
-        <h2>Health Report</h2>
-        <p>Generated on {{ metadata.generated_at }}</p>
+        <h2>{{ metadata.report_type }}</h2>
+        <p>Generated on {{ metadata.generated_at | format_datetime }}</p>
         <p>Analysis Period: {{ metadata.date_range_days }} days | Devices: {{ metadata.devices_analyzed }}</p>
     </div>
     
-    <!-- Executive Summary -->
     <div class="summary-cards">
         <div class="card {{ summary.overall_health.color }}">
             <div class="metric-value">{{ summary.overall_health.score }}%</div>
             <div class="metric-label">Overall Health</div>
             <div>Status: {{ summary.overall_health.status }}</div>
-            <div>Trend: {{ summary.overall_health.trend }}</div>
+            <div>Trend: {{ summary.overall_health.trend | title }}</div>
         </div>
         
         <div class="card">
@@ -935,7 +1117,6 @@ class HealthReportGenerator:
         </div>
     </div>
     
-    <!-- Charts -->
     {% if charts.health_trends %}
     <div class="chart-container">
         <h3>Health Trends Over Time</h3>
@@ -945,7 +1126,7 @@ class HealthReportGenerator:
     
     {% if charts.status_distribution %}
     <div class="chart-container">
-        <h3>Device Status Distribution</h3>
+        <h3>Device Health Distribution</h3>
         <img src="{{ charts.status_distribution }}" alt="Status Distribution Chart">
     </div>
     {% endif %}
@@ -971,7 +1152,6 @@ class HealthReportGenerator:
     </div>
     {% endif %}
     
-    <!-- Device Analysis Table -->
     <div class="chart-container">
         <h3>Device Health Analysis</h3>
         <table class="device-table">
@@ -1000,14 +1180,13 @@ class HealthReportGenerator:
         </table>
     </div>
     
-    <!-- Recommendations -->
     <div class="recommendations">
         <h3>AI-Powered Recommendations</h3>
         
         {% if recommendations.immediate_actions %}
         <h4>Immediate Actions Required</h4>
         {% for action in recommendations.immediate_actions %}
-        <div class="recommendation-item priority-critical">
+        <div class="recommendation-item priority-{{ action.priority.lower() }}">
             <strong>{{ action.priority }}:</strong> {{ action.action }}
             <br><small>Timeline: {{ action.timeline }}</small>
         </div>
@@ -1017,7 +1196,7 @@ class HealthReportGenerator:
         {% if recommendations.short_term_actions %}
         <h4>Short-term Actions</h4>
         {% for action in recommendations.short_term_actions %}
-        <div class="recommendation-item priority-high">
+        <div class="recommendation-item priority-{{ action.priority.lower() }}">
             <strong>{{ action.priority }}:</strong> {{ action.action }}
             <br><small>Timeline: {{ action.timeline }}</small>
         </div>
@@ -1027,7 +1206,7 @@ class HealthReportGenerator:
         {% if recommendations.long_term_actions %}
         <h4>Long-term Strategic Actions</h4>
         {% for action in recommendations.long_term_actions %}
-        <div class="recommendation-item priority-medium">
+        <div class="recommendation-item priority-{{ action.priority.lower() }}">
             <strong>{{ action.priority }}:</strong> {{ action.action }}
             <br><small>Timeline: {{ action.timeline }}</small>
         </div>
@@ -1035,10 +1214,9 @@ class HealthReportGenerator:
         {% endif %}
     </div>
     
-    <!-- Critical Devices Alert -->
     {% if health_analysis.critical_devices %}
     <div class="chart-container">
-        <h3 style="color: #e74c3c;">Critical Devices Requiring Immediate Attention</h3>
+        <h3 style="color: {{ config.color_scheme.danger }};">Critical Devices Requiring Immediate Attention</h3>
         <table class="device-table">
             <thead>
                 <tr>
@@ -1064,10 +1242,9 @@ class HealthReportGenerator:
     </div>
     {% endif %}
     
-    <!-- Top Performers -->
     {% if health_analysis.top_performers %}
     <div class="chart-container">
-        <h3 style="color: #27ae60;">Top Performing Devices</h3>
+        <h3 style="color: {{ config.color_scheme.success }};">Top Performing Devices</h3>
         <table class="device-table">
             <thead>
                 <tr>
@@ -1093,14 +1270,13 @@ class HealthReportGenerator:
     </div>
     {% endif %}
     
-    <!-- Predictions Section -->
     {% if predictions %}
     <div class="chart-container">
         <h3>Predictive Analysis</h3>
         
         {% if predictions.health_forecast %}
         <h4>Health Forecast</h4>
-        <div class="recommendation-item">
+        <div class="recommendation-item priority-medium">
             <strong>Next 7 Days:</strong> {{ predictions.health_forecast.next_7_days }}<br>
             <strong>Next 30 Days:</strong> {{ predictions.health_forecast.next_30_days }}<br>
             <strong>Confidence:</strong> {{ "%.1f"|format(predictions.health_forecast.confidence * 100) }}%
@@ -1113,6 +1289,7 @@ class HealthReportGenerator:
             <thead>
                 <tr>
                     <th>Device ID</th>
+                    <th>Device Name</th>
                     <th>Days Until Maintenance</th>
                     <th>Confidence</th>
                     <th>Recommendation</th>
@@ -1122,9 +1299,12 @@ class HealthReportGenerator:
                 {% for pred in predictions.maintenance_predictions %}
                 <tr>
                     <td>{{ pred.device_id }}</td>
+                    <td>{{ pred.device_name }}</td>
                     <td>{{ pred.days_until_maintenance }}</td>
                     <td>{{ "%.1f"|format(pred.confidence * 100) }}%</td>
-                    <td>{% if pred.days_until_maintenance <= 10 %}Schedule maintenance soon{% else %}Monitor closely{% endif %}</td>
+                    <td class="{% if pred.days_until_maintenance <= 10 %}status-poor{% else %}status-fair{% endif %}">
+                        {% if pred.days_until_maintenance <= 10 %}Schedule maintenance soon{% else %}Monitor closely{% endif %}
+                    </td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -1133,11 +1313,10 @@ class HealthReportGenerator:
     </div>
     {% endif %}
     
-    <!-- Footer -->
     <div class="footer">
         <p>Report generated by {{ config.system_name }} v{{ config.version }}</p>
-        <p>Generated on {{ metadata.generated_at }} | Report Type: {{ metadata.report_type }}</p>
-        <p>&copy; 2025 Digital Twin Industries. All rights reserved.</p>
+        <p>Generated on {{ metadata.generated_at | format_datetime }} | Report Type: {{ metadata.report_type }}</p>
+        <p>&copy; 2025 {{ config.company_name }}. All rights reserved.</p>
     </div>
 </body>
 </html>
@@ -1145,6 +1324,16 @@ class HealthReportGenerator:
             
             # Render template
             template = Template(html_template)
+            
+            # Add a custom filter for formatting datetime
+            def format_datetime(value):
+                try:
+                    return datetime.fromisoformat(value).strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    return value
+            
+            template.environment.filters['format_datetime'] = format_datetime
+            
             html_content = template.render(**report_data)
             
             # Save HTML file
@@ -1165,11 +1354,15 @@ class HealthReportGenerator:
     def _generate_pdf_report(self, html_path: str) -> str:
         """Generate PDF report from HTML (requires additional library)"""
         try:
-            # This would require weasyprint or similar library
-            # For now, just return the HTML path
-            self.logger.info("PDF generation requires additional dependencies (weasyprint)")
-            return html_path.replace('.html', '.pdf')
+            import weasyprint
+            pdf_path = html_path.replace('.html', '.pdf')
+            weasyprint.HTML(html_path).write_pdf(pdf_path)
+            return pdf_path
             
+        except ImportError:
+            self.logger.warning("PDF generation skipped: 'weasyprint' library not installed.")
+            self.logger.warning("To install: pip install weasyprint")
+            return None
         except Exception as e:
             self.logger.error(f"PDF generation error: {e}")
             return None
@@ -1231,8 +1424,9 @@ def main():
     parser.add_argument('--days', type=int, default=30, help='Number of days to analyze')
     parser.add_argument('--output', help='Output directory')
     parser.add_argument('--quick', action='store_true', help='Generate quick summary only')
-    parser.add_argument('--predictions', action='store_true', default=True, help='Include predictions')
-    parser.add_argument('--recommendations', action='store_true', default=True, help='Include recommendations')
+    parser.add_argument('--no-predictions', dest='predictions', action='store_false', help='Disable predictions')
+    parser.add_argument('--no-recommendations', dest='recommendations', action='store_false', help='Disable recommendations')
+    parser.set_defaults(predictions=True, recommendations=True)
     
     args = parser.parse_args()
     
@@ -1243,13 +1437,15 @@ def main():
         if args.quick:
             # Generate quick summary
             summary = generator.generate_quick_summary(args.devices)
-            print("Quick Health Summary:")
-            print(f"Overall Health: {summary.get('summary', {}).get('overall_health', {}).get('score', 'N/A')}%")
-            print(f"Critical Devices: {summary.get('critical_devices_count', 0)}")
-            print(f"Total Devices: {summary.get('total_devices', 0)}")
-            print(f"Trend: {summary.get('overall_health_trend', 'Unknown')}")
+            print("--- Quick Health Summary ---")
+            print(f"  Overall Health: {summary.get('summary', {}).get('overall_health', {}).get('score', 'N/A')}%")
+            print(f"  Overall Trend:  {summary.get('overall_health_trend', 'Unknown').title()}")
+            print(f"  Total Devices:  {summary.get('total_devices', 0)}")
+            print(f"  Critical:       {summary.get('critical_devices_count', 0)}")
+            print("----------------------------")
         else:
             # Generate comprehensive report
+            print(f"Generating comprehensive report for {args.days} days...")
             report_path = generator.generate_comprehensive_report(
                 device_ids=args.devices,
                 date_range_days=args.days,
