@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import logging
 import json
+import os # Added for path handling
+import sys # Added for path handling
 # import sqlite3 # Removed direct SQLite dependency
 import pickle
 from datetime import datetime, timedelta
@@ -347,7 +349,7 @@ class DashboardHelper:
                 'median_health': round(health_scores_pct.median(), 1),
                 'min_health': round(health_scores_pct.min(), 1),
                 'max_health': round(health_scores_pct.max(), 1),
-                'std_health': round(health_scores_pct.std(), 1),
+                'std_health': round(health_scores_pct.std(), 1) if not np.isnan(health_scores_pct.std()) else 0.0, # Handle NaN std
                 'health_distribution': health_distribution,
                 'health_trend': health_trend_details.get('trend', 'stable'), # Simple trend for overview card
                 'devices_needing_attention': health_distribution['poor'] + health_distribution['critical']
@@ -384,7 +386,7 @@ class DashboardHelper:
             # Get latest snapshot for current metrics
             latest_df = historical_df.sort_values('timestamp').groupby('device_id').last().reset_index()
 
-            efficiency_scores = pd.Series([])
+            efficiency_scores = pd.Series([], dtype=float) # Initialize with dtype
             if 'efficiency_score' in latest_df.columns:
                  efficiency_scores = latest_df['efficiency_score'].dropna() * 100
 
@@ -477,7 +479,8 @@ class DashboardHelper:
         default_trend = {'trend': 'stable', 'slope': 0.0, 'change_24h': 0.0, 'change_7d': 0.0, 'unit': '%'}
 
         try:
-            if df.empty or metric not in df.columns:
+            if df.empty or metric not in df.columns or df[metric].isnull().all():
+                self.logger.warning(f"No valid data for detailed trend on '{metric}'.")
                 return default_trend
 
             df_copy = df.dropna(subset=[metric, 'timestamp']).copy()
@@ -485,16 +488,26 @@ class DashboardHelper:
             if not pd.api.types.is_datetime64_any_dtype(df_copy['timestamp']):
                  df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'])
 
+            if df_copy.empty:
+                self.logger.warning(f"No valid data after dropping NaNs for trend on '{metric}'.")
+                return default_trend
 
-            # Resample to daily average
             # Ensure index is unique before resampling if needed
-            df_copy = df_copy.drop_duplicates(subset=['timestamp']).set_index('timestamp')
-            daily_avg = df_copy.resample('D')[metric].mean().dropna()
+            if df_copy['timestamp'].duplicated().any():
+                self.logger.debug(f"Handling duplicate timestamps for trend on '{metric}'. Keeping last.")
+                df_copy = df_copy.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
+
+            df_copy = df_copy.set_index('timestamp')
+
+            # Determine appropriate resampling frequency (e.g., daily)
+            # Adjust freq based on data density if needed
+            resample_freq = 'D'
+            daily_avg = df_copy[metric].resample(resample_freq).mean().dropna()
 
 
             if len(daily_avg) < 2:
                 # Need at least two points for trend calculation
-                self.logger.warning(f"Not enough daily data points ({len(daily_avg)}) for detailed trend on '{metric}'.")
+                self.logger.warning(f"Not enough resampled data points ({len(daily_avg)}) for detailed trend on '{metric}'.")
                 # Return basic trend if possible
                 if len(daily_avg) == 1:
                      return {'trend': 'stable', 'slope': 0.0, 'change_24h': 0.0, 'change_7d': 0.0, 'unit': '%'} # Treat single point as stable
@@ -504,7 +517,10 @@ class DashboardHelper:
             # Get latest, 24h ago, and 7d ago (or first) values
             latest_val = daily_avg.iloc[-1]
             prev_val_24h = daily_avg.iloc[-2] if len(daily_avg) >= 2 else latest_val # Fallback if only 1 day
-            prev_val_7d = daily_avg.iloc[0] # First value in the resampled series
+            # Use data from 7 days prior if available, otherwise use the first point
+            seven_days_ago = daily_avg.index[-1] - pd.Timedelta(days=7)
+            prev_val_7d_series = daily_avg[daily_avg.index <= seven_days_ago]
+            prev_val_7d = prev_val_7d_series.iloc[-1] if not prev_val_7d_series.empty else daily_avg.iloc[0]
 
             # Calculate changes
             change_24h = latest_val - prev_val_24h
@@ -514,18 +530,21 @@ class DashboardHelper:
             x = np.arange(len(daily_avg))
             slope, _, _, _, _ = stats.linregress(x, daily_avg.values)
 
-            # Determine trend string
+            # Determine trend string based on normalized slope (more robust)
+            data_range = daily_avg.max() - daily_avg.min() if len(daily_avg) > 1 else 1.0
+            normalized_slope = slope / (data_range + 1e-9) # Avoid division by zero
+
             trend_str = 'stable'
-            if slope > 0.005:  # Threshold for 'improving' (adjusted based on metric scale if needed)
+            if normalized_slope > 0.05:  # Threshold for 'improving' (e.g., >5% change over period)
                 trend_str = 'improving'
-            elif slope < -0.005: # Threshold for 'declining'
+            elif normalized_slope < -0.05: # Threshold for 'declining'
                 trend_str = 'declining'
 
             # Unit determination
             unit = '%'
             multiplier = 100
             if metric == 'value' and 'unit' in df.columns: # Special case for 'value' trend
-                unit_series = df['unit'].dropna()
+                unit_series = df_copy['unit'].dropna() # Use df_copy to access unit after potential dropna
                 if not unit_series.empty:
                     unit = unit_series.iloc[0]
                     multiplier = 1 # Don't multiply raw values by 100
@@ -535,7 +554,8 @@ class DashboardHelper:
             elif metric != 'health_score' and metric != 'efficiency_score':
                  # Assume other metrics are not 0-1 scores
                  multiplier = 1
-                 unit = df['unit'].iloc[0] if 'unit' in df.columns and not df.empty else ''
+                 unit_series = df_copy['unit'].dropna()
+                 unit = unit_series.iloc[0] if not unit_series.empty else ''
 
 
             return {
@@ -600,38 +620,42 @@ class DashboardHelper:
                 # Drop rows where health_score is NaN before nlargest/nsmallest
                 health_df_valid = latest_df.dropna(subset=['health_score'])
 
-                top_health = health_df_valid.nlargest(5, 'health_score')[health_cols].copy()
-                top_health['health_score'] = (top_health['health_score'] * 100).round(1)
+                if not health_df_valid.empty:
+                    top_health = health_df_valid.nlargest(5, 'health_score')[health_cols].copy()
+                    top_health['health_score'] = (top_health['health_score'] * 100).round(1)
 
-                bottom_health = health_df_valid.nsmallest(5, 'health_score')[health_cols].copy()
-                bottom_health['health_score'] = (bottom_health['health_score'] * 100).round(1)
+                    bottom_health = health_df_valid.nsmallest(5, 'health_score')[health_cols].copy()
+                    bottom_health['health_score'] = (bottom_health['health_score'] * 100).round(1)
 
-                comparisons['top_5_health'] = top_health.to_dict('records')
-                comparisons['bottom_5_health'] = bottom_health.to_dict('records')
+                    comparisons['top_5_health'] = top_health.to_dict('records')
+                    comparisons['bottom_5_health'] = bottom_health.to_dict('records')
 
             # Top 5 / Bottom 5 by Efficiency
             if 'efficiency_score' in latest_df.columns and not latest_df['efficiency_score'].isnull().all():
                 eff_cols = ['device_id', 'device_name', 'efficiency_score']
                 eff_df_valid = latest_df.dropna(subset=['efficiency_score'])
 
-                top_eff = eff_df_valid.nlargest(5, 'efficiency_score')[eff_cols].copy()
-                top_eff['efficiency_score'] = (top_eff['efficiency_score'] * 100).round(1)
+                if not eff_df_valid.empty:
+                    top_eff = eff_df_valid.nlargest(5, 'efficiency_score')[eff_cols].copy()
+                    top_eff['efficiency_score'] = (top_eff['efficiency_score'] * 100).round(1)
 
-                bottom_eff = eff_df_valid.nsmallest(5, 'efficiency_score')[eff_cols].copy()
-                bottom_eff['efficiency_score'] = (bottom_eff['efficiency_score'] * 100).round(1)
+                    bottom_eff = eff_df_valid.nsmallest(5, 'efficiency_score')[eff_cols].copy()
+                    bottom_eff['efficiency_score'] = (bottom_eff['efficiency_score'] * 100).round(1)
 
-                comparisons['top_5_efficiency'] = top_eff.to_dict('records')
-                comparisons['bottom_5_efficiency'] = bottom_eff.to_dict('records')
+                    comparisons['top_5_efficiency'] = top_eff.to_dict('records')
+                    comparisons['bottom_5_efficiency'] = bottom_eff.to_dict('records')
 
             # Aggregates by Location
             if 'location' in latest_df.columns and 'health_score' in latest_df.columns:
                 health_by_loc = (latest_df.groupby('location')['health_score'].mean() * 100).round(1).dropna()
-                comparisons['health_by_location'] = health_by_loc.to_dict()
+                if not health_by_loc.empty:
+                    comparisons['health_by_location'] = health_by_loc.to_dict()
 
             # Aggregates by Device Type
             if 'device_type' in latest_df.columns and 'efficiency_score' in latest_df.columns:
                 eff_by_type = (latest_df.groupby('device_type')['efficiency_score'].mean() * 100).round(1).dropna()
-                comparisons['efficiency_by_type'] = eff_by_type.to_dict()
+                if not eff_by_type.empty:
+                    comparisons['efficiency_by_type'] = eff_by_type.to_dict()
 
             return comparisons
 
@@ -663,21 +687,29 @@ class DashboardHelper:
 
             # Calculate daily energy estimate from historical data (more accurate)
             # Resample to hourly mean power, then sum over 24h
+            daily_energy_kwh = 0 # Default
             if 'timestamp' in power_df.columns and len(power_df) > 1:
-                power_df = power_df.set_index('timestamp')
+                power_df_indexed = power_df.set_index('timestamp')
                 # Sum power across all meters at each timestamp
-                total_power_series_w = power_df.groupby(power_df.index)['value'].sum()
+                total_power_series_w = power_df_indexed.groupby(power_df_indexed.index)['value'].sum()
                 # Resample to hourly average power in kW
                 hourly_power_kw = total_power_series_w.resample('H').mean() / 1000.0
 
-                # Get the last 24 hours of data
-                last_24h_power = hourly_power_kw.last('24H')
-                if not last_24h_power.empty:
-                    # Energy = Power * Time (assuming hourly samples, so time interval = 1 hour)
-                    daily_energy_kwh = last_24h_power.sum()
+                # Get the last 24 hours of data relative to the LATEST timestamp in the data
+                if not hourly_power_kw.empty:
+                    last_ts = hourly_power_kw.index.max()
+                    start_ts = last_ts - pd.Timedelta(hours=24)
+                    last_24h_power = hourly_power_kw[(hourly_power_kw.index > start_ts) & (hourly_power_kw.index <= last_ts)]
+
+                    if not last_24h_power.empty:
+                        # Energy = Power * Time (assuming hourly samples, so time interval = 1 hour)
+                        # Summing the average hourly power gives the total kWh for the period
+                        daily_energy_kwh = last_24h_power.sum()
+                    else:
+                        # Fallback: estimate based on current power if not enough history
+                        daily_energy_kwh = current_power_kw * 24
                 else:
-                    # Fallback: estimate based on current power if not enough history
-                    daily_energy_kwh = current_power_kw * 24
+                     daily_energy_kwh = current_power_kw * 24
             else:
                  # Fallback estimate
                  daily_energy_kwh = current_power_kw * 24
@@ -686,7 +718,8 @@ class DashboardHelper:
 
             # Estimate efficiency and footprint (can be refined)
             # Use efficiency score if available, otherwise simulate
-            avg_efficiency = historical_df['efficiency_score'].mean() * 100 if 'efficiency_score' in historical_df.columns else np.random.uniform(85, 95)
+            avg_efficiency_series = historical_df['efficiency_score'].dropna()
+            avg_efficiency = avg_efficiency_series.mean() * 100 if not avg_efficiency_series.empty else np.random.uniform(85, 95)
 
             return {
                 'current_power_kw': round(current_power_kw, 1),
@@ -732,7 +765,94 @@ class DashboardHelper:
 
     # --- Chart preparation methods remain the same, operating on DataFrames ---
     # (No changes needed for _prepare_line_chart_data, _prepare_bar_chart_data, etc.)
-    # ... (rest of the chart methods) ...
+    # ... (rest of the chart methods like _prepare_pie_chart_data_from_counts) ...
+    def _prepare_pie_chart_data_from_counts(self, counts: Dict[str, int]) -> Dict:
+        """Prepares data suitable for a pie chart from a counts dictionary."""
+        labels = list(counts.keys())
+        values = list(counts.values())
+        colors = [self.color_schemes['status'].get(label, '#bdc3c7') for label in labels] # Use status colors
+
+        return {
+            'labels': labels,
+            'datasets': [{
+                'data': values,
+                'backgroundColor': colors,
+                'hoverBackgroundColor': colors # Or slightly darker versions
+            }]
+        }
+
+    # Added prepare_chart_data from example usage for completeness
+    def prepare_chart_data(self, chart_type: str, time_range: str = '24h', device_id: Optional[str] = None, data_df: Optional[pd.DataFrame] = None) -> Dict:
+        """
+        Prepares data for various chart types based on input DataFrame or generates sample data.
+        NOTE: In production, this should ideally always receive a DataFrame (data_df).
+              The internal generator is primarily for demo/fallback.
+        """
+        self.logger.info(f"Preparing chart data: type={chart_type}, range={time_range}, device={device_id}")
+
+        if data_df is None:
+            # Fallback to internal generator ONLY if no data provided
+            self.logger.warning("No DataFrame provided to prepare_chart_data. Using internal demo generator.")
+            if device_id:
+                # Generate sample historical for a specific device
+                hours = {'1h': 1, '4h': 4, '24h': 24, '7d': 7*24, '30d': 30*24}.get(time_range, 24)
+                sample_records = self._generate_sample_historical_data(device_id, hours)
+                data_df = pd.DataFrame(sample_records)
+            else:
+                 # Generate sample overview data
+                 sample_records = self._generate_sample_device_data()
+                 data_df = pd.DataFrame(sample_records)
+                 # Filter by time range roughly
+                 cutoff = datetime.now() - timedelta(days={'1h': 1/24, '4h': 4/24, '24h': 1, '7d': 7, '30d': 30}.get(time_range, 1))
+                 data_df['timestamp'] = pd.to_datetime(data_df['timestamp'])
+                 data_df = data_df[data_df['timestamp'] >= cutoff]
+
+
+        if data_df.empty:
+            return {'error': 'No data available to generate chart'}
+
+        # Ensure timestamp is datetime
+        if 'timestamp' in data_df.columns and not pd.api.types.is_datetime64_any_dtype(data_df['timestamp']):
+            data_df['timestamp'] = pd.to_datetime(data_df['timestamp'])
+
+        try:
+            if chart_type == 'line':
+                return self._prepare_line_chart_data(data_df, device_id)
+            # Add other chart types like 'bar', 'pie' based on needs
+            elif chart_type == 'pie': # Example: Use status distribution
+                 latest_df = data_df.sort_values('timestamp').groupby('device_id').last().reset_index()
+                 status_counts = latest_df['status'].value_counts().to_dict()
+                 return self._prepare_pie_chart_data_from_counts(status_counts)
+            else:
+                return {'error': f'Unsupported chart type: {chart_type}'}
+        except Exception as e:
+            self.logger.error(f"Chart preparation error for {chart_type}: {e}", exc_info=True)
+            return {'error': str(e)}
+
+    def _prepare_line_chart_data(self, df: pd.DataFrame, device_id: Optional[str] = None) -> Dict:
+        """Prepares data for a line chart (e.g., value over time)."""
+        df_filtered = df if device_id is None else df[df['device_id'] == device_id]
+
+        if df_filtered.empty:
+            return {'labels': [], 'datasets': []}
+
+        df_sorted = df_filtered.sort_values('timestamp')
+
+        labels = df_sorted['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+        values = df_sorted['value'].tolist()
+        unit = df_sorted['unit'].iloc[0] if not df_sorted['unit'].empty else ''
+        label_text = f"{device_id} Value ({unit})" if device_id else f"Average Value ({unit})"
+
+        return {
+            'labels': labels,
+            'datasets': [{
+                'label': label_text,
+                'data': values,
+                'borderColor': self.color_schemes['primary'][0],
+                'tension': 0.1
+            }]
+        }
+
 
     # --- Real-time updates remain the same, operating on DataFrames ---
     # (No changes needed for get_realtime_updates, _get_metric_with_delta, etc.)
@@ -885,11 +1005,9 @@ class DashboardHelper:
 
             if historical_df is not None and not historical_df.empty:
                 # Ensure timestamp is string for JSON/CSV compatibility if needed
-                if 'timestamp' in historical_df.columns and pd.api.types.is_datetime64_any_dtype(historical_df['timestamp']):
-                     historical_df_export = historical_df.copy()
+                historical_df_export = historical_df.copy() # Avoid modifying original
+                if 'timestamp' in historical_df_export.columns and pd.api.types.is_datetime64_any_dtype(historical_df_export['timestamp']):
                      historical_df_export['timestamp'] = historical_df_export['timestamp'].dt.isoformat()
-                else:
-                     historical_df_export = historical_df
 
                 export_data['historical_data'] = historical_df_export.to_dict('records')
 
@@ -907,15 +1025,29 @@ class DashboardHelper:
                 # Export latest devices to CSV
                 export_path = self.cache_path / f"{base_filename}_latest_devices.csv"
                 latest_devices_df.to_csv(export_path, index=False, date_format='%Y-%m-%dT%H:%M:%SZ')
+                export_paths = {'latest_devices': str(export_path)}
 
                 # Optionally export historical data to a separate CSV
                 if historical_df is not None and not historical_df.empty:
+                    # Use the same export_df as JSON for consistent timestamp formatting
                     hist_export_path = self.cache_path / f"{base_filename}_historical.csv"
-                    historical_df.to_csv(hist_export_path, index=False, date_format='%Y-%m-%dT%H:%M:%SZ')
+                    historical_df_export.to_csv(hist_export_path, index=False, date_format='%Y-%m-%dT%H:%M:%SZ')
+                    export_paths['historical_data'] = str(hist_export_path)
 
-                return {'export_path': str(export_path), 'format': 'csv'}
+                return {'export_paths': export_paths, 'format': 'csv'}
 
             # Add 'excel' format if needed using pandas ExcelWriter
+            elif format_type == 'excel':
+                export_path = self.cache_path / f"{base_filename}.xlsx"
+                with pd.ExcelWriter(export_path, engine='xlsxwriter',
+                                    datetime_format='yyyy-mm-dd hh:mm:ss',
+                                    date_format='yyyy-mm-dd') as writer:
+                    latest_devices_df.to_excel(writer, sheet_name='Latest Devices', index=False)
+                    if historical_df is not None and not historical_df.empty:
+                        # Use export_df for consistent timestamp formatting if exists
+                        (historical_df_export if 'historical_df_export' in locals() else historical_df).to_excel(writer, sheet_name='Historical Data', index=False)
+                return {'export_path': str(export_path), 'format': 'excel'}
+
 
             else:
                 return {'error': f'Unsupported export format: {format_type}'}
@@ -947,7 +1079,7 @@ if __name__ == "__main__":
         print(f"Generated DataFrame with {len(historical_df)} records.")
     else:
         print("Failed to generate sample data.")
-        exit()
+        sys.exit(1) # Use sys.exit
 
 
     # 2. Get dashboard overview using the DataFrame
@@ -1025,10 +1157,25 @@ if __name__ == "__main__":
     print("5. Testing data export (using generated overview and latest data)...")
     latest_devices_df = historical_df.sort_values('timestamp').groupby('device_id').last().reset_index()
 
+    # JSON Export
     json_export = dashboard.export_dashboard_data(overview, latest_devices_df, historical_df, format_type='json')
     if 'error' not in json_export:
         print(f"✓ JSON Export: {json_export.get('export_path', 'Unknown path')}")
     else:
         print(f"✗ JSON Export Error: {json_export['error']}")
+
+    # CSV Export
+    csv_export = dashboard.export_dashboard_data(overview, latest_devices_df, historical_df, format_type='csv')
+    if 'error' not in csv_export:
+        print(f"✓ CSV Export: {csv_export.get('export_paths', 'Unknown paths')}")
+    else:
+        print(f"✗ CSV Export Error: {csv_export['error']}")
+
+    # Excel Export
+    excel_export = dashboard.export_dashboard_data(overview, latest_devices_df, historical_df, format_type='excel')
+    if 'error' not in excel_export:
+        print(f"✓ Excel Export: {excel_export.get('export_path', 'Unknown path')}")
+    else:
+        print(f"✗ Excel Export Error: {excel_export['error']}")
 
     print("\n=== DEMO COMPLETED (v2.0) ===")
