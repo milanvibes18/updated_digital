@@ -32,9 +32,9 @@
         "description": "High vibration detected"
       },
       "efficiency_low": {
-        "metric": "efficiency",
+        "metric": "efficiency_score",
         "operator": "<",
-        "threshold": 70,
+        "threshold": 0.7,
         "severity": "info",
         "duration": 600,
         "description": "System efficiency below optimal"

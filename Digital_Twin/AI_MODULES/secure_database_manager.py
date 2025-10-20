@@ -44,6 +44,22 @@ except ImportError:
     DEFAULT_PRIMARY_DB = 'DATABASE/secure_database.db'
     DEFAULT_USERS_DB = 'DATABASE/users.db'
 
+# --- NEW HELPER FUNCTION (from Update) ---
+def get_required_env(var_name: str) -> str:
+    """
+    Gets a required environment variable, raising a critical error if not found.
+    """
+    value = os.environ.get(var_name)
+    if value is None:
+        # Get logger instance if available, otherwise print
+        logger_instance = logging.getLogger('SecureDatabaseManager')
+        if logger_instance.hasHandlers():
+            logger_instance.critical(f"CRITICAL: Environment variable '{var_name}' is not set.")
+        else:
+            print(f"CRITICAL: Environment variable '{var_name}' is not set.")
+        raise ValueError(f"Missing required environment variable: {var_name}")
+    return value
+
 class SecureDatabaseManager:
     """
     Manages secure database operations, including user auth, data encryption,
@@ -71,7 +87,7 @@ class SecureDatabaseManager:
         
         # Initialize databases (Merged)
         self._initialize_database()  # Initializes data/audit/device tables
-        self.init_users_db()      # Initializes user table
+        self.init_users_db()       # Initializes user table
 
     # --- Kept from File 1 (Superior Logging) ---
     def _setup_logging(self):
@@ -96,7 +112,7 @@ class SecureDatabaseManager:
         
         return logger
 
-    # --- NEW: Static method for key generation ---
+    # --- NEW: Static method for key generation (from Update) ---
     @staticmethod
     def generate_key_for_env() -> str:
         """
@@ -105,31 +121,29 @@ class SecureDatabaseManager:
         key = secrets.token_bytes(32)  # 32 bytes = 256 bits
         return base64.b64encode(key).decode('utf-8')
 
-    # --- REFACTORED: Load key from Environment Variable ---
+    # --- REFACTORED: Load key from Environment Variable (from Update) ---
     def _initialize_encryption(self):
         """
         Initialize encryption by loading the 32-byte key from
         the ENCRYPTION_KEY environment variable.
         """
         try:
-            key_b64 = os.environ.get("ENCRYPTION_KEY")
-            if not key_b64:
-                self.logger.error("ENCRYPTION_KEY environment variable not set.")
-                raise ValueError("ENCRYPTION_KEY not set")
-            
+            # Use the helper function to get required env var
+            key_b64 = get_required_env("ENCRYPTION_KEY")
+
             key = base64.b64decode(key_b64)
-            
+
             if len(key) != 32:
                 self.logger.error(
                     f"ENCRYPTION_KEY must be 32 bytes (256-bit), but got {len(key)} bytes."
                 )
                 raise ValueError("Invalid key length")
-                
-            self.logger.info("AES-256-GCM Encryption key loaded successfully")
-            return key
-            
+
+            self.logger.info("AES-256-GCM Encryption key loaded successfully from environment")
+            return key # Store the raw bytes
+
         except Exception as e:
-            self.logger.error(f"Failed to initialize encryption: {e}")
+            self.logger.critical(f"CRITICAL: Failed to initialize encryption: {e}", exc_info=True)
             raise
 
     # --- REFACTORED: Removed data_hash column ---
@@ -217,35 +231,43 @@ class SecureDatabaseManager:
             self.logger.error(f"Failed to initialize user database: {e}")
             raise
 
-    # --- REFACTORED: Use AES-256-GCM ---
+    # --- REFACTORED: Use AES-256-GCM (from Update) ---
     def encrypt_data(self, data):
         """Encrypt data using AES-256-GCM."""
+        if not self.aes_gcm_key: # Check if key was loaded
+             raise RuntimeError("Encryption key not initialized.")
         try:
             if isinstance(data, dict):
-                data = json.dumps(data)
+                data_str = json.dumps(data)
             elif not isinstance(data, (str, bytes)):
-                data = str(data)
-            
-            if isinstance(data, str):
-                data = data.encode('utf-8')
-            
+                data_str = str(data)
+            else:
+                 data_str = data # Already string or bytes
+
+            if isinstance(data_str, str):
+                data_bytes = data_str.encode('utf-8')
+            else:
+                 data_bytes = data_str # Assume already bytes
+
             aesgcm = AESGCM(self.aes_gcm_key)
             nonce = secrets.token_bytes(12)  # GCM standard 96-bit nonce
-            
+
             # encrypt() returns ciphertext + 16-byte authentication tag
-            ciphertext_with_tag = aesgcm.encrypt(nonce, data, None) 
-            
+            ciphertext_with_tag = aesgcm.encrypt(nonce, data_bytes, None)
+
             # Store as nonce + (ciphertext + tag), all base64 encoded
             combined = nonce + ciphertext_with_tag
             return base64.b64encode(combined).decode('utf-8')
-            
+
         except Exception as e:
-            self.logger.error(f"Failed to encrypt data: {e}")
+            self.logger.error(f"Failed to encrypt data: {e}", exc_info=True)
             raise
 
-    # --- REFACTORED: Use AES-256-GCM ---
+    # --- REFACTORED: Use AES-256-GCM (Merged from Original + Update) ---
     def decrypt_data(self, encrypted_data):
         """Decrypt data using AES-256-GCM and verify integrity."""
+        if not self.aes_gcm_key: # From Update
+             raise RuntimeError("Encryption key not initialized.")
         try:
             combined_bytes = base64.b64decode(encrypted_data.encode('utf-8'))
             
@@ -255,13 +277,14 @@ class SecureDatabaseManager:
             ciphertext_with_tag = combined_bytes[12:]
             
             if len(nonce) != 12:
-                 raise ValueError("Invalid encrypted data format: nonce length incorrect")
+                    raise ValueError("Invalid encrypted data format: nonce length incorrect")
 
             aesgcm = AESGCM(self.aes_gcm_key)
             
             # decrypt() will raise InvalidTag exception if auth fails
             decrypted = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
             
+            # Return raw string, as in original. Callers handle JSON parsing.
             return decrypted.decode('utf-8')
             
         except (base64.binascii.Error, ValueError) as e:
@@ -271,7 +294,7 @@ class SecureDatabaseManager:
             self.logger.warning("Failed to decrypt data: DATA TAMPERING DETECTED (InvalidTag)")
             raise
         except Exception as e:
-            self.logger.error(f"Failed to decrypt data: {e}")
+            self.logger.error(f"Failed to decrypt data: {e}", exc_info=True) # exc_info from Update
             raise
 
     # --- REMOVED: _calculate_hash (redundant with AES-GCM) ---
@@ -286,7 +309,7 @@ class SecureDatabaseManager:
                 
                 cursor.execute('''
                     INSERT INTO audit_log (action, user_id, table_name, record_id, 
-                                           old_values, new_values, ip_address, user_agent)
+                                            old_values, new_values, ip_address, user_agent)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (action, user_id, table_name, record_id, 
                       json.dumps(old_values) if old_values else None,
@@ -427,9 +450,10 @@ class SecureDatabaseManager:
                 for row in rows:
                     try:
                         # Decrypt data (this will raise InvalidTag if tampered)
+                        # decrypt_data returns a string
                         decrypted_data = self.decrypt_data(row['encrypted_data'])
                         
-                        # Parse JSON if applicable
+                        # Parse JSON if applicable (as in original)
                         try:
                             data = json.loads(decrypted_data)
                         except json.JSONDecodeError:
@@ -620,6 +644,7 @@ class SecureDatabaseManager:
                 row = cursor.fetchone()
                 
                 if row:
+                    # decrypt_data returns a string, which json.loads parses
                     session_data = json.loads(self.decrypt_data(row['encrypted_session_data']))
                     
                     return {
@@ -679,7 +704,7 @@ class SecureDatabaseManager:
                 
                 query = '''
                     SELECT action, user_id, table_name, record_id, old_values, 
-                           new_values, timestamp, ip_address, user_agent
+                            new_values, timestamp, ip_address, user_agent
                     FROM audit_log WHERE 1=1
                 '''
                 params = []
@@ -775,7 +800,9 @@ class TestEncryption(unittest.TestCase):
         """Test encrypting and decrypting a dictionary."""
         original_dict = {"patient_id": 123, "data": {"bp": "120/80"}}
         encrypted = self.db_manager.encrypt_data(original_dict)
+        # decrypt_data returns a string, as expected
         decrypted_str = self.db_manager.decrypt_data(encrypted)
+        # The test correctly handles JSON loading
         decrypted_dict = json.loads(decrypted_str)
         self.assertEqual(original_dict, decrypted_dict)
 
@@ -927,5 +954,5 @@ if __name__ == "__main__":
     else:
         print("Usage: python secure_database_manager.py [generate_key|test|run_demo]")
         print(" - generate_key: Generate a new encryption key for your .env file")
-        print(" - test:           Run internal unit tests for encryption")
-        print(" - run_demo:       Run the full demo (requires ENCRYPTION_KEY to be set)")
+        print(" - test:          Run internal unit tests for encryption")
+        print(" - run_demo:      Run the full demo (requires ENCRYPTION_KEY to be set)")
