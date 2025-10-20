@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Enhanced Flask Application for Digital Twin System v3.0 (Production-Ready)
-Main web application with Redis caching, PostgreSQL, optimized SocketIO,
-and async task support.
+Enhanced Flask Application for Digital Twin System v3.2 (Production-Ready - Hardened)
+Main web application with Redis caching, PostgreSQL via SQLAlchemy ORM,
+optimized SocketIO, async task support, and refactored database operations.
 
-Major Enhancements:
-- Redis for distributed caching
-- PostgreSQL via SQLAlchemy
-- Optimized SocketIO with rooms and selective broadcasting
-- Async task support with Celery
-- Connection pooling and query optimization
-- Improved error handling and monitoring
+Major Enhancements in v3.2:
+- (Correction) Removed corrupted, duplicated code from end of file.
+- (Security) Implemented High-Priority Item #2:
+  - Removed all hardcoded secrets and connection strings.
+  - Application now requires environment variables for all secrets (e.g., SECRET_KEY, DATABASE_URL, REDIS_URL).
+  - Added get_required_env() helper to ensure app fails fast if secrets are missing.
 """
 
 import os
@@ -42,7 +41,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 import eventlet
 
 # Database imports
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, Index
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, Index, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
@@ -86,7 +85,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import custom modules
 try:
     from CONFIG.app_config import config
-    from AI_MODULES.secure_database_manager import SecureDatabaseManager
     from AI_MODULES.predictive_analytics_engine import PredictiveAnalyticsEngine
     from CONFIG.unified_data_generator import UnifiedDataGenerator
     from REPORTS.health_report_generator import HealthReportGenerator
@@ -101,10 +99,38 @@ except ImportError as e:
 # SQLAlchemy Base
 Base = declarative_base()
 
+# ==================== HELPER FUNCTIONS ====================
+
+def setup_logging():
+    """Setup comprehensive logging system"""
+    os.makedirs('LOGS', exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('LOGS/digital_twin_app.log'),
+            logging.StreamHandler()
+        ]
+    )
+    logging.info("Logging configured.")
+    return logging.getLogger('DigitalTwinApp')
+
+# Setup logging early so helper can use it
+logger = setup_logging()
+
+
+def get_required_env(var_name: str) -> str:
+    """Get a required environment variable or raise an error."""
+    value = os.environ.get(var_name)
+    if value is None:
+        logger.critical(f"CRITICAL: Environment variable '{var_name}' is not set.")
+        raise ValueError(f"Missing required environment variable: {var_name}")
+    return value
+
 # ==================== DATABASE MODELS ====================
 
 class DeviceData(Base):
-    """PostgreSQL model for device data"""
+    """SQLAlchemy model for device data"""
     __tablename__ = 'device_data'
     
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -118,15 +144,26 @@ class DeviceData(Base):
     efficiency_score = Column(Float)
     location = Column(String(200))
     unit = Column(String(50))
-    metadata = Column(Text)  # JSON string for additional data
+    metadata = Column(Text)  # Store additional JSON data as text
     
     __table_args__ = (
         Index('idx_device_timestamp', 'device_id', 'timestamp'),
         Index('idx_status_timestamp', 'status', 'timestamp'),
     )
+    
+    def to_dict(self):
+        """Helper method to convert model instance to dictionary"""
+        data = {c.name: getattr(self, c.name) for c in self.__table__.columns}
+        if data.get('metadata'):
+            try:
+                data['metadata'] = json.loads(data['metadata'])
+            except json.JSONDecodeError:
+                data['metadata'] = {}
+        return data
+
 
 class Alert(Base):
-    """PostgreSQL model for alerts"""
+    """SQLAlchemy model for alerts"""
     __tablename__ = 'alerts'
     
     id = Column(String(100), primary_key=True)
@@ -140,7 +177,82 @@ class Alert(Base):
     
     __table_args__ = (
         Index('idx_severity_timestamp', 'severity', 'timestamp'),
+        Index('idx_alert_device', 'device_id', 'timestamp'),
     )
+    
+    def to_dict(self):
+        """Helper method to convert model instance to dictionary"""
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class User(Base):
+    """SQLAlchemy model for users"""
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(100), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    email = Column(String(200), unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    def to_dict(self):
+        """Helper method to convert model instance to dictionary, excluding password"""
+        return {
+            'id': self.id,
+            'username': self.username,
+            'email': self.email,
+            'created_at': self.created_at
+        }
+
+
+# ==================== DATABASE SETUP ====================
+
+def create_database_engine(db_url: str = None):
+    """Create and configure database engine"""
+    # Use helper to get required env var. Remove hardcoded default.
+    db_url = db_url or get_required_env('DATABASE_URL')
+    
+    engine = create_engine(
+        db_url,
+        poolclass=QueuePool,
+        pool_size=20,
+        max_overflow=40,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        echo=False
+    )
+    
+    return engine
+
+
+def create_tables(engine):
+    """Creates all defined tables in the database if they don't exist"""
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database tables checked/created successfully.")
+    except Exception as e:
+        logger.critical(f"CRITICAL: Failed to create database tables: {e}")
+        raise
+
+
+# Session factory (will be initialized in app)
+SessionLocal = None
+
+
+@contextmanager
+def get_session():
+    """Provide a transactional scope around a series of operations."""
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except SQLAlchemyError as e:
+        session.rollback()
+        logger.error(f"Database session error: {e}", exc_info=True)
+        raise
+    finally:
+        SessionLocal.remove()
+
 
 # ==================== REDIS CACHE MANAGER ====================
 
@@ -148,28 +260,25 @@ class RedisCacheManager:
     """Manages Redis caching with connection pooling"""
     
     def __init__(self, redis_url: str = None, ttl: int = 300):
-        self.redis_url = redis_url or os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-        self.ttl = ttl  # Default TTL in seconds
+        # Use helper to get required env var. Remove hardcoded default.
+        self.redis_url = redis_url or get_required_env('REDIS_URL')
+        self.ttl = ttl
         self.logger = logging.getLogger('RedisCacheManager')
         
         try:
-            # Create connection pool
             self.pool = ConnectionPool.from_url(
                 self.redis_url,
                 max_connections=50,
-                decode_responses=False  # We'll handle encoding
+                decode_responses=False
             )
             self.client = redis.Redis(connection_pool=self.pool)
-            
-            # Test connection
             self.client.ping()
             self.logger.info(f"Redis connected successfully: {self.redis_url}")
             self.available = True
-            
         except Exception as e:
             self.logger.error(f"Redis connection failed: {e}. Falling back to in-memory cache.")
             self.available = False
-            self.memory_cache = {}  # Fallback
+            self.memory_cache = {}
     
     def get(self, key: str) -> Any:
         """Get value from cache"""
@@ -208,39 +317,6 @@ class RedisCacheManager:
             self.logger.error(f"Cache delete error for key {key}: {e}")
             return False
     
-    def get_many(self, keys: List[str]) -> Dict[str, Any]:
-        """Get multiple values"""
-        try:
-            if self.available:
-                values = self.client.mget(keys)
-                return {
-                    k: pickle.loads(v) if v else None 
-                    for k, v in zip(keys, values)
-                }
-            else:
-                return {k: self.memory_cache.get(k) for k in keys}
-        except Exception as e:
-            self.logger.error(f"Cache get_many error: {e}")
-            return {k: None for k in keys}
-    
-    def set_many(self, mapping: Dict[str, Any], ttl: int = None) -> bool:
-        """Set multiple key-value pairs"""
-        try:
-            ttl = ttl or self.ttl
-            if self.available:
-                pipeline = self.client.pipeline()
-                for key, value in mapping.items():
-                    serialized = pickle.dumps(value)
-                    pipeline.setex(key, ttl, serialized)
-                pipeline.execute()
-                return True
-            else:
-                self.memory_cache.update(mapping)
-                return True
-        except Exception as e:
-            self.logger.error(f"Cache set_many error: {e}")
-            return False
-    
     def clear_pattern(self, pattern: str) -> int:
         """Clear all keys matching pattern"""
         try:
@@ -257,183 +333,7 @@ class RedisCacheManager:
         except Exception as e:
             self.logger.error(f"Cache clear_pattern error: {e}")
             return 0
-    
-    def increment(self, key: str, amount: int = 1) -> int:
-        """Increment counter"""
-        try:
-            if self.available:
-                return self.client.incr(key, amount)
-            else:
-                self.memory_cache[key] = self.memory_cache.get(key, 0) + amount
-                return self.memory_cache[key]
-        except Exception as e:
-            self.logger.error(f"Cache increment error: {e}")
-            return 0
 
-# ==================== DATABASE MANAGER ====================
-
-class PostgreSQLManager:
-    """Manages PostgreSQL connections and operations"""
-    
-    def __init__(self, db_url: str = None):
-        self.db_url = db_url or os.environ.get(
-            'DATABASE_URL',
-            'postgresql://postgres:password@localhost:5432/digital_twin'
-        )
-        self.logger = logging.getLogger('PostgreSQLManager')
-        
-        try:
-            # Create engine with connection pooling
-            self.engine = create_engine(
-                self.db_url,
-                poolclass=QueuePool,
-                pool_size=20,
-                max_overflow=40,
-                pool_pre_ping=True,  # Verify connections before using
-                pool_recycle=3600,   # Recycle connections after 1 hour
-                echo=False
-            )
-            
-            # Create tables
-            Base.metadata.create_all(self.engine)
-            
-            # Session factory
-            self.SessionLocal = scoped_session(sessionmaker(
-                autocommit=False,
-                autoflush=False,
-                bind=self.engine
-            ))
-            
-            self.logger.info("PostgreSQL connected successfully")
-            self.available = True
-            
-        except Exception as e:
-            self.logger.error(f"PostgreSQL connection failed: {e}")
-            self.available = False
-    
-    @contextmanager
-    def get_session(self):
-        """Context manager for database sessions"""
-        session = self.SessionLocal()
-        try:
-            yield session
-            session.commit()
-        except Exception as e:
-            session.rollback()
-            self.logger.error(f"Session error: {e}")
-            raise
-        finally:
-            session.close()
-    
-    def bulk_insert_device_data(self, data_list: List[Dict]) -> bool:
-        """Bulk insert device data efficiently"""
-        try:
-            with self.get_session() as session:
-                objects = [
-                    DeviceData(
-                        device_id=d['device_id'],
-                        device_type=d.get('device_type'),
-                        device_name=d.get('device_name'),
-                        timestamp=d['timestamp'],
-                        value=d.get('value'),
-                        status=d.get('status'),
-                        health_score=d.get('health_score'),
-                        efficiency_score=d.get('efficiency_score'),
-                        location=d.get('location'),
-                        unit=d.get('unit'),
-                        metadata=json.dumps(d.get('metadata', {}))
-                    )
-                    for d in data_list
-                ]
-                session.bulk_save_objects(objects)
-            return True
-        except Exception as e:
-            self.logger.error(f"Bulk insert error: {e}")
-            return False
-    
-    def get_latest_device_data(self, limit: int = 100) -> pd.DataFrame:
-        """Get latest device data efficiently"""
-        try:
-            with self.get_session() as session:
-                # Subquery for latest timestamp per device
-                from sqlalchemy import func
-                subq = session.query(
-                    DeviceData.device_id,
-                    func.max(DeviceData.timestamp).label('max_ts')
-                ).group_by(DeviceData.device_id).subquery()
-                
-                # Join to get full records
-                query = session.query(DeviceData).join(
-                    subq,
-                    (DeviceData.device_id == subq.c.device_id) &
-                    (DeviceData.timestamp == subq.c.max_ts)
-                ).limit(limit)
-                
-                results = query.all()
-                
-                data = [{
-                    'device_id': r.device_id,
-                    'device_type': r.device_type,
-                    'device_name': r.device_name,
-                    'timestamp': r.timestamp,
-                    'value': r.value,
-                    'status': r.status,
-                    'health_score': r.health_score,
-                    'efficiency_score': r.efficiency_score,
-                    'location': r.location,
-                    'unit': r.unit
-                } for r in results]
-                
-                return pd.DataFrame(data)
-        except Exception as e:
-            self.logger.error(f"Query error: {e}")
-            return pd.DataFrame()
-    
-    def insert_alert(self, alert_data: Dict) -> bool:
-        """Insert single alert"""
-        try:
-            with self.get_session() as session:
-                alert = Alert(
-                    id=alert_data['id'],
-                    device_id=alert_data['device_id'],
-                    alert_type=alert_data.get('type'),
-                    severity=alert_data['severity'],
-                    description=alert_data['description'],
-                    timestamp=datetime.fromisoformat(alert_data['timestamp']),
-                    value=alert_data.get('value')
-                )
-                session.add(alert)
-            return True
-        except Exception as e:
-            self.logger.error(f"Alert insert error: {e}")
-            return False
-    
-    def get_recent_alerts(self, limit: int = 10, severity: str = None) -> List[Dict]:
-        """Get recent alerts"""
-        try:
-            with self.get_session() as session:
-                query = session.query(Alert).filter(
-                    Alert.acknowledged == False
-                )
-                
-                if severity:
-                    query = query.filter(Alert.severity == severity)
-                
-                query = query.order_by(Alert.timestamp.desc()).limit(limit)
-                results = query.all()
-                
-                return [{
-                    'id': r.id,
-                    'device_id': r.device_id,
-                    'type': r.alert_type,
-                    'severity': r.severity,
-                    'description': r.description,
-                    'timestamp': r.timestamp.isoformat(),
-                    'value': r.value
-                } for r in results]
-        except Exception as e:
-            self.logger.error(f"Get alerts error: {e}")
-            return []
 
 # ==================== CELERY CONFIGURATION ====================
 
@@ -444,8 +344,9 @@ def make_celery(app):
     
     celery = Celery(
         app.import_name,
-        backend=os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/1'),
-        broker=os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/1')
+        # Use helper to get required env vars. Remove hardcoded defaults.
+        backend=get_required_env('CELERY_RESULT_BACKEND'),
+        broker=get_required_env('CELERY_BROKER_URL')
     )
     celery.conf.update(app.config)
     
@@ -457,6 +358,7 @@ def make_celery(app):
     celery.Task = ContextTask
     return celery
 
+
 # ==================== MAIN APPLICATION CLASS ====================
 
 class DigitalTwinApp:
@@ -466,8 +368,7 @@ class DigitalTwinApp:
         self.app = None
         self.socketio = None
         self.cache = None
-        self.db_pg = None
-        self.db_manager = None
+        self.engine = None
         self.analytics_engine = None
         self.health_calculator = None
         self.alert_manager = None
@@ -490,8 +391,9 @@ class DigitalTwinApp:
             'system_metrics': set()
         }
         
-        # Initialize logging
-        self.setup_logging()
+        # Use the logger configured at the start
+        self.logger = logger
+        self.logger.info("Digital Twin Application v3.2 (Hardened) starting...")
         
         # Initialize Flask app
         self.create_app()
@@ -512,18 +414,8 @@ class DigitalTwinApp:
         self.start_background_tasks()
     
     def setup_logging(self):
-        """Setup comprehensive logging system"""
-        os.makedirs('LOGS', exist_ok=True)
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('LOGS/digital_twin_app.log'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger('DigitalTwinApp')
-        self.logger.info("Digital Twin Application v3.0 starting...")
+        """This function is now called at the module level before __init__."""
+        pass
     
     def create_app(self):
         """Create and configure Flask application"""
@@ -536,21 +428,23 @@ class DigitalTwinApp:
         )
         
         # Configuration
-        self.app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+        # Use helper to get required env vars. Remove hardcoded defaults.
+        self.app.config['SECRET_KEY'] = get_required_env('SECRET_KEY')
         self.app.config['DEBUG'] = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-        self.app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', secrets.token_hex(32))
+        self.app.config['JWT_SECRET_KEY'] = get_required_env('JWT_SECRET_KEY')
         self.app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
         
         # JWT
         self.jwt = JWTManager(self.app)
         
         # Rate Limiter with Redis
-        redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+        # Use helper to get required env var.
+        redis_url = get_required_env('REDIS_URL')
         self.limiter = Limiter(
             app=self.app,
             key_func=get_remote_address,
             default_limits=["1000 per hour", "100 per minute"],
-            storage_uri=redis_url  # Use Redis for distributed rate limiting
+            storage_uri=redis_url
         )
         self.logger.info("Flask-Limiter initialized with Redis.")
         
@@ -571,7 +465,7 @@ class DigitalTwinApp:
             engineio_logger=False,
             ping_timeout=60,
             ping_interval=25,
-            message_queue=redis_url,  # Redis for message queue (multi-worker support)
+            message_queue=redis_url, # Use the same redis_url
             channel='digital_twin'
         )
         
@@ -584,23 +478,34 @@ class DigitalTwinApp:
     
     def initialize_infrastructure(self):
         """Initialize Redis and PostgreSQL"""
+        global SessionLocal
+        
         # Redis Cache
         self.cache = RedisCacheManager(
-            redis_url=os.environ.get('REDIS_URL', 'redis://localhost:6379/0'),
-            ttl=300  # 5 minutes default TTL
+            redis_url=get_required_env('REDIS_URL'), # Pass required var
+            ttl=300
         )
         
-        # PostgreSQL
-        self.db_pg = PostgreSQLManager(
-            db_url=os.environ.get('DATABASE_URL')
-        )
+        # PostgreSQL with SQLAlchemy
+        try:
+            self.engine = create_database_engine() # Will use get_required_env
+            create_tables(self.engine)
+            
+            # Create scoped session factory
+            SessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+            SessionLocal = scoped_session(SessionFactory)
+            
+            self.logger.info("PostgreSQL initialized successfully via SQLAlchemy ORM")
+            self.db_available = True
+        except Exception as e:
+            self.logger.error(f"PostgreSQL initialization failed: {e}")
+            self.db_available = False
         
         self.logger.info("Infrastructure initialized (Redis & PostgreSQL)")
     
     def initialize_modules(self):
         """Initialize AI and analytics modules"""
         try:
-            self.db_manager = SecureDatabaseManager()
             self.analytics_engine = PredictiveAnalyticsEngine()
             self.health_calculator = HealthScoreCalculator()
             self.alert_manager = AlertManager()
@@ -612,6 +517,151 @@ class DigitalTwinApp:
             self.logger.info("Modules initialized successfully")
         except Exception as e:
             self.logger.error(f"Module initialization error: {e}", exc_info=True)
+    
+    # ==================== DATABASE OPERATIONS (REFACTORED) ====================
+    
+    def bulk_insert_device_data(self, data_list: List[Dict]) -> bool:
+        """Bulk insert device data efficiently using SQLAlchemy"""
+        try:
+            with get_session() as session:
+                objects = [
+                    DeviceData(
+                        device_id=d['device_id'],
+                        device_type=d.get('device_type'),
+                        device_name=d.get('device_name'),
+                        timestamp=d['timestamp'] if isinstance(d['timestamp'], datetime) else datetime.fromisoformat(str(d['timestamp'])),
+                        value=d.get('value'),
+                        status=d.get('status'),
+                        health_score=d.get('health_score'),
+                        efficiency_score=d.get('efficiency_score'),
+                        location=d.get('location'),
+                        unit=d.get('unit'),
+                        metadata=json.dumps(d.get('metadata', {})) if d.get('metadata') else None
+                    )
+                    for d in data_list
+                ]
+                session.bulk_save_objects(objects)
+            self.logger.info(f"Bulk inserted {len(objects)} device data records.")
+            return True
+        except Exception as e:
+            self.logger.error(f"Bulk insert error: {e}", exc_info=True)
+            return False
+    
+    def get_latest_device_data(self, limit: int = 100) -> pd.DataFrame:
+        """Get latest device data efficiently using SQLAlchemy"""
+        try:
+            with get_session() as session:
+                # Subquery to find the latest timestamp for each device_id
+                subq = session.query(
+                    DeviceData.device_id,
+                    func.max(DeviceData.timestamp).label('max_ts')
+                ).group_by(DeviceData.device_id).subquery()
+                
+                # Join DeviceData with the subquery
+                query = session.query(DeviceData).join(
+                    subq,
+                    (DeviceData.device_id == subq.c.device_id) &
+                    (DeviceData.timestamp == subq.c.max_ts)
+                ).order_by(DeviceData.timestamp.desc()).limit(limit)
+                
+                results = query.all()
+                data = [r.to_dict() for r in results]
+                
+                self.logger.info(f"Fetched latest data for {len(results)} devices.")
+                return pd.DataFrame(data)
+        except Exception as e:
+            self.logger.error(f"Get latest device data error: {e}", exc_info=True)
+            return pd.DataFrame()
+    
+    def insert_alert(self, alert_data: Dict) -> bool:
+        """Insert a single alert using SQLAlchemy"""
+        try:
+            with get_session() as session:
+                ts = alert_data.get('timestamp')
+                if isinstance(ts, str):
+                    timestamp = datetime.fromisoformat(ts)
+                elif isinstance(ts, datetime):
+                    timestamp = ts
+                else:
+                    timestamp = datetime.utcnow()
+                
+                alert = Alert(
+                    id=alert_data['id'],
+                    device_id=alert_data['device_id'],
+                    alert_type=alert_data.get('type') or alert_data.get('alert_type'),
+                    severity=alert_data['severity'],
+                    description=alert_data.get('description') or alert_data.get('message'),
+                    timestamp=timestamp,
+                    value=alert_data.get('value'),
+                    acknowledged=alert_data.get('acknowledged', False)
+                )
+                session.add(alert)
+            self.logger.info(f"Inserted alert: {alert_data['id']}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Alert insert error: {e}", exc_info=True)
+            return False
+    
+    def get_recent_alerts(self, limit: int = 10, severity: str = None, acknowledged: bool = False) -> List[Dict]:
+        """Get recent alerts using SQLAlchemy"""
+        try:
+            with get_session() as session:
+                query = session.query(Alert).filter(
+                    Alert.acknowledged == acknowledged
+                )
+                
+                if severity:
+                    query = query.filter(Alert.severity == severity)
+                
+                query = query.order_by(Alert.timestamp.desc()).limit(limit)
+                results = query.all()
+                
+                self.logger.info(f"Fetched {len(results)} recent alerts.")
+                return [r.to_dict() for r in results]
+        except Exception as e:
+            self.logger.error(f"Get alerts error: {e}", exc_info=True)
+            return []
+    
+    def create_user_sqlalchemy(self, username: str, password: str, email: str = None) -> bool:
+        """Creates a new user with SQLAlchemy"""
+        password_hash = generate_password_hash(password)
+        try:
+            with get_session() as session:
+                # Check if user already exists
+                existing_user = session.query(User).filter(
+                    (User.username == username) | (User.email == email if email else False)
+                ).first()
+                
+                if existing_user:
+                    self.logger.warning(f"User creation failed: Username '{username}' or email '{email}' already exists.")
+                    return False
+                
+                new_user = User(username=username, password_hash=password_hash, email=email)
+                session.add(new_user)
+            
+            self.logger.info(f"User '{username}' created successfully via SQLAlchemy.")
+            return True
+        except SQLAlchemyError as e:
+            self.logger.error(f"Error creating user '{username}' via SQLAlchemy: {e}", exc_info=True)
+            return False
+    
+    def authenticate_user_sqlalchemy(self, username: str, password: str) -> bool:
+        """Authenticates a user using SQLAlchemy"""
+        try:
+            with get_session() as session:
+                user = session.query(User).filter(User.username == username).first()
+            
+            if user and check_password_hash(user.password_hash, password):
+                self.logger.info(f"User '{username}' authenticated successfully via SQLAlchemy.")
+                return True
+            
+            self.logger.warning(f"Authentication failed for user '{username}' via SQLAlchemy.")
+            return False
+        except SQLAlchemyError as e:
+            self.logger.error(f"Error authenticating user '{username}' via SQLAlchemy: {e}", exc_info=True)
+            return False
+    
+    # ==================== ROUTES ====================
     
     def setup_routes(self):
         """Setup all Flask routes"""
@@ -641,7 +691,7 @@ class DigitalTwinApp:
                 return jsonify({"error": "Validation failed", "details": errors}), 400
             
             try:
-                if self.db_manager.create_user(username, password, email):
+                if self.create_user_sqlalchemy(username, password, email):
                     return jsonify({"message": "User created successfully"}), 201
                 return jsonify({"error": "Username or email exists"}), 409
             except Exception as e:
@@ -662,7 +712,7 @@ class DigitalTwinApp:
                 return jsonify({"error": "Username and password required"}), 400
             
             try:
-                if not self.db_manager.authenticate_user(username, password):
+                if not self.authenticate_user_sqlalchemy(username, password):
                     return jsonify({"error": "Invalid credentials"}), 401
                 
                 access_token = create_access_token(identity=username)
@@ -690,7 +740,7 @@ class DigitalTwinApp:
             try:
                 return render_template('index.html')
             except:
-                return "Digital Twin API v3.0 is running"
+                return "Digital Twin API v3.2 is running"
         
         @self.app.route('/dashboard')
         def dashboard():
@@ -723,9 +773,9 @@ class DigitalTwinApp:
                 status = {
                     'status': 'healthy',
                     'timestamp': datetime.now().isoformat(),
-                    'version': '3.0.0',
+                    'version': '3.2.0',
                     'redis': self.cache.available,
-                    'postgresql': self.db_pg.available,
+                    'postgresql': self.db_available,
                     'connected_clients': len(self.connected_clients),
                     'uptime': str(datetime.now() - self.start_time).split('.')[0]
                 }
@@ -739,17 +789,12 @@ class DigitalTwinApp:
         def get_dashboard_data():
             """Get dashboard data with caching"""
             try:
-                # Try cache first
                 cached = self.cache.get('dashboard_data')
                 if cached:
                     return jsonify(cached)
                 
-                # Fetch from database
                 data = self._fetch_dashboard_data()
-                
-                # Cache for 30 seconds
                 self.cache.set('dashboard_data', data, ttl=30)
-                
                 return jsonify(data)
             except Exception as e:
                 self.logger.error(f"Error getting dashboard data: {e}")
@@ -765,11 +810,8 @@ class DigitalTwinApp:
                 if cached:
                     return jsonify(cached)
                 
-                if self.db_pg.available:
-                    df = self.db_pg.get_latest_device_data(limit=1000)
-                    devices = df.to_dict('records')
-                else:
-                    devices = []
+                df = self.get_latest_device_data(limit=1000)
+                devices = df.to_dict('records')
                 
                 self.cache.set('devices_list', devices, ttl=30)
                 return jsonify(devices)
@@ -788,7 +830,6 @@ class DigitalTwinApp:
                 if cached:
                     return jsonify(cached)
                 
-                # Fetch from database
                 devices = self.cache.get('devices_list') or []
                 device = next((d for d in devices if d.get('device_id') == device_id), None)
                 
@@ -808,16 +849,20 @@ class DigitalTwinApp:
             try:
                 limit = request.args.get('limit', 10, type=int)
                 severity = request.args.get('severity', None)
+                acknowledged_param = request.args.get('acknowledged', 'false').lower()
+                acknowledged_filter = acknowledged_param == 'true'
                 
-                cache_key = f'alerts:{severity}:{limit}'
+                cache_key = f'alerts:{severity}:{limit}:{acknowledged_filter}'
                 cached = self.cache.get(cache_key)
                 if cached:
                     return jsonify(cached)
                 
-                if self.db_pg.available:
-                    alerts = self.db_pg.get_recent_alerts(limit=limit, severity=severity)
-                else:
-                    alerts = []
+                alerts = self.get_recent_alerts(limit=limit, severity=severity, acknowledged=acknowledged_filter)
+                
+                # Convert datetime objects for JSON serialization
+                for alert in alerts:
+                    if isinstance(alert.get('timestamp'), datetime):
+                        alert['timestamp'] = alert['timestamp'].isoformat()
                 
                 self.cache.set(cache_key, alerts, ttl=10)
                 return jsonify(alerts)
@@ -837,7 +882,6 @@ class DigitalTwinApp:
                 if cached:
                     return jsonify(cached)
                 
-                # Get device data
                 devices = self.cache.get('devices_list') or []
                 device_data = next((d for d in devices if d.get('device_id') == device_id), None)
                 
@@ -846,7 +890,6 @@ class DigitalTwinApp:
                 
                 device_df = pd.DataFrame([device_data])
                 
-                # Run predictions
                 anomalies = self.analytics_engine.detect_anomalies(device_df)
                 try:
                     failure_pred = self.analytics_engine.predict_failure(device_df)
@@ -912,7 +955,6 @@ class DigitalTwinApp:
                 if devices_df.empty:
                     return jsonify([]), 200
                 
-                # Prepare data
                 health_data = {}
                 if self.health_calculator:
                     health_scores = self.health_calculator.calculate_device_health_scores(devices_df)
@@ -968,7 +1010,6 @@ class DigitalTwinApp:
                         'message': 'Report generation started'
                     })
                 else:
-                    # Synchronous fallback
                     report_path = self._generate_report_sync()
                     filename = os.path.basename(report_path)
                     return jsonify({
@@ -1028,6 +1069,8 @@ class DigitalTwinApp:
         
         self.logger.info("Routes setup completed")
     
+    # ==================== WEBSOCKET EVENTS ====================
+    
     def setup_websocket_events(self):
         """Setup optimized WebSocket events"""
         
@@ -1059,7 +1102,6 @@ class DigitalTwinApp:
             
             self.logger.info(f"Client {client_id} (User: {identity}) connected. Total: {len(self.connected_clients)}")
             
-            # Send initial data
             cached_data = self.cache.get('dashboard_data')
             if cached_data:
                 emit('initial_data', cached_data)
@@ -1071,7 +1113,6 @@ class DigitalTwinApp:
             user_identity = session.get('identity', 'Unknown')
             
             if client_id in self.connected_clients:
-                # Remove from all rooms
                 subs = self.connected_clients[client_id].get('subscriptions', set())
                 for sub in subs:
                     if sub in self.rooms:
@@ -1096,12 +1137,10 @@ class DigitalTwinApp:
                 sub_type = data.get('type')
                 
                 if sub_type in self.rooms:
-                    # Add to room tracking
                     self.rooms[sub_type].add(client_id)
                     if client_id in self.connected_clients:
                         self.connected_clients[client_id]['subscriptions'].add(sub_type)
                     
-                    # Join SocketIO room
                     join_room(sub_type)
                     emit('subscription_confirmed', {'type': sub_type})
                     self.logger.info(f"Client {client_id} subscribed to {sub_type}")
@@ -1131,6 +1170,8 @@ class DigitalTwinApp:
         
         self.logger.info("WebSocket events setup completed")
     
+    # ==================== BACKGROUND TASKS ====================
+    
     def start_background_tasks(self):
         """Start optimized background tasks"""
         
@@ -1141,7 +1182,6 @@ class DigitalTwinApp:
             
             while True:
                 try:
-                    # Generate new data
                     new_devices_df = self.data_generator.generate_device_data(
                         device_count=25,
                         days_of_data=0.003,
@@ -1152,17 +1192,21 @@ class DigitalTwinApp:
                         new_devices_df.groupby('device_id')['timestamp'].idxmax()
                     ]
                     
-                    # Store in PostgreSQL (bulk insert)
-                    if self.db_pg.available:
-                        devices_list = latest_devices_df.to_dict('records')
-                        self.db_pg.bulk_insert_device_data(devices_list)
+                    # Store in PostgreSQL using refactored method
+                    devices_list = latest_devices_df.to_dict('records')
+                    # Convert pandas Timestamps to datetime objects
+                    for d in devices_list:
+                        if 'timestamp' in d and isinstance(d['timestamp'], pd.Timestamp):
+                            d['timestamp'] = d['timestamp'].to_pydatetime()
+                    
+                    self.bulk_insert_device_data(devices_list)
                     
                     # Update cache
                     dashboard_data = self._fetch_dashboard_data_from_df(latest_devices_df)
                     self.cache.set('dashboard_data', dashboard_data, ttl=30)
                     self.cache.set('devices_list', latest_devices_df.to_dict('records'), ttl=30)
                     
-                    # Broadcast only to subscribed clients (optimized)
+                    # Broadcast only to subscribed clients
                     if self.rooms['device_updates']:
                         self.socketio.emit(
                             'data_update',
@@ -1174,7 +1218,7 @@ class DigitalTwinApp:
                     self._check_and_send_alerts(latest_devices_df)
                     
                     update_count += 1
-                    if update_count % 12 == 0:  # Log every minute
+                    if update_count % 12 == 0:
                         self.logger.info(f"Data update cycle {update_count} completed")
                     
                     eventlet.sleep(5)
@@ -1198,7 +1242,6 @@ class DigitalTwinApp:
                     ]
                     
                     for client_id in disconnected:
-                        # Remove from rooms
                         subs = self.connected_clients[client_id].get('subscriptions', set())
                         for sub in subs:
                             if sub in self.rooms:
@@ -1219,15 +1262,14 @@ class DigitalTwinApp:
             
             while True:
                 try:
-                    # Warm up dashboard data
-                    if self.db_pg.available:
-                        df = self.db_pg.get_latest_device_data(limit=100)
+                    if self.db_available:
+                        df = self.get_latest_device_data(limit=100)
                         if not df.empty:
                             data = self._fetch_dashboard_data_from_df(df)
                             self.cache.set('dashboard_data', data, ttl=300)
                             self.cache.set('devices_list', df.to_dict('records'), ttl=300)
                     
-                    eventlet.sleep(60)  # Every minute
+                    eventlet.sleep(60)
                     
                 except Exception as e:
                     self.logger.error(f"Cache warmup error: {e}")
@@ -1255,12 +1297,10 @@ class DigitalTwinApp:
     # ==================== HELPER METHODS ====================
     
     def _fetch_dashboard_data(self):
-        """Fetch dashboard data from database"""
+        """Fetch dashboard data from database using refactored method"""
         try:
-            if self.db_pg.available:
-                df = self.db_pg.get_latest_device_data(limit=100)
-                return self._fetch_dashboard_data_from_df(df)
-            return {}
+            df = self.get_latest_device_data(limit=100)
+            return self._fetch_dashboard_data_from_df(df)
         except Exception as e:
             self.logger.error(f"Fetch dashboard data error: {e}")
             return {}
@@ -1311,10 +1351,10 @@ class DigitalTwinApp:
                 except Exception as e:
                     self.logger.error(f"Alert evaluation error: {e}")
             
-            # Store in database
-            if self.db_pg.available and all_alerts:
+            # Store in database using refactored method
+            if self.db_available and all_alerts:
                 for alert in all_alerts:
-                    self.db_pg.insert_alert(alert)
+                    self.insert_alert(alert)
             
             # Broadcast only to subscribed clients
             if self.rooms['alerts'] and all_alerts:
@@ -1335,7 +1375,7 @@ class DigitalTwinApp:
                 'disk_percent': psutil.disk_usage('/').percent,
                 'active_connections': len(self.connected_clients),
                 'cache_available': self.cache.available,
-                'database_available': self.db_pg.available
+                'database_available': self.db_available
             }
         except ImportError:
             return {
@@ -1345,7 +1385,7 @@ class DigitalTwinApp:
                 'disk_percent': random.uniform(40, 80),
                 'active_connections': len(self.connected_clients),
                 'cache_available': self.cache.available,
-                'database_available': self.db_pg.available
+                'database_available': self.db_available
             }
     
     def _generate_report_sync(self):
@@ -1353,7 +1393,7 @@ class DigitalTwinApp:
         try:
             if HealthReportGenerator:
                 report_gen = HealthReportGenerator()
-                recent_data_df = self.db_pg.get_latest_device_data(limit=5000) if self.db_pg.available else pd.DataFrame()
+                recent_data_df = self.get_latest_device_data(limit=5000) if self.db_available else pd.DataFrame()
                 html_path = report_gen.generate_comprehensive_report(data_df=recent_data_df, date_range_days=7)
                 return html_path
             return ""
@@ -1368,7 +1408,6 @@ class DigitalTwinApp:
             os.makedirs(exports_dir, exist_ok=True)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
-            # Get data from cache or database
             devices = self.cache.get('devices_list') or []
             
             if format_type.lower() == 'csv':
@@ -1389,8 +1428,8 @@ class DigitalTwinApp:
     def run(self, host='0.0.0.0', port=5000, debug=False):
         """Run the application"""
         self.start_time = datetime.now()
-        self.logger.info(f"Starting Digital Twin Application v3.0 on {host}:{port}")
-        self.logger.info(f"Redis: {self.cache.available}, PostgreSQL: {self.db_pg.available}")
+        self.logger.info(f"Starting Digital Twin Application v3.2 on {host}:{port}")
+        self.logger.info(f"Redis: {self.cache.available}, PostgreSQL: {self.db_available}")
         
         try:
             self.socketio.run(
@@ -1411,28 +1450,44 @@ class DigitalTwinApp:
                 self.scheduler.shutdown()
             raise
 
+
 # ==================== CELERY TASKS ====================
 
 if CELERY_AVAILABLE:
-    @celery.task(bind=True)
+    # Need to get a celery instance. This is tricky without the app.
+    # We will define them here, but they rely on the app context.
+    # This assumes `celery = make_celery(create_app().app)` is called by the celery worker.
+    # For now, let's create a placeholder celery app for defining tasks.
+    _celery_app = Celery(
+        'digital_twin_tasks',
+        backend=os.environ.get('CELERY_RESULT_BACKEND'),
+        broker=os.environ.get('CELERY_BROKER_URL')
+    )
+
+    @_celery_app.task(bind=True)
     def generate_report_task(self):
         """Async report generation task"""
         try:
+            # Re-create app instance for task context
             app_instance = create_app()
-            report_path = app_instance._generate_report_sync()
-            return {'success': True, 'path': report_path}
+            with app_instance.app.app_context():
+                report_path = app_instance._generate_report_sync()
+                return {'success': True, 'path': report_path}
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
-    @celery.task(bind=True)
+    @_celery_app.task(bind=True)
     def export_data_task(self, format_type, date_range):
         """Async export task"""
         try:
+            # Re-create app instance for task context
             app_instance = create_app()
-            filepath = app_instance._export_data_sync(format_type, date_range)
-            return {'success': True, 'path': filepath}
+            with app_instance.app.app_context():
+                filepath = app_instance._export_data_sync(format_type, date_range)
+                return {'success': True, 'path': filepath}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
 
 # ==================== ERROR HANDLERS ====================
 
@@ -1454,6 +1509,7 @@ def setup_error_handlers(app, limiter):
         app.logger.error(f"Unhandled exception: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected error occurred'}), 500
 
+
 # ==================== APPLICATION FACTORY ====================
 
 def create_app():
@@ -1461,10 +1517,20 @@ def create_app():
     try:
         app_instance = DigitalTwinApp()
         setup_error_handlers(app_instance.app, app_instance.limiter)
+        
+        # This is where Celery gets its app context
+        if app_instance.celery:
+            global generate_report_task, export_data_task
+            
+            # Re-bind tasks to the app's celery instance
+            generate_report_task = app_instance.celery.task(bind=True)(generate_report_task.run)
+            export_data_task = app_instance.celery.task(bind=True)(export_data_task.run)
+
         return app_instance
     except Exception as e:
-        logging.critical(f"Failed to create application: {e}", exc_info=True)
+        logger.critical(f"Failed to create application: {e}", exc_info=True)
         sys.exit(1)
+
 
 # ==================== MAIN ====================
 
@@ -1478,5 +1544,7 @@ if __name__ == '__main__':
         digital_twin_app.run(host=host, port=port, debug=debug)
     except Exception as e:
         print(f"CRITICAL: Failed to start application: {e}")
-        logging.critical(f"Failed to start application: {e}", exc_info=True)
+        logger.critical(f"Failed to start application: {e}", exc_info=True)
         sys.exit(1)
+
+# --- End of corrected file ---
