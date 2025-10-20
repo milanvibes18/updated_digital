@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-Enhanced Flask Application for Digital Twin System v3.3 (Production-Ready - Hardened)
+Enhanced Flask Application for Digital Twin System v3.4 (Production-Ready - Hardened)
 Main web application with Redis caching, PostgreSQL via SQLAlchemy ORM,
 optimized SocketIO, async task support via Celery, structured logging,
 input validation, Prometheus metrics, and enhanced security.
 
-Major Enhancements from v3.2:
-- Added Prometheus metrics via prometheus-flask-exporter (Item 1)
-- Integrated structured logging via structlog (Item 2)
-- Implemented input validation for auth routes via Marshmallow (Item 3)
-- JWT verification middleware was already present (Item 4)
-- Replaced APScheduler with Celery Beat for scheduled tasks (Item 5)
-- Added Flask-WTF for CSRF protection beyond JWT cookies (Part of Item 6)
-- CORS and Rate Limiting were already present (Part of Item 6)
-- SQLAlchemy connections were already consistent (Item 7)
+Major Enhancements from v3.3:
+- Added Role-Based Access Control (RBAC) mechanisms (Item 4)
+  - User model now has a 'role'
+  - JWTs now contain a 'role' claim
+  - Added @role_required decorator
 """
 
 import os
@@ -60,7 +56,7 @@ from redis.connection import ConnectionPool
 from flask_jwt_extended import (
     JWTManager, jwt_required, create_access_token,
     get_jwt_identity, unset_jwt_cookies, decode_token,
-    set_access_cookies, verify_jwt_in_request # Added verify_jwt_in_request
+    set_access_cookies, verify_jwt_in_request, get_jwt # Added verify_jwt_in_request, get_jwt
 )
 from jwt.exceptions import ExpiredSignatureError, DecodeError, InvalidTokenError
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -266,11 +262,50 @@ def validate_json(schema: Schema):
         return wrapper
     return decorator
 
+# --- NEW: Decorator for Role-Based Access Control ---
+def role_required(required_role: str):
+    """Decorator to require a specific role from the JWT."""
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                # First, verify JWT is present and valid
+                verify_jwt_in_request()
+                # Get the full token claims
+                claims = get_jwt()
+                # Get role, default to 'user' if claim is somehow missing
+                user_role = claims.get("role", "user")
+
+                # Check for 'admin' role, or if a specific role matches
+                # This logic grants 'admin' access to everything
+                if user_role == 'admin':
+                    return fn(*args, **kwargs)
+
+                if user_role != required_role:
+                    logger.warning(
+                        "Role access denied",
+                        required_role=required_role,
+                        user_role=user_role,
+                        identity=claims.get('sub')
+                    )
+                    return jsonify({"error": "Access forbidden: Insufficient permissions"}), 403
+
+                return fn(*args, **kwargs)
+            except (ExpiredSignatureError, DecodeError, InvalidTokenError) as e:
+                 logger.warning("Role verification failed: Invalid JWT", error=str(e))
+                 return jsonify({"error": f"Token is invalid: {str(e)}"}), 401
+            except Exception as e:
+                logger.error("Error during role verification", error=str(e), exc_info=True)
+                # This could be triggered if verify_jwt_in_request() fails (e.g., no token)
+                return jsonify({"error": "Authentication required"}), 401
+        return wrapper
+    return decorator
+
 
 # ==================== DATABASE MODELS (SQLAlchemy) ====================
 # (No changes needed for models)
 Base = declarative_base()
-# ... (DeviceData, Alert, User models remain the same) ...
+# ... (DeviceData, Alert models remain the same) ...
 class DeviceData(Base):
     """SQLAlchemy model for device data"""
     __tablename__ = 'device_data'
@@ -348,7 +383,8 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     email = Column(String(200), unique=True, index=True) # Added index
     created_at = Column(DateTime, default=datetime.utcnow)
-    # Add roles, permissions etc. later if needed
+    # --- NEW: Add role field ---
+    role = Column(String(50), nullable=False, default='user', index=True) # e.g., 'user', 'admin'
 
     def to_dict(self):
         """Helper method to convert model instance to dictionary, excluding password"""
@@ -356,7 +392,8 @@ class User(Base):
             'id': self.id,
             'username': self.username,
             'email': self.email,
-            'created_at': self.created_at.isoformat() if self.created_at else None
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'role': self.role, # --- NEW: Include role ---
         }
 
 # ==================== DATABASE SETUP (SQLAlchemy) ====================
@@ -491,7 +528,7 @@ class RedisCacheManager:
                 self.memory_cache[key] = value # Store original value in memory cache
                 # Simulate TTL for memory cache (basic cleanup, not perfect)
                 if effective_ttl > 0:
-                     threading.Timer(effective_ttl, self.memory_cache.pop, args=[key, None]).start()
+                        threading.Timer(effective_ttl, self.memory_cache.pop, args=[key, None]).start()
                 return True
         except Exception as e:
             self.logger.error(f"Cache SET error", cache_key=key, error=str(e))
@@ -597,8 +634,8 @@ def init_celery(app: Flask, celery: Optional[Celery]):
                         logger.info("Celery task completed successfully.")
                         return result
                     except Exception as e:
-                         logger.error("Celery task failed", error=str(e), exc_info=True)
-                         raise # Re-raise for Celery error handling
+                            logger.error("Celery task failed", error=str(e), exc_info=True)
+                            raise # Re-raise for Celery error handling
     celery.Task = ContextTask
     app.extensions["celery"] = celery
     logger.info("Celery initialized and linked with Flask app context.", beat_schedule_keys=list(celery.conf.beat_schedule.keys()))
@@ -632,7 +669,7 @@ class DigitalTwinApp:
         self.rooms: Dict[str, Set[str]] = defaultdict(set)
 
         self.logger = logger # Use structlog logger
-        self.logger.info("Digital Twin Application v3.3 starting...")
+        self.logger.info("Digital Twin Application v3.4 starting...")
 
         self._create_app()
         if not self.app:
@@ -823,8 +860,8 @@ class DigitalTwinApp:
                     elif isinstance(ts, (int, float)):
                         timestamp = datetime.fromtimestamp(ts)
                     elif not isinstance(ts, datetime):
-                         self.logger.warning(f"Skipping record with invalid timestamp type", type=str(type(ts)))
-                         continue
+                            self.logger.warning(f"Skipping record with invalid timestamp type", type=str(type(ts)))
+                            continue
                     else:
                         timestamp = ts # Already datetime
 
@@ -1004,7 +1041,8 @@ class DigitalTwinApp:
                 if existing_user:
                     self.logger.warning(f"User creation failed: Username or email already exists.", username=username, email=email)
                     return False
-
+                
+                # Role will be set to 'user' by default from the model
                 new_user = User(username=username, password_hash=password_hash, email=email)
                 session.add(new_user)
 
@@ -1089,13 +1127,16 @@ class DigitalTwinApp:
                 # Apply counter manually for failure
                 if PROMETHEUS_AVAILABLE: login_counter(lambda: Response(status=401)) # Dummy response for label
                 return jsonify({"error": "Invalid credentials"}), 401
+            
+            # --- NEW: Add role to JWT claims ---
+            additional_claims = {"role": user.role}
+            access_token = create_access_token(identity=user.username, additional_claims=additional_claims)
 
-            access_token = create_access_token(identity=user.username)
             response = jsonify(access_token=access_token, user=user.to_dict())
 
             # Set HttpOnly cookie
             set_access_cookies(response, access_token)
-            logger.info("Login successful, JWT cookie set", username=username)
+            logger.info("Login successful, JWT cookie set", username=username, role=user.role)
 
             # Apply counter manually for success
             if PROMETHEUS_AVAILABLE: login_counter(lambda: Response(status=200)) # Dummy response for label
@@ -1116,38 +1157,42 @@ class DigitalTwinApp:
         @limiter.limit("120 per minute")
         def protected():
             current_user_identity = get_jwt_identity()
+            # --- NEW: Get role from claims ---
+            claims = get_jwt()
+            user_role = claims.get('role', 'user')
+
+            logger.debug("Accessed protected /me endpoint", username=current_user_identity, role=user_role)
             # Optionally fetch full user from DB if needed
-            # For now, just return identity
-            logger.debug("Accessed protected /me endpoint", username=current_user_identity)
-            return jsonify(logged_in_as=current_user_identity)
+            # For now, just return identity and role
+            return jsonify(logged_in_as=current_user_identity, role=user_role)
 
         # ==================== PAGE ROUTES ====================
         # (Serve React App - No changes)
         @self.app.route('/', defaults={'path': ''})
         @self.app.route('/<path:path>')
         def serve_react_app(path):
-             static_folder = self.app.static_folder
-             if static_folder is None:
-                  logger.error("Static folder not configured.")
-                  return "Static folder not found", 404
+            static_folder = self.app.static_folder
+            if static_folder is None:
+                logger.error("Static folder not configured.")
+                return "Static folder not found", 404
 
-             # Security: Basic path validation to prevent directory traversal
-             safe_path = os.path.normpath(os.path.join(static_folder, path)).lstrip(os.path.sep)
-             full_path = os.path.join(static_folder, safe_path)
+            # Security: Basic path validation to prevent directory traversal
+            safe_path = os.path.normpath(os.path.join(static_folder, path)).lstrip(os.path.sep)
+            full_path = os.path.join(static_folder, safe_path)
 
-             if path != "" and os.path.exists(full_path) and os.path.isfile(full_path):
-                  # Ensure the resolved path is still within the static folder
-                  if os.path.commonprefix((os.path.realpath(full_path), os.path.realpath(static_folder))) == os.path.realpath(static_folder):
-                       return send_from_directory(static_folder, safe_path)
-                  else:
-                       logger.warning("Attempted directory traversal", requested_path=path)
-                       return "Not Found", 404
-             else:
-                  index_path = os.path.join(static_folder, 'index.html')
-                  if not os.path.exists(index_path):
-                       logger.error("index.html not found in static folder.", path=index_path)
-                       return "Frontend entry point not found", 404
-                  return send_from_directory(static_folder, 'index.html')
+            if path != "" and os.path.exists(full_path) and os.path.isfile(full_path):
+                # Ensure the resolved path is still within the static folder
+                if os.path.commonprefix((os.path.realpath(full_path), os.path.realpath(static_folder))) == os.path.realpath(static_folder):
+                    return send_from_directory(static_folder, safe_path)
+                else:
+                    logger.warning("Attempted directory traversal", requested_path=path)
+                    return "Not Found", 404
+            else:
+                index_path = os.path.join(static_folder, 'index.html')
+                if not os.path.exists(index_path):
+                    logger.error("index.html not found in static folder.", path=index_path)
+                    return "Frontend entry point not found", 404
+                return send_from_directory(static_folder, 'index.html')
 
 
         # ==================== API ENDPOINTS ====================
@@ -1156,34 +1201,34 @@ class DigitalTwinApp:
         @limiter.exempt
         def health_check():
             # (Remains the same)
-             db_ok = False
-             redis_ok = self.cache.available if self.cache else False
-             celery_ok = False
-             try:
-                 with engine.connect() as connection: db_ok = True
-             except Exception as e: logger.error(f"Health check DB failed", error=str(e))
-             if self.celery:
-                 try:
-                     # Basic check: ping a worker (might be slow/unreliable)
-                     # Or check connection to broker/backend
-                     self.celery.broker_connection().ensure_connection(max_retries=1)
-                     celery_ok = True
-                 except Exception as e:
-                     logger.warning("Health check Celery failed", error=str(e))
+            db_ok = False
+            redis_ok = self.cache.available if self.cache else False
+            celery_ok = False
+            try:
+                with engine.connect() as connection: db_ok = True
+            except Exception as e: logger.error(f"Health check DB failed", error=str(e))
+            if self.celery:
+                try:
+                    # Basic check: ping a worker (might be slow/unreliable)
+                    # Or check connection to broker/backend
+                    self.celery.broker_connection().ensure_connection(max_retries=1)
+                    celery_ok = True
+                except Exception as e:
+                    logger.warning("Health check Celery failed", error=str(e))
 
-             status = {
-                 'status': 'healthy' if db_ok and redis_ok and celery_ok else 'partial',
-                 'timestamp': datetime.now().isoformat(),
-                 'version': '3.3.0',
-                 'checks': {
-                     'redis': 'ok' if redis_ok else 'unavailable',
-                     'postgresql': 'ok' if db_ok else 'unavailable',
-                     'celery': 'ok' if celery_ok else 'unavailable',
-                 },
-                 'uptime': str(datetime.now() - self.start_time).split('.')[0]
-             }
-             status_code = 200 if status['status'] == 'healthy' else 503
-             return jsonify(status), status_code
+            status = {
+                'status': 'healthy' if db_ok and redis_ok and celery_ok else 'partial',
+                'timestamp': datetime.now().isoformat(),
+                'version': '3.4.0', # Updated version
+                'checks': {
+                    'redis': 'ok' if redis_ok else 'unavailable',
+                    'postgresql': 'ok' if db_ok else 'unavailable',
+                    'celery': 'ok' if celery_ok else 'unavailable',
+                },
+                'uptime': str(datetime.now() - self.start_time).split('.')[0]
+            }
+            status_code = 200 if status['status'] == 'healthy' else 503
+            return jsonify(status), status_code
 
         # --- UPDATED: /metrics endpoint for Prometheus ---
         @self.app.route('/metrics')
@@ -1219,24 +1264,24 @@ class DigitalTwinApp:
                 recent_alerts = self.get_recent_alerts(limit=20, acknowledged=False)
                 overview_data = {}
                 if not latest_devices_df.empty:
-                     total_devices = latest_devices_df['device_id'].nunique()
-                     active_devices = latest_devices_df[latest_devices_df['status'] != 'offline'].shape[0]
-                     avg_health = latest_devices_df['health_score'].dropna().mean() * 100 if not latest_devices_df['health_score'].dropna().empty else 0
-                     avg_efficiency = latest_devices_df['efficiency_score'].dropna().mean() * 100 if not latest_devices_df['efficiency_score'].dropna().empty else 0
-                     status_counts = latest_devices_df['status'].value_counts().to_dict()
-                     status_distribution = { 'normal': status_counts.get('normal', 0), 'warning': status_counts.get('warning', 0), 'critical': status_counts.get('critical', 0), 'offline': status_counts.get('offline', 0) }
-                     energy_usage = latest_devices_df[latest_devices_df['device_type']=='power_meter']['value'].sum() / 1000
+                    total_devices = latest_devices_df['device_id'].nunique()
+                    active_devices = latest_devices_df[latest_devices_df['status'] != 'offline'].shape[0]
+                    avg_health = latest_devices_df['health_score'].dropna().mean() * 100 if not latest_devices_df['health_score'].dropna().empty else 0
+                    avg_efficiency = latest_devices_df['efficiency_score'].dropna().mean() * 100 if not latest_devices_df['efficiency_score'].dropna().empty else 0
+                    status_counts = latest_devices_df['status'].value_counts().to_dict()
+                    status_distribution = { 'normal': status_counts.get('normal', 0), 'warning': status_counts.get('warning', 0), 'critical': status_counts.get('critical', 0), 'offline': status_counts.get('offline', 0) }
+                    energy_usage = latest_devices_df[latest_devices_df['device_type']=='power_meter']['value'].sum() / 1000
 
-                     overview_data = {
-                         'systemHealth': round(avg_health),
-                         'activeDevices': active_devices,
-                         'totalDevices': total_devices,
-                         'efficiency': round(avg_efficiency),
-                         'energyUsage': round(energy_usage, 1),
-                         'energyCost': round(energy_usage * 24 * 0.12),
-                         'statusDistribution': status_distribution,
-                         'timestamp': datetime.utcnow().isoformat()
-                     }
+                    overview_data = {
+                        'systemHealth': round(avg_health),
+                        'activeDevices': active_devices,
+                        'totalDevices': total_devices,
+                        'efficiency': round(avg_efficiency),
+                        'energyUsage': round(energy_usage, 1),
+                        'energyCost': round(energy_usage * 24 * 0.12),
+                        'statusDistribution': status_distribution,
+                        'timestamp': datetime.utcnow().isoformat()
+                    }
 
                 dashboard_payload = {
                     **overview_data,
@@ -1254,13 +1299,13 @@ class DigitalTwinApp:
         @jwt_required()
         @limiter.limit("120 per minute")
         def get_devices():
-             try:
-                 limit = request.args.get('limit', default=1000, type=int)
-                 devices_df = self.get_latest_device_data(limit=limit)
-                 return jsonify(devices_df.to_dict('records'))
-             except Exception as e:
-                 self.logger.error(f"Error getting devices", error=str(e), exc_info=True)
-                 return jsonify({"error": "Failed to retrieve devices"}), 500
+            try:
+                limit = request.args.get('limit', default=1000, type=int)
+                devices_df = self.get_latest_device_data(limit=limit)
+                return jsonify(devices_df.to_dict('records'))
+            except Exception as e:
+                self.logger.error(f"Error getting devices", error=str(e), exc_info=True)
+                return jsonify({"error": "Failed to retrieve devices"}), 500
 
         @self.app.route('/api/devices/<string:device_id>')
         @jwt_required()
@@ -1303,17 +1348,33 @@ class DigitalTwinApp:
         @limiter.limit("30 per minute")
         @self.csrf.exempt # Exempt if using header-based JWT primarily, or ensure CSRF token is sent
         def acknowledge_alert_api(alert_id):
-             user_id = get_jwt_identity() # Get user from JWT
-             success = self.acknowledge_alert_db(alert_id, user_id)
-             if success:
-                 with get_session() as session:
-                      alert = session.query(Alert).filter(Alert.id == alert_id).first()
-                 updated_alert_data = alert.to_dict() if alert else None
-                 if self.socketio:
-                     self.socketio.emit('alert_acknowledged', {'alertId': alert_id, 'acknowledgedBy': user_id, 'timestamp': datetime.utcnow().isoformat()}, room='alerts')
-                 return jsonify({"message": "Alert acknowledged", "alert": updated_alert_data}), 200
-             else:
-                 return jsonify({"error": "Failed to acknowledge alert or alert not found"}), 404
+            user_id = get_jwt_identity() # Get user from JWT
+            success = self.acknowledge_alert_db(alert_id, user_id)
+            if success:
+                with get_session() as session:
+                    alert = session.query(Alert).filter(Alert.id == alert_id).first()
+                updated_alert_data = alert.to_dict() if alert else None
+                if self.socketio:
+                    self.socketio.emit('alert_acknowledged', {'alertId': alert_id, 'acknowledgedBy': user_id, 'timestamp': datetime.utcnow().isoformat()}, room='alerts')
+                return jsonify({"message": "Alert acknowledged", "alert": updated_alert_data}), 200
+            else:
+                return jsonify({"error": "Failed to acknowledge alert or alert not found"}), 404
+        
+        # --- Example Admin-Only Route ---
+        @self.app.route('/api/admin/summary')
+        @jwt_required()
+        @role_required('admin') # <-- NEW RBAC DECORATOR IN USE
+        @limiter.limit("30 per minute")
+        def get_admin_summary():
+            """An example route only accessible to users with the 'admin' role."""
+            logger.info("Admin summary endpoint accessed", user=get_jwt_identity())
+            # In a real app, you'd fetch sensitive summary data here
+            return jsonify({
+                "message": "Welcome, Admin!",
+                "total_users": session.query(User).count(),
+                "total_devices": session.query(DeviceData.device_id).distinct().count(),
+                "connected_clients": len(self.connected_clients)
+            })
 
         # --- Placeholders ---
         @self.app.route('/api/predictions')
@@ -1330,28 +1391,29 @@ class DigitalTwinApp:
         @jwt_required()
         @limiter.limit("60 per minute")
         def get_health_scores():
-             # TODO: Implement
-             logger.info("Serving health scores (placeholder)")
-             return jsonify({"message": "Health scores (not implemented)"}), 501
+            # TODO: Implement
+            logger.info("Serving health scores (placeholder)")
+            return jsonify({"message": "Health scores (not implemented)"}), 501
 
         @self.app.route('/api/recommendations')
         @jwt_required()
         @limiter.limit("30 per minute")
         def get_recommendations():
-             # TODO: Implement
-             logger.info("Serving recommendations (placeholder)")
-             return jsonify({"message": "Recommendations (not implemented)"}), 501
+            # TODO: Implement
+            logger.info("Serving recommendations (placeholder)")
+            return jsonify({"message": "Recommendations (not implemented)"}), 501
 
         @self.app.route('/api/system_metrics')
         @jwt_required()
         @limiter.limit("120 per minute")
         def get_system_metrics_api():
-             logger.info("Serving system metrics")
-             return jsonify(self._get_system_metrics())
+            logger.info("Serving system metrics")
+            return jsonify(self._get_system_metrics())
 
         # --- Celery Task Routes ---
         @self.app.route('/api/tasks/start_report', methods=['POST'])
         @jwt_required()
+        @role_required('admin') # Example: Only admins can run reports
         @limiter.limit("5 per hour")
         @self.csrf.exempt # Typically exempt for API calls if using header auth
         def start_report_task():
@@ -1389,13 +1451,13 @@ class DigitalTwinApp:
             reports_dir = Path(get_optional_env('REPORTS_DIR', 'REPORTS/generated'))
             logger.debug(f"Attempting to serve report", filename=filename, directory=str(reports_dir))
             if not reports_dir.is_dir():
-                 logger.error(f"Reports directory not found", directory=str(reports_dir))
-                 return "Reports directory configuration error", 500
+                logger.error(f"Reports directory not found", directory=str(reports_dir))
+                return "Reports directory configuration error", 500
             try:
                 return send_from_directory(reports_dir, filename, as_attachment=False)
             except FileNotFoundError:
-                 logger.warning(f"Report file not found", filename=filename)
-                 return "Report not found", 404
+                logger.warning(f"Report file not found", filename=filename)
+                return "Report not found", 404
 
         @self.app.route('/exports/<path:filename>')
         # @jwt_required() # Optional protection
@@ -1403,13 +1465,13 @@ class DigitalTwinApp:
             exports_dir = Path(get_optional_env('EXPORTS_DIR', 'EXPORTS'))
             logger.debug(f"Attempting to serve export", filename=filename, directory=str(exports_dir))
             if not exports_dir.is_dir():
-                 logger.error(f"Exports directory not found", directory=str(exports_dir))
-                 return "Exports directory configuration error", 500
+                logger.error(f"Exports directory not found", directory=str(exports_dir))
+                return "Exports directory configuration error", 500
             try:
                 return send_from_directory(exports_dir, filename, as_attachment=True)
             except FileNotFoundError:
-                 logger.warning(f"Export file not found", filename=filename)
-                 return "Export not found", 404
+                logger.warning(f"Export file not found", filename=filename)
+                return "Export not found", 404
 
         self.logger.info("Flask routes setup completed.")
 
@@ -1428,17 +1490,17 @@ class DigitalTwinApp:
         def handle_connect_auth():
             auth = request.args.get('token') # Or read from request.headers if preferred
             if not auth:
-                 logger.warning("WS connection attempt without token")
-                 return False # Reject connection
+                logger.warning("WS connection attempt without token")
+                return False # Reject connection
 
             try:
                 # Use flask_jwt_extended to verify the token
-                # This doesn't set the identity globally, just verifies
-                decode_token(auth)
-                # You could extract identity here if needed: payload = decode_token(auth); user_id = payload['sub']
-                logger.info("WS connection authenticated", sid=request.sid)
-                # Proceed with regular connection handling
-                handle_connect() # Call the original handler below
+                # --- NEW: Extract claims and pass to handler ---
+                payload = decode_token(auth)
+                user_id = payload.get('sub')
+                user_role = payload.get('role', 'user') # Get role, default to 'user'
+                logger.info("WS connection authenticated", sid=request.sid, user_id=user_id, role=user_role)
+                handle_connect(identity=user_id, role=user_role) # Pass identity and role
                 return True
             except (ExpiredSignatureError, DecodeError, InvalidTokenError) as e:
                 logger.warning("WS authentication failed", error=str(e), sid=request.sid)
@@ -1449,16 +1511,16 @@ class DigitalTwinApp:
 
         # Original connect handler (now called after auth success)
         # @self.socketio.on('connect') - This decorator is removed, handled by handle_connect_auth
-        def handle_connect():
+        def handle_connect(identity: str = "anonymous", role: str = "user"): # NEW: Accept args
             client_id = request.sid
-            # user_id = get_jwt_identity() # Can't reliably get identity here after connect
             self.connected_clients[client_id] = {
                 'connected_at': datetime.utcnow(),
                 'last_ping': datetime.utcnow(),
-                # 'identity': user_id, # Store if extracted during auth
+                'identity': identity, # NEW: Store identity
+                'role': role,       # NEW: Store role
                 'subscriptions': set()
             }
-            logger.info(f"Client connected details stored", sid=client_id, total_clients=len(self.connected_clients))
+            logger.info(f"Client connected details stored", sid=client_id, identity=identity, role=role, total_clients=len(self.connected_clients))
             initial_data = self.cache.get('dashboard_combined_data')
             if initial_data:
                 emit('dashboard_update', initial_data)
@@ -1468,13 +1530,13 @@ class DigitalTwinApp:
         def handle_disconnect():
             client_id = request.sid
             if client_id in self.connected_clients:
-                # identity = self.connected_clients[client_id].get('identity', 'anonymous')
+                identity = self.connected_clients[client_id].get('identity', 'anonymous')
                 subs = self.connected_clients[client_id].get('subscriptions', set())
                 for room in list(subs): self._leave_room_internal(client_id, room)
                 del self.connected_clients[client_id]
-                logger.info(f"Client disconnected", sid=client_id, total_clients=len(self.connected_clients))
+                logger.info(f"Client disconnected", sid=client_id, identity=identity, total_clients=len(self.connected_clients))
             else:
-                 logger.info("Untracked client disconnected", sid=client_id)
+                logger.info("Untracked client disconnected", sid=client_id)
 
         # ... (ping, subscribe, unsubscribe handlers remain the same) ...
         @self.socketio.on('ping_from_client')
@@ -1518,18 +1580,18 @@ class DigitalTwinApp:
 
     # ... (Internal room helpers remain the same) ...
     def _join_room_internal(self, client_id, room_name):
-         join_room(room_name, sid=client_id)
-         self.rooms[room_name].add(client_id)
-         if client_id in self.connected_clients:
-             self.connected_clients[client_id]['subscriptions'].add(room_name)
+        join_room(room_name, sid=client_id)
+        self.rooms[room_name].add(client_id)
+        if client_id in self.connected_clients:
+            self.connected_clients[client_id]['subscriptions'].add(room_name)
 
     def _leave_room_internal(self, client_id, room_name):
-         leave_room(room_name, sid=client_id)
-         if room_name in self.rooms:
-              self.rooms[room_name].discard(client_id)
-              if not self.rooms[room_name]: del self.rooms[room_name]
-         if client_id in self.connected_clients and 'subscriptions' in self.connected_clients[client_id]:
-             self.connected_clients[client_id]['subscriptions'].discard(room_name)
+        leave_room(room_name, sid=client_id)
+        if room_name in self.rooms:
+            self.rooms[room_name].discard(client_id)
+            if not self.rooms[room_name]: del self.rooms[room_name]
+        if client_id in self.connected_clients and 'subscriptions' in self.connected_clients[client_id]:
+            self.connected_clients[client_id]['subscriptions'].discard(room_name)
 
     # ==================== BACKGROUND TASKS ====================
 
@@ -1545,30 +1607,30 @@ class DigitalTwinApp:
             while True:
                 try:
                     if self.data_generator:
-                         new_data_list = []
-                         if not getattr(self.data_generator, 'devices', None):
-                             self.data_generator.setup_simulation(device_count=25)
-                         sim_time = datetime.utcnow()
-                         for device_meta in self.data_generator.devices:
-                             reading = self.data_generator._generate_single_reading(device_meta, sim_time, 0)
-                             new_data_list.append(reading)
-                         if new_data_list:
-                              self.bulk_insert_device_data(new_data_list)
-                              latest_df = pd.DataFrame(new_data_list)
-                         else: latest_df = pd.DataFrame()
+                        new_data_list = []
+                        if not getattr(self.data_generator, 'devices', None):
+                            self.data_generator.setup_simulation(device_count=25)
+                        sim_time = datetime.utcnow()
+                        for device_meta in self.data_generator.devices:
+                            reading = self.data_generator._generate_single_reading(device_meta, sim_time, 0)
+                            new_data_list.append(reading)
+                        if new_data_list:
+                                self.bulk_insert_device_data(new_data_list)
+                                latest_df = pd.DataFrame(new_data_list)
+                        else: latest_df = pd.DataFrame()
                     else: latest_df = self.get_latest_device_data(limit=100)
 
                     if not latest_df.empty:
                         if self.alert_manager: self._check_and_send_alerts(latest_df)
                         current_time = time.monotonic()
                         if current_time - last_cache_update > 5:
-                             logger.debug("Updating dashboard cache and broadcasting...")
-                             dashboard_payload = self._create_dashboard_payload(latest_df)
-                             self.cache.set('dashboard_combined_data', dashboard_payload, ttl=30)
-                             self.cache.set('latest_devices:500', latest_df.to_dict('records'), ttl=60)
-                             if self.socketio:
-                                  self.socketio.emit('dashboard_update', dashboard_payload, room='dashboard_updates')
-                             last_cache_update = current_time
+                            logger.debug("Updating dashboard cache and broadcasting...")
+                            dashboard_payload = self._create_dashboard_payload(latest_df)
+                            self.cache.set('dashboard_combined_data', dashboard_payload, ttl=30)
+                            self.cache.set('latest_devices:500', latest_df.to_dict('records'), ttl=60)
+                            if self.socketio:
+                                    self.socketio.emit('dashboard_update', dashboard_payload, room='dashboard_updates')
+                            last_cache_update = current_time
                         else: logger.debug("Skipping cache update/broadcast (too soon).")
 
                     eventlet.sleep(float(get_optional_env('DATA_UPDATE_INTERVAL', 1)))
@@ -1598,8 +1660,8 @@ class DigitalTwinApp:
         # Need app context - ContextTask handles this
         app_instance = current_app.extensions.get("digital_twin_instance")
         if not app_instance:
-             logger.error("Could not get DigitalTwinApp instance in Celery task")
-             return {'status': 'FAILURE', 'error': 'App instance missing'}
+            logger.error("Could not get DigitalTwinApp instance in Celery task")
+            return {'status': 'FAILURE', 'error': 'App instance missing'}
 
         logger.info("Running scheduled cleanup of inactive clients...")
         try:
@@ -1617,8 +1679,8 @@ class DigitalTwinApp:
         """Celery task to run model retraining."""
         app_instance = current_app.extensions.get("digital_twin_instance")
         if not app_instance:
-             logger.error("Could not get DigitalTwinApp instance in Celery task")
-             return {'status': 'FAILURE', 'error': 'App instance missing'}
+            logger.error("Could not get DigitalTwinApp instance in Celery task")
+            return {'status': 'FAILURE', 'error': 'App instance missing'}
 
         if not app_instance.analytics_engine or not hasattr(app_instance.analytics_engine, 'retrain_models'):
             logger.warning("Analytics engine or retrain_models method not available.")
@@ -1691,16 +1753,16 @@ class DigitalTwinApp:
             logger.error(f"Error checking/sending alerts", error=str(e), exc_info=True)
 
     def _get_system_metrics(self) -> Dict:
-         # (Remains the same)
-         metrics = {'timestamp': datetime.utcnow().isoformat(), 'cpu_percent': None, 'memory_percent': None, 'disk_percent': None, 'active_connections': len(self.connected_clients), 'cache_available': self.cache.available if self.cache else False, 'database_available': self.db_available, 'celery_available': CELERY_AVAILABLE}
-         try:
-             import psutil
-             metrics['cpu_percent'] = psutil.cpu_percent(interval=0.1)
-             metrics['memory_percent'] = psutil.virtual_memory().percent
-             metrics['disk_percent'] = psutil.disk_usage('/').percent
-         except ImportError: logger.warning("psutil not installed, cannot get detailed system metrics.")
-         except Exception as e: logger.error(f"Error getting system metrics", error=str(e))
-         return metrics
+        # (Remains the same)
+        metrics = {'timestamp': datetime.utcnow().isoformat(), 'cpu_percent': None, 'memory_percent': None, 'disk_percent': None, 'active_connections': len(self.connected_clients), 'cache_available': self.cache.available if self.cache else False, 'database_available': self.db_available, 'celery_available': CELERY_AVAILABLE}
+        try:
+            import psutil
+            metrics['cpu_percent'] = psutil.cpu_percent(interval=0.1)
+            metrics['memory_percent'] = psutil.virtual_memory().percent
+            metrics['disk_percent'] = psutil.disk_usage('/').percent
+        except ImportError: logger.warning("psutil not installed, cannot get detailed system metrics.")
+        except Exception as e: logger.error(f"Error getting system metrics", error=str(e))
+        return metrics
 
     # --- REMOVED: _cleanup_inactive_clients (logic moved to Celery task) ---
     def _cleanup_inactive_clients_logic(self) -> int:
@@ -1715,22 +1777,23 @@ class DigitalTwinApp:
         ]
 
         for sid in inactive_sids:
-             logger.warning(f"Disconnecting inactive client", sid=sid)
-             if self.socketio:
-                 # Ensure disconnect runs in the correct context if needed, or handle potential errors
-                 try:
-                     self.socketio.disconnect(sid, silent=True) # silent=True prevents disconnect event loop
-                 except Exception as e:
-                     logger.error("Error during socketio disconnect", sid=sid, error=str(e))
-             # Clean up internal state immediately, don't rely on disconnect handler which might not run
-             if sid in self.connected_clients:
-                 subs = self.connected_clients[sid].get('subscriptions', set())
-                 for room in list(subs): self._leave_room_internal(sid, room)
-                 del self.connected_clients[sid]
-             disconnected_count += 1
+            identity = self.connected_clients.get(sid, {}).get('identity', 'unknown')
+            logger.warning(f"Disconnecting inactive client", sid=sid, identity=identity)
+            if self.socketio:
+                # Ensure disconnect runs in the correct context if needed, or handle potential errors
+                try:
+                    self.socketio.disconnect(sid, silent=True) # silent=True prevents disconnect event loop
+                except Exception as e:
+                    logger.error("Error during socketio disconnect", sid=sid, error=str(e))
+            # Clean up internal state immediately, don't rely on disconnect handler which might not run
+            if sid in self.connected_clients:
+                subs = self.connected_clients[sid].get('subscriptions', set())
+                for room in list(subs): self._leave_room_internal(sid, room)
+                del self.connected_clients[sid]
+            disconnected_count += 1
 
         if disconnected_count > 0:
-             logger.info(f"Cleaned up inactive client(s).", count=disconnected_count)
+            logger.info(f"Cleaned up inactive client(s).", count=disconnected_count)
         return disconnected_count
 
 
@@ -1769,7 +1832,7 @@ class DigitalTwinApp:
         effective_host = get_optional_env('HOST', host)
         debug_mode = self.app.config.get('DEBUG', False)
         self.start_time = datetime.now()
-        logger.info(f"Starting Digital Twin App v3.3", host=effective_host, port=effective_port, debug=debug_mode)
+        logger.info(f"Starting Digital Twin App v3.4", host=effective_host, port=effective_port, debug=debug_mode)
         logger.info(f"Component Status", db_ok=self.db_available, redis_ok=self.cache.available, celery_ok=CELERY_AVAILABLE)
         if not self.socketio: logger.critical("SocketIO failed to initialize. Cannot run."); return
         try:
@@ -1779,12 +1842,12 @@ class DigitalTwinApp:
         finally: self._shutdown()
 
     def _shutdown(self):
-         # (Remains the same, removed scheduler shutdown)
-         logger.info("Initiating graceful shutdown...")
-         # if self.scheduler and self.scheduler.running: # REMOVED
-         #      try: self.scheduler.shutdown(); logger.info("APScheduler shut down.")
-         #      except Exception as e: logger.error(f"Error shutting down APScheduler", error=str(e))
-         logger.info("Shutdown complete.")
+        # (Remains the same, removed scheduler shutdown)
+        logger.info("Initiating graceful shutdown...")
+        # if self.scheduler and self.scheduler.running: # REMOVED
+        #     try: self.scheduler.shutdown(); logger.info("APScheduler shut down.")
+        #     except Exception as e: logger.error(f"Error shutting down APScheduler", error=str(e))
+        logger.info("Shutdown complete.")
 
 
 # ==================== APPLICATION FACTORY & MAIN ====================
@@ -1818,11 +1881,11 @@ def generate_report_task(self, user_id="system"): # Added user_id
     try:
         report_gen = HealthReportGenerator()
         if not report_gen.db_manager:
-             report_gen.db_manager = SecureDatabaseManager()
+            report_gen.db_manager = SecureDatabaseManager()
 
         with get_session() as session:
-             recent_data = session.query(DeviceData).filter(DeviceData.timestamp >= datetime.utcnow() - timedelta(days=7)).all()
-             report_data_df = pd.DataFrame([d.to_dict() for d in recent_data])
+            recent_data = session.query(DeviceData).filter(DeviceData.timestamp >= datetime.utcnow() - timedelta(days=7)).all()
+            report_data_df = pd.DataFrame([d.to_dict() for d in recent_data])
 
         if report_data_df.empty:
             logger.warning("No data found for report generation.", task_id=self.request.id)
@@ -1848,10 +1911,10 @@ def export_data_task(self, format_type='json', date_range_days=7):
         filepath = export_dir / filename
 
         with get_session() as session:
-             start_date = datetime.utcnow() - timedelta(days=int(date_range_days))
-             data_query = session.query(DeviceData).filter(DeviceData.timestamp >= start_date).order_by(DeviceData.timestamp.asc())
-             results = data_query.limit(50000).all() # Limit export size
-             data_list = [d.to_dict() for d in results]
+            start_date = datetime.utcnow() - timedelta(days=int(date_range_days))
+            data_query = session.query(DeviceData).filter(DeviceData.timestamp >= start_date).order_by(DeviceData.timestamp.asc())
+            results = data_query.limit(50000).all() # Limit export size
+            data_list = [d.to_dict() for d in results]
 
         if not data_list:
             logger.warning("No data found for export.", task_id=self.request.id)
