@@ -1,19 +1,31 @@
 // src/components/DeviceCard.tsx
-import { useState, useEffect } from 'react'; // Import hooks
+import { useState, useEffect } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Badge } from './ui/badge';
 import { Device } from '../types/digital-twin';
 import { cn } from '../utils/cn';
-import { Thermometer, Zap, Waves, Gauge, Activity, Power, WifiOff } from 'lucide-react';
-import { Skeleton } from './ui/skeleton'; // Import Skeleton
+import {
+    Thermometer, Zap, Waves, Gauge, Activity, Power, WifiOff,
+    TrendingUp, TrendingDown, Minus, // Added trend icons
+    Info // Added Info icon for details/comparison placeholder
+} from 'lucide-react';
+import { Skeleton } from './ui/skeleton';
+import { Button } from './ui/button'; // Added for placeholder
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/tooltip'; // Added for tooltips
 
 interface DeviceCardProps {
-  // --- UPDATED: Props are now optional for loading state ---
   device?: Device;
   loading?: boolean;
   onClick?: (deviceId: string) => void;
+  // --- NEW ---
+  trend?: 'up' | 'down' | 'stable'; // Prop for trend direction
+  // --- Placeholder for comparison ---
+  isSelectedForCompare?: boolean;
+  onCompareSelect?: (deviceId: string, selected: boolean) => void;
+  // -------------
 }
 
+// --- Constants remain the same ---
 const deviceTypeConfig = {
   temperature_sensor: { icon: Thermometer, unit: '°C' },
   pressure_sensor: { icon: Gauge, unit: 'kPa' },
@@ -30,9 +42,10 @@ const statusConfig = {
   offline: 'bg-gray-500',
 };
 
-// --- NEW: Skeleton Component for Loading State ---
+// --- Skeleton Component (no changes) ---
 function DeviceCardSkeleton() {
-  return (
+  // ... (skeleton code remains the same)
+   return (
     <Card className="shadow-sm transition-shadow duration-300 animate-pulse">
       <CardHeader className="pb-4">
         <div className="flex items-center justify-between">
@@ -62,28 +75,33 @@ function DeviceCardSkeleton() {
   );
 }
 
-export function DeviceCard({ device, loading = false, onClick }: DeviceCardProps) {
-  // --- NEW: State for real-time refresh indicator ---
+
+export function DeviceCard({
+    device,
+    loading = false,
+    onClick,
+    trend, // <-- NEW prop
+    // --- Placeholders ---
+    isSelectedForCompare,
+    onCompareSelect
+    // ------------------
+}: DeviceCardProps) {
   const [lastTimestamp, setLastTimestamp] = useState(device?.timestamp);
   const [isPulsing, setIsPulsing] = useState(false);
 
-  // --- NEW: Effect to detect timestamp changes and trigger pulse ---
   useEffect(() => {
     if (device && device.timestamp !== lastTimestamp) {
       setIsPulsing(true);
       setLastTimestamp(device.timestamp);
-      // Remove pulse animation after it finishes
-      const timer = setTimeout(() => setIsPulsing(false), 2000); // 2s animation
+      const timer = setTimeout(() => setIsPulsing(false), 2000);
       return () => clearTimeout(timer);
     }
   }, [device, device?.timestamp, lastTimestamp]);
 
-  // --- NEW: Handle Loading State ---
   if (loading || !device) {
     return <DeviceCardSkeleton />;
   }
 
-  // --- Existing Logic ---
   const config = deviceTypeConfig[device.type] || deviceTypeConfig.default;
   const Icon = device.status === 'offline' ? WifiOff : config.icon;
   const statusColor = statusConfig[device.status];
@@ -94,85 +112,139 @@ export function DeviceCard({ device, loading = false, onClick }: DeviceCardProps
     }
   };
 
+  // --- NEW: Trend Icon Logic ---
+  const TrendIcon = trend === 'up' ? TrendingUp : trend === 'down' ? TrendingDown : Minus;
+  const trendColor = trend === 'up' ? 'text-success' : trend === 'down' ? 'text-destructive' : 'text-muted-foreground';
+  // ---------------------------
+
   return (
-    <Card
-      className={cn(
-        'shadow-sm hover:shadow-lg transition-all duration-300',
-        onClick && 'cursor-pointer'
-      )}
-      onClick={handleCardClick}
-    >
-      <CardHeader className="pb-4">
-        <div className="flex items-center justify-between">
-          <Icon
-            className={cn(
-              'h-6 w-6 text-muted-foreground transition-colors',
-              device.status === 'offline' && 'text-gray-500'
-            )}
-          />
-          <div className="flex items-center space-x-2">
-            <Badge variant="outline" className="capitalize">
-              {device.type.replace(/_/g, ' ')}
-            </Badge>
-            {/* --- NEW: Added pulse animation on update --- */}
-            <div
+    <TooltipProvider delayDuration={100}>
+      <Card
+        className={cn(
+          'shadow-sm hover:shadow-lg transition-all duration-300 relative', // Added relative
+          onClick && 'cursor-pointer',
+          isSelectedForCompare && 'ring-2 ring-primary shadow-lg' // Highlight if selected
+        )}
+        onClick={handleCardClick}
+      >
+        <CardHeader className="pb-4">
+          <div className="flex items-center justify-between">
+            <Icon
               className={cn(
-                'h-3 w-3 rounded-full',
-                statusColor,
-                isPulsing && 'animate-pulse' // Apply pulse
+                'h-6 w-6 text-muted-foreground transition-colors',
+                device.status === 'offline' && 'text-gray-500'
               )}
             />
+            <div className="flex items-center space-x-2">
+              <Badge variant="outline" className="capitalize text-xs"> {/* Made text smaller */}
+                {device.type.replace(/_/g, ' ')}
+              </Badge>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                   <div
+                    className={cn(
+                      'h-3 w-3 rounded-full',
+                      statusColor,
+                      isPulsing && 'animate-pulse'
+                    )}
+                  />
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Status: <span className='capitalize'>{device.status}</span></p>
+                  {device.timestamp && <p>Last Update: {new Date(device.timestamp).toLocaleTimeString()}</p>}
+                </TooltipContent>
+              </Tooltip>
+            </div>
           </div>
-        </div>
-      </CardHeader>
-      <CardContent>
-        <CardTitle className="text-lg font-semibold truncate" title={device.name}>
-          {device.name}
-        </CardTitle>
-        <CardDescription className="text-sm truncate" title={device.id}>
-          {device.id}
-        </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <CardTitle className="text-lg font-semibold truncate" title={device.name}>
+            {device.name}
+          </CardTitle>
+          <CardDescription className="text-sm truncate" title={device.id}>
+            {device.id} {/* Keep ID visible but smaller */}
+          </CardDescription>
 
-        <div className="mt-4 pt-4 border-t border-border/50">
-          <div className="flex items-baseline justify-between">
-            <span className="text-sm text-muted-foreground">
-              {device.status === 'offline' ? 'Last seen' : 'Current Value'}
-            </span>
-            {device.status !== 'offline' ? (
-              // --- NEW: Added pulse animation on update ---
+          <div className="mt-4 pt-4 border-t border-border/50">
+            <div className="flex items-baseline justify-between">
+              <span className="text-sm text-muted-foreground">
+                {device.status === 'offline' ? 'Last seen' : 'Value'}
+              </span>
+              {device.status !== 'offline' ? (
+                <span
+                  className={cn(
+                    'text-xl font-bold text-foreground',
+                    isPulsing && 'animate-pulse'
+                  )}
+                >
+                  {device.value?.toFixed(2)}{config.unit}
+                </span>
+              ) : (
+                <span className="text-sm text-muted-foreground">
+                  {new Date(device.timestamp).toLocaleString()}
+                </span>
+              )}
+            </div>
+            <div className="flex items-center justify-between mt-2"> {/* Changed to items-center */}
+              <span className="text-sm text-muted-foreground flex items-center gap-1">
+                 Health
+                 {/* --- NEW: Trend Icon Display --- */}
+                 {trend && (
+                     <Tooltip>
+                        <TooltipTrigger asChild>
+                            <TrendIcon className={cn('h-4 w-4', trendColor)} />
+                        </TooltipTrigger>
+                        <TooltipContent>
+                            <p>Health Trend: <span className='capitalize'>{trend}</span></p>
+                        </TooltipContent>
+                    </Tooltip>
+                 )}
+                 {/* ----------------------------- */}
+              </span>
               <span
                 className={cn(
-                  'text-xl font-bold text-foreground',
-                  isPulsing && 'animate-pulse' // Apply pulse
+                  'text-lg font-bold',
+                  device.healthScore >= 80
+                    ? 'text-success'
+                    : device.healthScore >= 60
+                    ? 'text-warning'
+                    : 'text-destructive',
+                  isPulsing && 'animate-pulse'
                 )}
               >
-                {device.value?.toFixed(2)}
-                {config.unit}
+                {/* Ensure healthScore is treated as a percentage */}
+                {typeof device.healthScore === 'number' ? `${device.healthScore.toFixed(0)}%` : 'N/A'}
               </span>
-            ) : (
-              <span className="text-sm text-muted-foreground">
-                {new Date(device.timestamp).toLocaleString()}
-              </span>
-            )}
+            </div>
           </div>
-          <div className="flex items-baseline justify-between mt-2">
-            <span className="text-sm text-muted-foreground">Health</span>
-            <span
-              className={cn(
-                'text-lg font-bold',
-                device.healthScore >= 80
-                  ? 'text-success'
-                  : device.healthScore >= 60
-                  ? 'text-warning'
-                  : 'text-destructive',
-                isPulsing && 'animate-pulse' // Apply pulse
-              )}
-            >
-              {device.healthScore?.toFixed(0)}%
-            </span>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
+
+          {/* --- Placeholder for Comparison --- */}
+          {/* This requires parent component state management */}
+          {/* <div className="absolute top-2 right-2">
+            <Tooltip>
+               <TooltipTrigger asChild>
+                   <Button
+                       variant="ghost"
+                       size="icon"
+                       className="h-6 w-6 text-muted-foreground hover:text-primary"
+                       onClick={(e) => {
+                           e.stopPropagation(); // Prevent card click
+                           onCompareSelect?.(device.id, !isSelectedForCompare);
+                       }}
+                       aria-label={isSelectedForCompare ? 'Remove from comparison' : 'Add to comparison'}
+                   >
+                       {isSelectedForCompare ? <MinusCircle className="h-4 w-4 text-primary" /> : <PlusCircle className="h-4 w-4" />}
+                   </Button>
+               </TooltipTrigger>
+               <TooltipContent>
+                   <p>{isSelectedForCompare ? 'Remove from comparison' : 'Add to comparison'}</p>
+               </TooltipContent>
+           </Tooltip>
+          </div> */}
+           {/* ----------------------------- */}
+
+        </CardContent>
+      </Card>
+    </TooltipProvider>
   );
 }
