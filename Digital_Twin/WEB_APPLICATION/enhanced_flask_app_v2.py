@@ -7,9 +7,8 @@ input validation, Prometheus metrics, and enhanced security.
 
 Major Enhancements from v3.3:
 - Added Role-Based Access Control (RBAC) mechanisms (Item 4)
-  - User model now has a 'role'
-  - JWTs now contain a 'role' claim
-  - Added @role_required decorator
+- Switched password hashing from werkzeug default to bcrypt (as requested)
+- Implemented JWT Refresh Token logic (as requested)
 """
 
 import os
@@ -19,7 +18,7 @@ import logging # Still needed for basic setup before structlog takes over
 import structlog # For structured logging
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # Ensure timezone is imported
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set # Added Set
 from collections import defaultdict, deque
@@ -46,7 +45,7 @@ import eventlet
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, Index, func
 from sqlalchemy.orm import sessionmaker, scoped_session, declarative_base
 from sqlalchemy.pool import QueuePool
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 # Redis imports
 import redis
@@ -56,10 +55,13 @@ from redis.connection import ConnectionPool
 from flask_jwt_extended import (
     JWTManager, jwt_required, create_access_token,
     get_jwt_identity, unset_jwt_cookies, decode_token,
-    set_access_cookies, verify_jwt_in_request, get_jwt # Added verify_jwt_in_request, get_jwt
+    set_access_cookies, verify_jwt_in_request, get_jwt,
+    # --- Enabled Refresh Logic ---
+    create_refresh_token, set_refresh_cookies
 )
 from jwt.exceptions import ExpiredSignatureError, DecodeError, InvalidTokenError
-from werkzeug.security import generate_password_hash, check_password_hash
+# from werkzeug.security import generate_password_hash, check_password_hash # Replaced with bcrypt
+import bcrypt # <-- Added bcrypt
 from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_wtf.csrf import CSRFProtect # For form CSRF
 
@@ -78,9 +80,6 @@ except ImportError:
         def exempt(self, f): return f
         def init_app(self, app): pass
     def get_remote_address(): return "127.0.0.1"
-
-# Background Scheduler (REMOVED - Replaced by Celery Beat)
-# from apscheduler.schedulers.background import BackgroundScheduler
 
 # Celery for async tasks and scheduled tasks (Beat)
 try:
@@ -195,7 +194,6 @@ def setup_logging():
     # Silence overly verbose libraries (using standard logging)
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
     logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
-    # logging.getLogger('apscheduler').setLevel(logging.WARNING) # APScheduler removed
     logging.getLogger('socketio').setLevel(logging.WARNING)
     logging.getLogger('engineio').setLevel(logging.WARNING)
     logging.getLogger('celery').setLevel(logging.INFO) # Keep celery logs visible
@@ -303,18 +301,18 @@ def role_required(required_role: str):
 
 
 # ==================== DATABASE MODELS (SQLAlchemy) ====================
-# (No changes needed for models)
 Base = declarative_base()
-# ... (DeviceData, Alert models remain the same) ...
+UTCDateTime = DateTime(timezone=True) # Use timezone-aware datetime
+
 class DeviceData(Base):
     """SQLAlchemy model for device data"""
     __tablename__ = 'device_data'
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoinment=True)
     device_id = Column(String(100), nullable=False, index=True)
     device_type = Column(String(100))
     device_name = Column(String(200))
-    timestamp = Column(DateTime, nullable=False, index=True, default=datetime.utcnow)
+    timestamp = Column(UTCDateTime, nullable=False, index=True, default=lambda: datetime.now(timezone.utc)) # Use UTC
     value = Column(Float)
     status = Column(String(50), index=True)
     health_score = Column(Float)
@@ -336,7 +334,7 @@ class DeviceData(Base):
                 data['metadata'] = json.loads(data['metadata'])
             except (json.JSONDecodeError, TypeError): # Added TypeError check
                 data['metadata'] = {} # Default to empty dict if metadata is not valid JSON
-        # Convert datetime to ISO string
+        # Convert datetime to ISO string with timezone
         if isinstance(data.get('timestamp'), datetime):
             data['timestamp'] = data['timestamp'].isoformat()
         return data
@@ -351,7 +349,7 @@ class Alert(Base):
     rule_name = Column(String(100)) # Added rule_name
     severity = Column(String(50), index=True)
     message = Column(Text) # Renamed from description for clarity
-    timestamp = Column(DateTime, nullable=False, index=True, default=datetime.utcnow)
+    timestamp = Column(UTCDateTime, nullable=False, index=True, default=lambda: datetime.now(timezone.utc)) # Use UTC
     acknowledged = Column(Boolean, default=False, index=True)
     resolved = Column(Boolean, default=False, index=True) # Added resolved status
     value = Column(Float) # Value that triggered the alert
@@ -378,11 +376,11 @@ class User(Base):
     """SQLAlchemy model for users"""
     __tablename__ = 'users'
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoinment=True)
     username = Column(String(100), unique=True, nullable=False, index=True)
-    password_hash = Column(String(255), nullable=False)
+    password_hash = Column(String(255), nullable=False) # Store hash as string
     email = Column(String(200), unique=True, index=True) # Added index
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(UTCDateTime, default=lambda: datetime.now(timezone.utc)) # Use UTC
     # --- NEW: Add role field ---
     role = Column(String(50), nullable=False, default='user', index=True) # e.g., 'user', 'admin'
 
@@ -397,10 +395,9 @@ class User(Base):
         }
 
 # ==================== DATABASE SETUP (SQLAlchemy) ====================
-# (No changes needed for setup)
 engine = None
 SessionLocal = None
-# ... (init_database and get_session remain the same) ...
+
 def init_database(db_url: str):
     """Initializes the database engine and session factory."""
     global engine, SessionLocal
@@ -453,8 +450,6 @@ def get_session():
         logger.debug(f"Removed DB session", session_id=id(session))
 
 # ==================== REDIS CACHE MANAGER ====================
-# (No changes needed for Redis)
-# ... (RedisCacheManager class remains the same) ...
 class RedisCacheManager:
     """Manages Redis caching with connection pooling"""
     _instance = None
@@ -572,7 +567,6 @@ celery_app = None
 
 def make_celery(app_name=__name__):
     """Factory to create a Celery app instance."""
-    # (Remains the same)
     if not CELERY_AVAILABLE:
         return None
 
@@ -656,7 +650,6 @@ class DigitalTwinApp:
         self.pattern_analyzer = None
         self.recommendation_engine = None
         self.data_generator = None
-        # self.scheduler: Optional[BackgroundScheduler] = None # REMOVED
         self.jwt: Optional[JWTManager] = None
         self.limiter: Optional[Limiter] = None
         self.csrf: Optional[CSRFProtect] = None # NEW: CSRF Protection
@@ -693,16 +686,32 @@ class DigitalTwinApp:
             template_folder='templates',
             instance_relative_config=True
         )
+        
+        is_production = get_optional_env('FLASK_ENV', 'development') == 'production'
 
         self.app.config.from_mapping(
             SECRET_KEY=get_required_env('SECRET_KEY'), # Used for Flask session, CSRF
             DEBUG=get_optional_env('FLASK_DEBUG', 'False').lower() == 'true',
             JWT_SECRET_KEY=get_required_env('JWT_SECRET_KEY'), # Separate key for JWT
-            JWT_ACCESS_TOKEN_EXPIRES=timedelta(hours=int(get_optional_env('JWT_EXPIRY_HOURS', 24))),
-            JWT_TOKEN_LOCATION=['headers', 'cookies'],
-            JWT_COOKIE_SECURE=get_optional_env('FLASK_ENV', 'development') == 'production',
-            JWT_COOKIE_CSRF_PROTECT=True,
-            JWT_CSRF_CHECK_FORM=True,
+            
+            # --- UPDATED: Token Expiry (Refresh Logic Enabled) ---
+            JWT_ACCESS_TOKEN_EXPIRES=timedelta(hours=int(get_optional_env('JWT_EXPIRY_HOURS', 1))), # Short-lived access token
+            JWT_REFRESH_TOKEN_EXPIRES=timedelta(days=int(get_optional_env('JWT_REFRESH_DAYS', 30))), # Long-lived refresh token
+
+            # --- UPDATED: Token Location & Cookie Settings ---
+            JWT_TOKEN_LOCATION=['headers', 'cookies'], # Allow both header and cookie
+            JWT_COOKIE_SECURE=is_production, # Use secure cookies in prod
+            JWT_COOKIE_SAMESITE='Lax', # Recommended default
+            JWT_COOKIE_CSRF_PROTECT=True, # Enable double submit CSRF protection
+            JWT_CSRF_CHECK_FORM=True, # Check CSRF for form submissions as well
+            
+            # --- NEW: Refresh Cookie Config ---
+            JWT_REFRESH_COOKIE_PATH='/api/auth/refresh', # Only send refresh cookie to the refresh endpoint
+            JWT_REFRESH_COOKIE_SECURE=is_production,
+            JWT_REFRESH_COOKIE_SAMESITE='Lax',
+            JWT_REFRESH_COOKIE_CSRF_PROTECT=True,
+            # --- End Update ---
+
             # NEW: Needed for Flask-WTF CSRF
             WTF_CSRF_ENABLED=True,
             WTF_CSRF_SECRET_KEY=get_required_env('SECRET_KEY'), # Can reuse Flask secret key
@@ -779,7 +788,6 @@ class DigitalTwinApp:
 
     def _initialize_modules(self):
         """Initialize AI and analytics modules"""
-        # (Remains largely the same, removed scheduler init)
         self.logger.info("Initializing application modules...")
         try:
             self.analytics_engine = PredictiveAnalyticsEngine() if PredictiveAnalyticsEngine else None
@@ -789,8 +797,6 @@ class DigitalTwinApp:
             self.recommendation_engine = RecommendationEngine() if RecommendationEngine else None
             self.data_generator = UnifiedDataGenerator(db_path=self.app.config['DATABASE_URL']) if UnifiedDataGenerator else None
 
-            # self.scheduler = BackgroundScheduler(daemon=True) # REMOVED
-
             self.logger.info("Application modules initialized successfully.")
         except Exception as e:
             self.logger.error(f"Module initialization error", error=str(e), exc_info=True)
@@ -798,7 +804,6 @@ class DigitalTwinApp:
 
     def _setup_middleware(self):
         """Setup Flask middleware"""
-        # (Remains the same)
         self.app.wsgi_app = ProxyFix(
             self.app.wsgi_app,
             x_for=int(get_optional_env('PROXY_X_FOR', 1)),
@@ -810,8 +815,8 @@ class DigitalTwinApp:
 
         CORS(self.app,
              origins=self.app.config['CORS_ALLOWED_ORIGINS'],
-             supports_credentials=True,
-             allow_headers=["Content-Type", "Authorization", "X-CSRF-TOKEN"])
+             supports_credentials=True, # Important for cookies
+             allow_headers=["Content-Type", "Authorization", "X-CSRF-TOKEN"]) # Allow CSRF token header
         self.logger.info(f"CORS configured", origins=self.app.config['CORS_ALLOWED_ORIGINS'])
 
         # --- NEW: Add request logging middleware ---
@@ -835,8 +840,13 @@ class DigitalTwinApp:
             return response
 
     # ==================== DATABASE OPERATIONS (SQLAlchemy) ====================
-    # (No changes needed for DB operations)
-    # ... (bulk_insert_device_data, get_latest_device_data, etc. remain the same) ...
+    # (Methods remain the same)
+    # ... bulk_insert_device_data ...
+    # ... get_latest_device_data ...
+    # ... insert_alert ...
+    # ... get_recent_alerts ...
+    # ... acknowledge_alert_db ...
+
     def bulk_insert_device_data(self, data_list: List[Dict]) -> bool:
         """Bulk insert device data efficiently using SQLAlchemy"""
         inserted_count = 0
@@ -849,27 +859,30 @@ class DigitalTwinApp:
                         self.logger.warning(f"Skipping invalid device data record", record=d)
                         continue
 
-                    # Ensure timestamp is datetime
+                    # Ensure timestamp is datetime and timezone-aware (UTC)
                     ts = d['timestamp']
+                    timestamp = None
                     if isinstance(ts, str):
                         try:
                             timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                            if timestamp.tzinfo is None:
+                                timestamp = timestamp.replace(tzinfo=timezone.utc)
                         except ValueError:
                             self.logger.warning(f"Skipping record with invalid timestamp format", timestamp=ts)
                             continue
                     elif isinstance(ts, (int, float)):
-                        timestamp = datetime.fromtimestamp(ts)
-                    elif not isinstance(ts, datetime):
-                            self.logger.warning(f"Skipping record with invalid timestamp type", type=str(type(ts)))
-                            continue
+                        timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    elif isinstance(ts, datetime):
+                        timestamp = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
                     else:
-                        timestamp = ts # Already datetime
+                        self.logger.warning(f"Skipping record with invalid timestamp type", type=str(type(ts)))
+                        continue
 
                     objects_to_insert.append(DeviceData(
                         device_id=d['device_id'],
                         device_type=d.get('device_type'),
                         device_name=d.get('device_name'),
-                        timestamp=timestamp,
+                        timestamp=timestamp, # Use timezone-aware datetime
                         value=float(d['value']) if d.get('value') is not None else None,
                         status=d.get('status'),
                         health_score=float(d['health_score']) if d.get('health_score') is not None else None,
@@ -897,7 +910,11 @@ class DigitalTwinApp:
             self.logger.debug(f"Cache hit", cache_key=cache_key)
             try:
                 # Recreate DataFrame from cached dict list
-                return pd.DataFrame(cached)
+                df = pd.DataFrame(cached)
+                # Ensure timestamp is datetime after loading from cache
+                if 'timestamp' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                return df
             except Exception as e:
                 self.logger.warning(f"Failed to create DataFrame from cache", cache_key=cache_key, error=str(e))
                 self.cache.delete(cache_key) # Invalidate cache
@@ -919,12 +936,16 @@ class DigitalTwinApp:
                 ).order_by(DeviceData.timestamp.desc()).limit(limit)
 
                 results = query.all()
-                data_list = [r.to_dict() for r in results]
+                data_list = [r.to_dict() for r in results] # Converts datetime to ISO string
 
             self.logger.info(f"Fetched latest device data from DB", count=len(results))
             if data_list:
-                self.cache.set(cache_key, data_list, ttl=60) # Cache for 1 minute
-                return pd.DataFrame(data_list)
+                self.cache.set(cache_key, data_list, ttl=60) # Cache the list of dicts
+                df = pd.DataFrame(data_list)
+                # Ensure timestamp is datetime after loading from DB
+                if 'timestamp' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                return df
             else:
                 return pd.DataFrame()
         except Exception as e:
@@ -936,15 +957,18 @@ class DigitalTwinApp:
         try:
             with get_session() as session:
                 ts = alert_data.get('timestamp')
+                timestamp = None
                 if isinstance(ts, str):
                     try:
                         timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                        if timestamp.tzinfo is None:
+                            timestamp = timestamp.replace(tzinfo=timezone.utc)
                     except ValueError:
-                        timestamp = datetime.utcnow()
+                        timestamp = datetime.now(timezone.utc)
                 elif isinstance(ts, datetime):
-                    timestamp = ts
+                     timestamp = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
                 else:
-                    timestamp = datetime.utcnow()
+                    timestamp = datetime.now(timezone.utc)
 
                 # Use AlertManager generated ID if available, else generate new
                 alert_id = alert_data.get('id', str(uuid.uuid4()))
@@ -955,7 +979,7 @@ class DigitalTwinApp:
                     rule_name=alert_data.get('rule_name'),
                     severity=alert_data['severity'],
                     message=alert_data.get('description') or alert_data.get('message'),
-                    timestamp=timestamp,
+                    timestamp=timestamp, # Use timezone-aware datetime
                     value=float(alert_data['value']) if alert_data.get('value') is not None else None,
                     acknowledged=alert_data.get('acknowledged', False),
                     resolved=alert_data.get('resolved', False),
@@ -992,7 +1016,7 @@ class DigitalTwinApp:
                 query = query.order_by(Alert.timestamp.desc()).limit(limit)
                 results = query.all()
 
-            data_list = [r.to_dict() for r in results]
+            data_list = [r.to_dict() for r in results] # Converts datetime to ISO string
             self.logger.info(f"Fetched recent alerts from DB", count=len(results))
             self.cache.set(cache_key, data_list, ttl=30) # Cache for 30 seconds
             return data_list
@@ -1011,7 +1035,7 @@ class DigitalTwinApp:
                         alert.metadata = json.dumps({ # Add ack info to metadata
                             **(json.loads(alert.metadata) if alert.metadata else {}),
                             "acknowledged_by": user_id,
-                            "acknowledged_at": datetime.utcnow().isoformat()
+                            "acknowledged_at": datetime.now(timezone.utc).isoformat() # Use UTC
                         })
                         self.logger.info(f"Alert acknowledged in DB", alert_id=alert_id, user_id=user_id)
                         # Invalidate cache
@@ -1027,11 +1051,16 @@ class DigitalTwinApp:
             self.logger.error(f"DB Acknowledge error", alert_id=alert_id, error=str(e), exc_info=True)
             return False
 
+
+    # --- UPDATED: create_user_sqlalchemy ---
     def create_user_sqlalchemy(self, username: str, password: str, email: Optional[str] = None) -> bool:
-        """Creates a new user with SQLAlchemy"""
-        # Validation moved to the route using Marshmallow
-        password_hash = generate_password_hash(password)
+        """Creates a new user with bcrypt hashed password"""
         try:
+            # Hash password using bcrypt
+            password_bytes = password.encode('utf-8')
+            salt = bcrypt.gensalt()
+            password_hash = bcrypt.hashpw(password_bytes, salt).decode('utf-8') # Store hash as string
+
             with get_session() as session:
                 existing_user = session.query(User).filter(
                     (func.lower(User.username) == func.lower(username)) |
@@ -1041,32 +1070,44 @@ class DigitalTwinApp:
                 if existing_user:
                     self.logger.warning(f"User creation failed: Username or email already exists.", username=username, email=email)
                     return False
-                
+
                 # Role will be set to 'user' by default from the model
                 new_user = User(username=username, password_hash=password_hash, email=email)
                 session.add(new_user)
 
-            self.logger.info(f"User created successfully via SQLAlchemy.", username=username)
+            self.logger.info(f"User created successfully via SQLAlchemy (bcrypt).", username=username)
             return True
         except SQLAlchemyError as e:
             self.logger.error(f"Error creating user via SQLAlchemy", username=username, error=str(e), exc_info=True)
             return False
+        except Exception as e: # Catch potential bcrypt errors
+             self.logger.error(f"Error hashing password during user creation", username=username, error=str(e), exc_info=True)
+             return False
 
+
+    # --- UPDATED: authenticate_user_sqlalchemy ---
     def authenticate_user_sqlalchemy(self, username: str, password: str) -> Optional[User]:
-        """Authenticates a user using SQLAlchemy, returns User object on success."""
+        """Authenticates a user using bcrypt"""
         try:
             with get_session() as session:
                 user = session.query(User).filter(func.lower(User.username) == func.lower(username)).first()
 
-            if user and check_password_hash(user.password_hash, password):
-                self.logger.info(f"User authenticated successfully via SQLAlchemy.", username=username)
-                return user
+            if user and user.password_hash:
+                password_bytes = password.encode('utf-8')
+                stored_hash_bytes = user.password_hash.encode('utf-8')
+                # Check password using bcrypt
+                if bcrypt.checkpw(password_bytes, stored_hash_bytes):
+                    self.logger.info(f"User authenticated successfully via SQLAlchemy (bcrypt).", username=username)
+                    return user
 
-            self.logger.warning(f"Authentication failed via SQLAlchemy.", username=username)
+            self.logger.warning(f"Authentication failed via SQLAlchemy (bcrypt).", username=username)
             return None
         except SQLAlchemyError as e:
             self.logger.error(f"Error authenticating user via SQLAlchemy", username=username, error=str(e), exc_info=True)
             return None
+        except Exception as e: # Catch potential bcrypt errors
+             self.logger.error(f"Error checking password during authentication", username=username, error=str(e), exc_info=True)
+             return None
 
     # ==================== ROUTES ====================
 
@@ -1086,7 +1127,9 @@ class DigitalTwinApp:
                 'registrations_total', 'Total number of registrations',
                  labels={'status': lambda r: 'success' if r.status_code == 201 else 'failure'}
             )
-            # You can add more metrics like histograms for request latency, etc.
+        else: # Dummy decorators if Prometheus not available
+            login_counter = lambda f: f
+            registration_counter = lambda f: f
 
         # ==================== AUTH ENDPOINTS (with Validation) ====================
 
@@ -1100,15 +1143,16 @@ class DigitalTwinApp:
             password = data['password']
             email = data['email']
 
+            # Use the updated method with bcrypt
             if self.create_user_sqlalchemy(username, password, email):
                 logger.info("User registration successful", username=username)
                 # Apply counter manually for success
-                if PROMETHEUS_AVAILABLE: registration_counter(lambda: Response(status=201)) # Dummy response for label
+                # if PROMETHEUS_AVAILABLE: registration_counter(lambda: Response(status=201))() # Execute dummy response
                 return jsonify({"message": "User registered successfully"}), 201
             else:
                 logger.warning("User registration failed in DB layer", username=username)
                 # Apply counter manually for failure
-                if PROMETHEUS_AVAILABLE: registration_counter(lambda: Response(status=409)) # Dummy response for label
+                # if PROMETHEUS_AVAILABLE: registration_counter(lambda: Response(status=409))() # Execute dummy response
                 return jsonify({"error": "Registration failed. Username or email may already exist."}), 409
 
         @self.app.route('/api/auth/login', methods=['POST'])
@@ -1120,44 +1164,98 @@ class DigitalTwinApp:
             username = data['username']
             password = data['password']
 
+            # Use the updated method with bcrypt
             user = self.authenticate_user_sqlalchemy(username, password)
 
             if not user:
                 logger.warning("Login failed: Invalid credentials", username=username)
                 # Apply counter manually for failure
-                if PROMETHEUS_AVAILABLE: login_counter(lambda: Response(status=401)) # Dummy response for label
+                # if PROMETHEUS_AVAILABLE: login_counter(lambda: Response(status=401))()
                 return jsonify({"error": "Invalid credentials"}), 401
-            
-            # --- NEW: Add role to JWT claims ---
+
+            # --- Add role to JWT claims ---
             additional_claims = {"role": user.role}
             access_token = create_access_token(identity=user.username, additional_claims=additional_claims)
+            # --- ENABLED: Add refresh token ---
+            refresh_token = create_refresh_token(identity=user.username)
 
-            response = jsonify(access_token=access_token, user=user.to_dict())
+            response = jsonify(
+                access_token=access_token, # Client-side can store this in memory
+                # refresh_token is in HttpOnly cookie, not body
+                user=user.to_dict()
+            )
 
-            # Set HttpOnly cookie
+            # Set HttpOnly cookie for access token
             set_access_cookies(response, access_token)
-            logger.info("Login successful, JWT cookie set", username=username, role=user.role)
+            # --- ENABLED: Set HttpOnly cookie for refresh token ---
+            set_refresh_cookies(response, refresh_token)
+
+            logger.info("Login successful, JWT access and refresh cookies set", username=username, role=user.role)
 
             # Apply counter manually for success
-            if PROMETHEUS_AVAILABLE: login_counter(lambda: Response(status=200)) # Dummy response for label
+            # if PROMETHEUS_AVAILABLE: login_counter(lambda: Response(status=200))()
+            return response, 200
+
+        # --- ENABLED: Refresh Token Endpoint ---
+        @self.app.route('/api/auth/refresh', methods=['POST'])
+        @jwt_required(refresh=True) # Requires a valid refresh token cookie
+        @limiter.limit("5 per minute")
+        def refresh():
+            # We already know the refresh token is valid thanks to @jwt_required(refresh=True)
+            current_user = get_jwt_identity()
+            
+            # Fetch user to get current role, in case roles changed
+            user = None
+            try:
+                with get_session() as session:
+                    user = session.query(User).filter(func.lower(User.username) == func.lower(current_user)).first()
+            except Exception as e:
+                logger.error("Could not fetch user during refresh", username=current_user, error=str(e))
+                return jsonify({"error": "Error verifying user"}), 500
+
+            if not user:
+                logger.warning("User not found during refresh", username=current_user)
+                return jsonify({"error": "User not found"}), 401
+
+            user_role = user.role
+            additional_claims = {"role": user_role}
+            
+            # Create a new access token
+            new_access_token = create_access_token(identity=current_user, additional_claims=additional_claims)
+            
+            # Send back the new access token
+            # The client-side app will receive this and should store it (e.g., in memory)
+            response = jsonify(access_token=new_access_token)
+            
+            # Set the new access token in the cookie as well
+            set_access_cookies(response, new_access_token)
+            
+            logger.info("Access token refreshed", username=current_user, role=user_role)
             return response, 200
 
         @self.app.route('/api/auth/logout', methods=['POST'])
         def logout():
             # No validation needed
-            current_user = get_jwt_identity() # Get identity before clearing
+            current_user = None
+            try:
+                 # Verify token to log who is logging out
+                 verify_jwt_in_request(optional=True) 
+                 current_user = get_jwt_identity()
+            except Exception:
+                 pass # Ignore if token is invalid/expired
+                 
             response = jsonify({"message": "Logout successful"})
-            unset_jwt_cookies(response) # Clear cookies
+            unset_jwt_cookies(response) # Clear access AND refresh cookies
             logger.info("User logged out", username=current_user or "Unknown")
             # TODO: Add token to blocklist if using JWT blocklisting
             return response, 200
 
         @self.app.route('/api/auth/me')
-        @jwt_required() # Ensures JWT is valid (either header or cookie)
+        @jwt_required() # Ensures access token is valid (either header or cookie)
         @limiter.limit("120 per minute")
         def protected():
             current_user_identity = get_jwt_identity()
-            # --- NEW: Get role from claims ---
+            # --- Get role from claims ---
             claims = get_jwt()
             user_role = claims.get('role', 'user')
 
@@ -1205,6 +1303,7 @@ class DigitalTwinApp:
             redis_ok = self.cache.available if self.cache else False
             celery_ok = False
             try:
+                # Use engine directly for simple check
                 with engine.connect() as connection: db_ok = True
             except Exception as e: logger.error(f"Health check DB failed", error=str(e))
             if self.celery:
@@ -1238,18 +1337,10 @@ class DigitalTwinApp:
             if not PROMETHEUS_AVAILABLE or not self.metrics:
                 return jsonify({"message": "Prometheus exporter not available."}), 503
             # The exporter handles generating the response automatically
-            # We don't need to call generate_latest() explicitly if using PrometheusMetrics
-            # This endpoint is automatically registered by the extension.
-            # However, if we need custom metrics not auto-instrumented:
-            # from prometheus_client import generate_latest, REGISTRY
-            # Add custom metric collection logic here if needed
-            # return Response(generate_latest(REGISTRY), mimetype='text/plain')
             logger.debug("Serving Prometheus metrics")
             return Response("", mimetype='text/plain') # Let the middleware handle it
 
 
-        # ... (Other API endpoints like /api/dashboard, /api/devices, etc. remain largely the same) ...
-        # Ensure @jwt_required() is uncommented for production where needed.
         @self.app.route('/api/dashboard')
         @jwt_required()
         @limiter.limit("60 per minute")
@@ -1270,7 +1361,8 @@ class DigitalTwinApp:
                     avg_efficiency = latest_devices_df['efficiency_score'].dropna().mean() * 100 if not latest_devices_df['efficiency_score'].dropna().empty else 0
                     status_counts = latest_devices_df['status'].value_counts().to_dict()
                     status_distribution = { 'normal': status_counts.get('normal', 0), 'warning': status_counts.get('warning', 0), 'critical': status_counts.get('critical', 0), 'offline': status_counts.get('offline', 0) }
-                    energy_usage = latest_devices_df[latest_devices_df['device_type']=='power_meter']['value'].sum() / 1000
+                    energy_usage_df = latest_devices_df[latest_devices_df['device_type']=='power_meter']['value']
+                    energy_usage = energy_usage_df.sum() / 1000.0 if not energy_usage_df.empty else 0.0 # Convert W to kW
 
                     overview_data = {
                         'systemHealth': round(avg_health),
@@ -1278,16 +1370,32 @@ class DigitalTwinApp:
                         'totalDevices': total_devices,
                         'efficiency': round(avg_efficiency),
                         'energyUsage': round(energy_usage, 1),
-                        'energyCost': round(energy_usage * 24 * 0.12),
+                        'energyCost': round(energy_usage * 24 * 0.12), # Assuming $0.12/kWh
                         'statusDistribution': status_distribution,
-                        'timestamp': datetime.utcnow().isoformat()
+                        'timestamp': datetime.now(timezone.utc).isoformat()
                     }
+
+                # Generate dummy performance data
+                perf_data = []
+                if 'systemHealth' in overview_data and 'efficiency' in overview_data:
+                     base_health = overview_data['systemHealth']
+                     base_eff = overview_data['efficiency']
+                     now = datetime.now(timezone.utc)
+                     for i in range(24): # Last 24 hours
+                         ts = now - timedelta(hours=i)
+                         perf_data.append({
+                             'timestamp': ts.isoformat(),
+                             'systemHealth': max(0, min(100, base_health + random.uniform(-2, 2) - i*0.1)),
+                             'efficiency': max(0, min(100, base_eff + random.uniform(-1, 1) - i*0.05)),
+                             'energyUsage': max(0, overview_data.get('energyUsage', 0) * (1 + random.uniform(-0.1, 0.1) - i*0.01))
+                         })
+                     perf_data.reverse() # Oldest first
 
                 dashboard_payload = {
                     **overview_data,
                     'devices': latest_devices_df.to_dict('records')[:100],
                     'alerts': recent_alerts,
-                    'performanceData': self.app._generate_dummy_performance_data(overview_data.get('systemHealth', 80), overview_data.get('efficiency', 85))
+                    'performanceData': perf_data
                 }
                 self.cache.set(cache_key, dashboard_payload, ttl=30)
                 return jsonify(dashboard_payload)
@@ -1346,20 +1454,30 @@ class DigitalTwinApp:
         @self.app.route('/api/alerts/acknowledge/<string:alert_id>', methods=['POST'])
         @jwt_required()
         @limiter.limit("30 per minute")
-        @self.csrf.exempt # Exempt if using header-based JWT primarily, or ensure CSRF token is sent
+        # @self.csrf.exempt # Exempt if using header-based JWT primarily, or ensure CSRF token is sent
         def acknowledge_alert_api(alert_id):
             user_id = get_jwt_identity() # Get user from JWT
             success = self.acknowledge_alert_db(alert_id, user_id)
             if success:
+                updated_alert_data = None
                 with get_session() as session:
                     alert = session.query(Alert).filter(Alert.id == alert_id).first()
-                updated_alert_data = alert.to_dict() if alert else None
+                    if alert: updated_alert_data = alert.to_dict()
+
                 if self.socketio:
-                    self.socketio.emit('alert_acknowledged', {'alertId': alert_id, 'acknowledgedBy': user_id, 'timestamp': datetime.utcnow().isoformat()}, room='alerts')
+                    # Broadcast acknowledgment update
+                    self.socketio.emit('alert_acknowledged', {
+                        'alertId': alert_id,
+                        'acknowledgedBy': user_id,
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                        }, room='alerts') # Assuming an 'alerts' room
+
+                # Invalidate cache after successful DB update and broadcast
+                self.cache.clear_pattern("alerts:*")
                 return jsonify({"message": "Alert acknowledged", "alert": updated_alert_data}), 200
             else:
                 return jsonify({"error": "Failed to acknowledge alert or alert not found"}), 404
-        
+
         # --- Example Admin-Only Route ---
         @self.app.route('/api/admin/summary')
         @jwt_required()
@@ -1368,13 +1486,20 @@ class DigitalTwinApp:
         def get_admin_summary():
             """An example route only accessible to users with the 'admin' role."""
             logger.info("Admin summary endpoint accessed", user=get_jwt_identity())
-            # In a real app, you'd fetch sensitive summary data here
-            return jsonify({
-                "message": "Welcome, Admin!",
-                "total_users": session.query(User).count(),
-                "total_devices": session.query(DeviceData.device_id).distinct().count(),
-                "connected_clients": len(self.connected_clients)
-            })
+            try:
+                with get_session() as session:
+                     user_count = session.query(User).count()
+                     device_count = session.query(DeviceData.device_id).distinct().count()
+                return jsonify({
+                    "message": "Welcome, Admin!",
+                    "total_users": user_count,
+                    "total_devices": device_count,
+                    "connected_clients": len(self.connected_clients)
+                })
+            except Exception as e:
+                logger.error("Error fetching admin summary", error=str(e), exc_info=True)
+                return jsonify({"error": "Failed to fetch admin summary"}), 500
+
 
         # --- Placeholders ---
         @self.app.route('/api/predictions')
@@ -1383,25 +1508,89 @@ class DigitalTwinApp:
         def get_predictions():
             device_id = request.args.get('device_id')
             if not device_id: return jsonify({"error": "device_id query parameter is required"}), 400
-            # TODO: Implement
+            # TODO: Integrate with PredictiveAnalyticsEngine.predict_failure(...) etc.
             logger.info("Serving predictions (placeholder)", device_id=device_id)
-            return jsonify({"message": f"Predictions for {device_id} (not implemented)", "device_id": device_id}), 501
+            # Example using engine if available
+            if self.analytics_engine:
+                 # Fetch recent data for the device to feed the model
+                 try:
+                     with get_session() as session:
+                         recent_data_db = session.query(DeviceData).filter(DeviceData.device_id == device_id).order_by(DeviceData.timestamp.desc()).limit(50).all() # Fetch enough for features
+                     if not recent_data_db: return jsonify({"message": f"No recent data for {device_id}", "device_id": device_id}), 404
+                     recent_data_df = pd.DataFrame([d.to_dict() for d in recent_data_db])
+
+                     # Call prediction methods (assuming they take DataFrame)
+                     anomaly_pred = self.analytics_engine.detect_anomalies(recent_data_df)
+                     failure_pred = self.analytics_engine.predict_failure(recent_data_df)
+
+                     return jsonify({
+                         "device_id": device_id,
+                         "anomaly_prediction": anomaly_pred,
+                         "failure_prediction": failure_pred
+                     })
+                 except Exception as e:
+                    logger.error("Error generating predictions", device_id=device_id, error=str(e), exc_info=True)
+                    return jsonify({"error": "Prediction generation failed"}), 500
+            else:
+                 return jsonify({"message": f"Predictions for {device_id} (engine unavailable)", "device_id": device_id}), 501
+
 
         @self.app.route('/api/health_scores')
         @jwt_required()
         @limiter.limit("60 per minute")
         def get_health_scores():
-            # TODO: Implement
+            # TODO: Integrate with HealthScoreCalculator.calculate_fleet_health_score(...)
             logger.info("Serving health scores (placeholder)")
-            return jsonify({"message": "Health scores (not implemented)"}), 501
+            if self.health_calculator:
+                try:
+                    latest_devices_df = self.get_latest_device_data(limit=500)
+                    if latest_devices_df.empty:
+                        return jsonify({}), 200 # Return empty if no devices
+
+                    # Group data by device_id for fleet calculation
+                    fleet_data = {
+                        device_id: group_df
+                        for device_id, group_df in latest_devices_df.groupby('device_id')
+                    }
+                    fleet_health = self.health_calculator.calculate_fleet_health_score(fleet_data)
+                    # Return only the device_id -> health score mapping for simplicity
+                    scores_only = {
+                         dev_id: result.get('overall_score')
+                         for dev_id, result in fleet_health.get('device_results', {}).items()
+                         if not result.get('error')
+                    }
+                    return jsonify(scores_only), 200
+                except Exception as e:
+                     logger.error("Error calculating health scores", error=str(e), exc_info=True)
+                     return jsonify({"error": "Health score calculation failed"}), 500
+            else:
+                 return jsonify({"message": "Health scores (engine unavailable)"}), 501
+
 
         @self.app.route('/api/recommendations')
         @jwt_required()
         @limiter.limit("30 per minute")
         def get_recommendations():
-            # TODO: Implement
+            # TODO: Integrate with RecommendationEngine.generate_recommendations(...)
             logger.info("Serving recommendations (placeholder)")
-            return jsonify({"message": "Recommendations (not implemented)"}), 501
+            if self.recommendation_engine:
+                 try:
+                      # Generate recommendations based on current state (needs health data, etc.)
+                      # This is a simplified example; a real implementation needs more context.
+                      health_data_mock = {'overall_score': 0.8} # Mock data
+                      recs = self.recommendation_engine.generate_recommendations(health_data=health_data_mock)
+                      # Flatten the recommendations for the API
+                      flat_recs = []
+                      for cat in ['emergency', 'maintenance', 'optimization', 'operational', 'preventive']:
+                           flat_recs.extend(recs.get(f'{cat}_recommendations', []))
+                      flat_recs.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+                      return jsonify(flat_recs[:10]), 200 # Return top 10
+                 except Exception as e:
+                      logger.error("Error generating recommendations", error=str(e), exc_info=True)
+                      return jsonify({"error": "Recommendation generation failed"}), 500
+            else:
+                 return jsonify({"message": "Recommendations (engine unavailable)"}), 501
+
 
         @self.app.route('/api/system_metrics')
         @jwt_required()
@@ -1420,7 +1609,8 @@ class DigitalTwinApp:
             if not self.celery: return jsonify({"error": "Async task runner not available"}), 503
             try:
                 user_id = get_jwt_identity()
-                task = generate_report_task.delay(user_id=user_id) # Pass context if needed
+                # Ensure the task name matches the one defined with @celery_app.task
+                task = celery_app.send_task('digital_twin.generate_report', args=[user_id])
                 logger.info(f"Dispatched generate_report_task", task_id=task.id, user_id=user_id)
                 return jsonify({"task_id": task.id, "status": "PENDING"}), 202
             except Exception as e:
@@ -1433,16 +1623,23 @@ class DigitalTwinApp:
         def get_task_status(task_id):
             if not self.celery: return jsonify({"error": "Async task runner not available"}), 503
             try:
-                task_result = generate_report_task.AsyncResult(task_id)
-                response = {'task_id': task_id, 'status': task_result.status, 'result': task_result.result if task_result.ready() else None}
-                if task_result.failed():
-                    response['error'] = str(task_result.result)
-                    logger.warning(f"Task failed", task_id=task_id, error=str(task_result.result), traceback=task_result.traceback)
-                logger.debug("Checked task status", task_id=task_id, status=response['status'])
-                return jsonify(response)
+                 # Use AsyncResult from the specific task if possible, otherwise use celery_app
+                 task_result = celery_app.AsyncResult(task_id) # Generic way
+                 # task_result = generate_report_task.AsyncResult(task_id) # Specific way if task is imported
+
+                 response = {'task_id': task_id, 'status': task_result.status}
+                 if task_result.ready():
+                     if task_result.successful():
+                         response['result'] = task_result.result
+                     else:
+                         response['error'] = str(task_result.result)
+                         logger.warning(f"Task failed", task_id=task_id, error=str(task_result.result), traceback=task_result.traceback)
+                 logger.debug("Checked task status", task_id=task_id, status=response['status'])
+                 return jsonify(response)
             except Exception as e:
                 logger.error(f"Failed to get task status", task_id=task_id, error=str(e), exc_info=True)
                 return jsonify({"error": "Failed to retrieve task status"}), 500
+
 
         # --- Static File Serving ---
         @self.app.route('/reports/<path:filename>')
@@ -1454,7 +1651,12 @@ class DigitalTwinApp:
                 logger.error(f"Reports directory not found", directory=str(reports_dir))
                 return "Reports directory configuration error", 500
             try:
-                return send_from_directory(reports_dir, filename, as_attachment=False)
+                # Security: Ensure filename is safe
+                safe_filename = Path(filename).name # Basic sanitization
+                if safe_filename != filename:
+                    logger.warning("Potential path traversal detected in report request", filename=filename)
+                    return "Invalid filename", 400
+                return send_from_directory(reports_dir, safe_filename, as_attachment=False)
             except FileNotFoundError:
                 logger.warning(f"Report file not found", filename=filename)
                 return "Report not found", 404
@@ -1468,7 +1670,12 @@ class DigitalTwinApp:
                 logger.error(f"Exports directory not found", directory=str(exports_dir))
                 return "Exports directory configuration error", 500
             try:
-                return send_from_directory(exports_dir, filename, as_attachment=True)
+                # Security: Ensure filename is safe
+                safe_filename = Path(filename).name # Basic sanitization
+                if safe_filename != filename:
+                    logger.warning("Potential path traversal detected in export request", filename=filename)
+                    return "Invalid filename", 400
+                return send_from_directory(exports_dir, safe_filename, as_attachment=True)
             except FileNotFoundError:
                 logger.warning(f"Export file not found", filename=filename)
                 return "Export not found", 404
@@ -1477,7 +1684,6 @@ class DigitalTwinApp:
 
 
     # ==================== WEBSOCKET EVENTS ====================
-    # (No major changes needed, added JWT verification example)
 
     def _setup_websocket_events(self):
         """Setup optimized WebSocket events with authentication"""
@@ -1485,50 +1691,75 @@ class DigitalTwinApp:
             self.logger.warning("SocketIO not initialized, skipping WebSocket event setup.")
             return
 
-        # --- NEW: SocketIO Middleware for JWT Auth ---
+        # --- UPDATED: SocketIO Middleware for JWT Auth (from Cookie OR Header) ---
         @self.socketio.on('connect')
         def handle_connect_auth():
-            auth = request.args.get('token') # Or read from request.headers if preferred
-            if not auth:
-                logger.warning("WS connection attempt without token")
-                return False # Reject connection
-
+            # Try to verify JWT from cookie first (preferred for browsers)
             try:
-                # Use flask_jwt_extended to verify the token
-                # --- NEW: Extract claims and pass to handler ---
-                payload = decode_token(auth)
-                user_id = payload.get('sub')
-                user_role = payload.get('role', 'user') # Get role, default to 'user'
-                logger.info("WS connection authenticated", sid=request.sid, user_id=user_id, role=user_role)
+                # We only check for the *access* token cookie here for the initial connection
+                verify_jwt_in_request(locations=['cookies'])
+                claims = get_jwt()
+                user_id = claims.get('sub')
+                user_role = claims.get('role', 'user')
+                logger.info("WS connection authenticated via Cookie", sid=request.sid, user_id=user_id, role=user_role)
                 handle_connect(identity=user_id, role=user_role) # Pass identity and role
                 return True
-            except (ExpiredSignatureError, DecodeError, InvalidTokenError) as e:
-                logger.warning("WS authentication failed", error=str(e), sid=request.sid)
-                return False # Reject connection
-            except Exception as e:
-                logger.error("Unexpected error during WS auth", error=str(e), exc_info=True)
-                return False
+            except Exception as cookie_err:
+                logger.debug(f"WS Cookie auth failed: {cookie_err}. Trying header/query param.")
+                # If cookie fails, try header or query parameter (e.g., from mobile clients)
+                auth_header = request.headers.get('Authorization')
+                token = None
+                if auth_header and auth_header.startswith('Bearer '):
+                    token = auth_header.split(' ')[1]
+                else:
+                    # Fallback to query parameter (less secure, use with caution)
+                    token = request.args.get('token')
+
+                if not token:
+                    logger.warning("WS connection attempt without valid token (Cookie/Header/Query)")
+                    return False # Reject connection
+
+                try:
+                    # Decode using app's JWT secret key
+                    secret = current_app.config['JWT_SECRET_KEY']
+                    payload = decode_token(token) # Use decode_token for flexibility
+                    user_id = payload.get('sub')
+                    user_role = payload.get('role', 'user')
+
+                    if not user_id:
+                        logger.warning("Invalid token payload (missing 'sub')")
+                        return False
+
+                    logger.info("WS connection authenticated via Header/Query", sid=request.sid, user_id=user_id, role=user_role)
+                    handle_connect(identity=user_id, role=user_role) # Pass identity and role
+                    return True
+                except (ExpiredSignatureError, DecodeError, InvalidTokenError) as e:
+                    logger.warning("WS Header/Query authentication failed", error=str(e), sid=request.sid)
+                    return False # Reject connection
+                except Exception as e:
+                    logger.error("Unexpected error during WS Header/Query auth", error=str(e), exc_info=True)
+                    return False
 
         # Original connect handler (now called after auth success)
-        # @self.socketio.on('connect') - This decorator is removed, handled by handle_connect_auth
-        def handle_connect(identity: str = "anonymous", role: str = "user"): # NEW: Accept args
+        def handle_connect(identity: str = "anonymous", role: str = "user"): # Accept args
             client_id = request.sid
             self.connected_clients[client_id] = {
-                'connected_at': datetime.utcnow(),
-                'last_ping': datetime.utcnow(),
-                'identity': identity, # NEW: Store identity
-                'role': role,       # NEW: Store role
+                'connected_at': datetime.now(timezone.utc),
+                'last_ping': datetime.now(timezone.utc),
+                'identity': identity, # Store identity
+                'role': role,       # Store role
                 'subscriptions': set()
             }
             logger.info(f"Client connected details stored", sid=client_id, identity=identity, role=role, total_clients=len(self.connected_clients))
             initial_data = self.cache.get('dashboard_combined_data')
             if initial_data:
-                emit('dashboard_update', initial_data)
+                emit('dashboard_update', initial_data) # Send initial state
 
 
         @self.socketio.on('disconnect')
         def handle_disconnect():
-            client_id = request.sid
+            """Handle client disconnection."""
+            client_id = request.sid # <-- Get sid directly
             if client_id in self.connected_clients:
                 identity = self.connected_clients[client_id].get('identity', 'anonymous')
                 subs = self.connected_clients[client_id].get('subscriptions', set())
@@ -1538,20 +1769,26 @@ class DigitalTwinApp:
             else:
                 logger.info("Untracked client disconnected", sid=client_id)
 
-        # ... (ping, subscribe, unsubscribe handlers remain the same) ...
         @self.socketio.on('ping_from_client')
         def handle_ping():
             client_id = request.sid
             if client_id in self.connected_clients:
-                self.connected_clients[client_id]['last_ping'] = datetime.utcnow()
-                emit('pong_from_server', {'timestamp': datetime.utcnow().isoformat()})
+                self.connected_clients[client_id]['last_ping'] = datetime.now(timezone.utc)
+                emit('pong_from_server', {'timestamp': datetime.now(timezone.utc).isoformat()})
 
         @self.socketio.on('subscribe')
         def handle_subscribe(data):
             client_id = request.sid
-            if client_id not in self.connected_clients: return
+            if client_id not in self.connected_clients: return # Ignore unsubscribed clients
             try:
                 room_name = data.get('room')
+                # Optional: Add RBAC check here - can user subscribe to this room?
+                # user_role = self.connected_clients[client_id].get('role', 'user')
+                # if room_name == 'admin_only' and user_role != 'admin':
+                #    logger.warning("Subscription denied", sid=client_id, room=room_name, role=user_role)
+                #    emit('error', {'message': 'Permission denied for this room'})
+                #    return
+
                 if room_name:
                     self._join_room_internal(client_id, room_name)
                     emit('subscribed', {'room': room_name})
@@ -1578,7 +1815,6 @@ class DigitalTwinApp:
 
         self.logger.info("WebSocket event handlers setup.")
 
-    # ... (Internal room helpers remain the same) ...
     def _join_room_internal(self, client_id, room_name):
         join_room(room_name, sid=client_id)
         self.rooms[room_name].add(client_id)
@@ -1597,39 +1833,46 @@ class DigitalTwinApp:
 
     def _start_background_tasks(self):
         """Start background tasks (Data generation). Celery Beat handles scheduled tasks."""
-        self.logger.info("Starting background data generation task...")
+        self.logger.info("Setting up background data generation task...")
 
         # Data Generation/Update Task (still useful for simulation/dev)
         def data_update_task():
-            # (Remains the same as before) ...
             logger.info("Background data update task started.")
             last_cache_update = time.monotonic()
             while True:
                 try:
-                    if self.data_generator:
+                    # Get app instance within the greenlet/thread
+                    current_app_instance = current_app.extensions.get("digital_twin_instance")
+                    if not current_app_instance:
+                         logger.error("Could not get DigitalTwinApp instance in data_update_task")
+                         eventlet.sleep(60)
+                         continue
+
+                    # Use instance attributes
+                    if current_app_instance.data_generator:
                         new_data_list = []
-                        if not getattr(self.data_generator, 'devices', None):
-                            self.data_generator.setup_simulation(device_count=25)
-                        sim_time = datetime.utcnow()
-                        for device_meta in self.data_generator.devices:
-                            reading = self.data_generator._generate_single_reading(device_meta, sim_time, 0)
+                        if not getattr(current_app_instance.data_generator, 'devices', None):
+                            current_app_instance.data_generator.setup_simulation(device_count=25)
+                        sim_time = datetime.now(timezone.utc)
+                        for device_meta in current_app_instance.data_generator.devices:
+                            reading = current_app_instance.data_generator._generate_single_reading(device_meta, pd.Timestamp(sim_time), 0)
                             new_data_list.append(reading)
                         if new_data_list:
-                                self.bulk_insert_device_data(new_data_list)
+                                current_app_instance.bulk_insert_device_data(new_data_list)
                                 latest_df = pd.DataFrame(new_data_list)
                         else: latest_df = pd.DataFrame()
-                    else: latest_df = self.get_latest_device_data(limit=100)
+                    else: latest_df = current_app_instance.get_latest_device_data(limit=100)
 
                     if not latest_df.empty:
-                        if self.alert_manager: self._check_and_send_alerts(latest_df)
+                        if current_app_instance.alert_manager: current_app_instance._check_and_send_alerts(latest_df)
                         current_time = time.monotonic()
                         if current_time - last_cache_update > 5:
                             logger.debug("Updating dashboard cache and broadcasting...")
-                            dashboard_payload = self._create_dashboard_payload(latest_df)
-                            self.cache.set('dashboard_combined_data', dashboard_payload, ttl=30)
-                            self.cache.set('latest_devices:500', latest_df.to_dict('records'), ttl=60)
-                            if self.socketio:
-                                    self.socketio.emit('dashboard_update', dashboard_payload, room='dashboard_updates')
+                            dashboard_payload = current_app_instance._create_dashboard_payload(latest_df)
+                            current_app_instance.cache.set('dashboard_combined_data', dashboard_payload, ttl=30)
+                            current_app_instance.cache.set('latest_devices:500', latest_df.to_dict('records'), ttl=60)
+                            if current_app_instance.socketio:
+                                    current_app_instance.socketio.emit('dashboard_update', dashboard_payload, room='dashboard_updates') # Assume a room
                             last_cache_update = current_time
                         else: logger.debug("Skipping cache update/broadcast (too soon).")
 
@@ -1640,6 +1883,8 @@ class DigitalTwinApp:
                     eventlet.sleep(10)
 
         if self.socketio and get_optional_env('ENABLE_DATA_GENERATOR', 'False').lower() == 'true':
+            # Store the app instance for the background task to access
+            self.app.extensions["digital_twin_instance"] = self
             self.socketio.start_background_task(data_update_task)
             self.logger.info("Data generator background task started.")
         elif not self.socketio:
@@ -1647,8 +1892,6 @@ class DigitalTwinApp:
         else:
             logger.info("Data generator background task is disabled (ENABLE_DATA_GENERATOR not true).")
 
-        # APScheduler setup removed
-        # self._setup_periodic_tasks() # REMOVED
 
     # ==================== CELERY TASKS (moved from bottom) ====================
     # Item 5: Define Celery tasks for scheduled jobs
@@ -1657,7 +1900,6 @@ class DigitalTwinApp:
     @celery_app.task(bind=True, name='digital_twin.cleanup_inactive_clients')
     def cleanup_inactive_clients_task(self):
         """Celery task to cleanup inactive WebSocket clients."""
-        # Need app context - ContextTask handles this
         app_instance = current_app.extensions.get("digital_twin_instance")
         if not app_instance:
             logger.error("Could not get DigitalTwinApp instance in Celery task")
@@ -1689,7 +1931,7 @@ class DigitalTwinApp:
         logger.info("Running scheduled model retraining via Celery...")
         try:
             # The retrain_models method handles data fetching internally now
-            result = app_instance.analytics_engine.retrain_models()
+            result = app_instance.analytics_engine.retrain_models() # Call directly
             logger.info(f"Model retraining task completed.", result_status=result.get('status'))
             return {'status': 'SUCCESS', 'retraining_result': result}
         except Exception as e:
@@ -1697,11 +1939,9 @@ class DigitalTwinApp:
             self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
             raise
 
-    # Other Celery tasks (generate_report_task, export_data_task) remain the same
 
     # ==================== HELPER METHODS ====================
-    # (No changes needed for helpers like _create_dashboard_payload, etc.)
-    # ... (_check_and_send_alerts, _get_system_metrics remain the same) ...
+    # (Methods remain the same)
     def _create_dashboard_payload(self, latest_devices_df: pd.DataFrame) -> Dict:
         """Helper to create the consistent dashboard data payload."""
         overview_data = {}
@@ -1712,7 +1952,8 @@ class DigitalTwinApp:
             avg_efficiency = latest_devices_df['efficiency_score'].dropna().mean() * 100 if not latest_devices_df['efficiency_score'].dropna().empty else 0
             status_counts = latest_devices_df['status'].value_counts().to_dict()
             status_distribution = { 'normal': status_counts.get('normal', 0), 'warning': status_counts.get('warning', 0), 'critical': status_counts.get('critical', 0), 'offline': status_counts.get('offline', 0) }
-            energy_usage = latest_devices_df[latest_devices_df['device_type']=='power_meter']['value'].sum() / 1000
+            energy_usage_df = latest_devices_df[latest_devices_df['device_type']=='power_meter']['value']
+            energy_usage = energy_usage_df.sum() / 1000.0 if not energy_usage_df.empty else 0.0 # Convert W to kW
 
             overview_data = {
                 'systemHealth': round(avg_health),
@@ -1720,16 +1961,32 @@ class DigitalTwinApp:
                 'totalDevices': total_devices,
                 'efficiency': round(avg_efficiency),
                 'energyUsage': round(energy_usage, 1),
-                'energyCost': round(energy_usage * 24 * 0.12),
+                'energyCost': round(energy_usage * 24 * 0.12), # Assuming $0.12/kWh
                 'statusDistribution': status_distribution,
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.now(timezone.utc).isoformat()
             }
         recent_alerts = self.get_recent_alerts(limit=20, acknowledged=False)
+        # Generate dummy performance data
+        perf_data = []
+        if 'systemHealth' in overview_data and 'efficiency' in overview_data:
+             base_health = overview_data['systemHealth']
+             base_eff = overview_data['efficiency']
+             now = datetime.now(timezone.utc)
+             for i in range(24): # Last 24 hours
+                 ts = now - timedelta(hours=i)
+                 perf_data.append({
+                     'timestamp': ts.isoformat(),
+                     'systemHealth': max(0, min(100, base_health + random.uniform(-2, 2) - i*0.1)),
+                     'efficiency': max(0, min(100, base_eff + random.uniform(-1, 1) - i*0.05)),
+                     'energyUsage': max(0, overview_data.get('energyUsage', 0) * (1 + random.uniform(-0.1, 0.1) - i*0.01))
+                 })
+             perf_data.reverse() # Oldest first
+
         return {
             **overview_data,
             'devices': latest_devices_df.to_dict('records')[:100],
             'alerts': recent_alerts,
-            'performanceData': self.app._generate_dummy_performance_data(overview_data.get('systemHealth', 80), overview_data.get('efficiency', 85))
+            'performanceData': perf_data
         }
 
     def _check_and_send_alerts(self, devices_df: pd.DataFrame):
@@ -1739,22 +1996,26 @@ class DigitalTwinApp:
         try:
             for _, device_row in devices_df.iterrows():
                 device_data = device_row.to_dict()
+                # Ensure timestamp is string for alert manager if needed
                 if isinstance(device_data.get('timestamp'), datetime): device_data['timestamp'] = device_data['timestamp'].isoformat()
                 triggered = self.alert_manager.evaluate_conditions(data=device_data, device_id=device_data.get('device_id'))
                 if triggered: all_triggered_alerts.extend(triggered)
+
             if all_triggered_alerts:
                 alerts_inserted = sum(1 for alert in all_triggered_alerts if self.insert_alert(alert))
                 if alerts_inserted > 0: logger.info(f"Inserted new alerts into DB.", count=alerts_inserted)
+
                 logger.info(f"Broadcasting triggered alerts...", count=len(all_triggered_alerts))
                 for alert in all_triggered_alerts:
-                    if isinstance(alert.get('timestamp'), datetime): alert['timestamp'] = alert['timestamp'].isoformat()
-                    self.socketio.emit('alert_update', alert, room='alerts')
+                     # Ensure timestamp is string before emitting
+                     if isinstance(alert.get('timestamp'), datetime): alert['timestamp'] = alert['timestamp'].isoformat()
+                     self.socketio.emit('alert_update', alert, room='alerts') # Assume alerts room
+
         except Exception as e:
             logger.error(f"Error checking/sending alerts", error=str(e), exc_info=True)
 
     def _get_system_metrics(self) -> Dict:
-        # (Remains the same)
-        metrics = {'timestamp': datetime.utcnow().isoformat(), 'cpu_percent': None, 'memory_percent': None, 'disk_percent': None, 'active_connections': len(self.connected_clients), 'cache_available': self.cache.available if self.cache else False, 'database_available': self.db_available, 'celery_available': CELERY_AVAILABLE}
+        metrics = {'timestamp': datetime.now(timezone.utc).isoformat(), 'cpu_percent': None, 'memory_percent': None, 'disk_percent': None, 'active_connections': len(self.connected_clients), 'cache_available': self.cache.available if self.cache else False, 'database_available': self.db_available, 'celery_available': CELERY_AVAILABLE}
         try:
             import psutil
             metrics['cpu_percent'] = psutil.cpu_percent(interval=0.1)
@@ -1764,33 +2025,42 @@ class DigitalTwinApp:
         except Exception as e: logger.error(f"Error getting system metrics", error=str(e))
         return metrics
 
-    # --- REMOVED: _cleanup_inactive_clients (logic moved to Celery task) ---
     def _cleanup_inactive_clients_logic(self) -> int:
         """Internal logic for cleaning up inactive WebSocket clients."""
-        # This logic is now called by the Celery task
-        now = datetime.utcnow()
-        timeout = timedelta(minutes=int(get_optional_env('CLIENT_TIMEOUT_MINUTES', 5)))
+        now = datetime.now(timezone.utc)
+        # Use a shorter timeout, clients should send pings
+        timeout = timedelta(minutes=int(get_optional_env('CLIENT_TIMEOUT_MINUTES', 2)))
         disconnected_count = 0
-        inactive_sids = [
-            sid for sid, client_info in self.connected_clients.items()
-            if now - client_info.get('last_ping', now) > timeout
-        ]
+        inactive_sids = []
+
+        # Iterate safely over a copy of the keys
+        for sid, client_info in list(self.connected_clients.items()):
+            last_ping = client_info.get('last_ping', client_info.get('connected_at'))
+            # Ensure last_ping is timezone-aware if needed, though it should be UTC already
+            if isinstance(last_ping, str):
+                try: last_ping = datetime.fromisoformat(last_ping.replace('Z', '+00:00'))
+                except: last_ping = now - timedelta(days=1) # Treat invalid timestamp as very old
+
+            if now - last_ping > timeout:
+                inactive_sids.append(sid)
 
         for sid in inactive_sids:
             identity = self.connected_clients.get(sid, {}).get('identity', 'unknown')
             logger.warning(f"Disconnecting inactive client", sid=sid, identity=identity)
             if self.socketio:
-                # Ensure disconnect runs in the correct context if needed, or handle potential errors
                 try:
                     self.socketio.disconnect(sid, silent=True) # silent=True prevents disconnect event loop
                 except Exception as e:
                     logger.error("Error during socketio disconnect", sid=sid, error=str(e))
-            # Clean up internal state immediately, don't rely on disconnect handler which might not run
+            # Clean up internal state immediately
             if sid in self.connected_clients:
                 subs = self.connected_clients[sid].get('subscriptions', set())
                 for room in list(subs): self._leave_room_internal(sid, room)
-                del self.connected_clients[sid]
-            disconnected_count += 1
+                try:
+                    del self.connected_clients[sid]
+                    disconnected_count += 1
+                except KeyError:
+                     pass # Already removed, perhaps by disconnect handler
 
         if disconnected_count > 0:
             logger.info(f"Cleaned up inactive client(s).", count=disconnected_count)
@@ -1820,10 +2090,19 @@ class DigitalTwinApp:
         def handle_db_exception(e):
             logger.error(f"Database error occurred", error=str(e), exc_info=True)
             return jsonify(error="Database operation failed"), 500
+        @app.errorhandler(ValidationError) # Handle Marshmallow validation errors
+        def handle_validation_error(error):
+             logger.warning("API Input Validation Error", errors=error.messages)
+             return jsonify({"error": "Validation failed", "messages": error.messages}), 400
         @app.errorhandler(Exception)
         def handle_exception(e):
+            # Log all other exceptions
             logger.error(f"Unhandled exception", error=str(e), exc_info=True)
-            return jsonify(error="An unexpected error occurred"), 500
+            # Avoid sending detailed internal errors to the client in production
+            error_message = "An unexpected error occurred"
+            if current_app.config.get('DEBUG'):
+                 error_message = str(e) # Show details in debug mode
+            return jsonify(error=error_message), 500
         logger.info("Error handlers registered.")
 
     def run(self, host='0.0.0.0', port=5000):
@@ -1844,9 +2123,6 @@ class DigitalTwinApp:
     def _shutdown(self):
         # (Remains the same, removed scheduler shutdown)
         logger.info("Initiating graceful shutdown...")
-        # if self.scheduler and self.scheduler.running: # REMOVED
-        #     try: self.scheduler.shutdown(); logger.info("APScheduler shut down.")
-        #     except Exception as e: logger.error(f"Error shutting down APScheduler", error=str(e))
         logger.info("Shutdown complete.")
 
 
@@ -1880,17 +2156,29 @@ def generate_report_task(self, user_id="system"): # Added user_id
     # ContextTask handles app context
     try:
         report_gen = HealthReportGenerator()
-        if not report_gen.db_manager:
-            report_gen.db_manager = SecureDatabaseManager()
+        # Need to ensure report_gen can access DB via SQLAlchemy sessions if needed
+        # E.g., pass the session factory or manage sessions within the generator
 
+        # Fetch data using SQLAlchemy within the task context
         with get_session() as session:
-            recent_data = session.query(DeviceData).filter(DeviceData.timestamp >= datetime.utcnow() - timedelta(days=7)).all()
-            report_data_df = pd.DataFrame([d.to_dict() for d in recent_data])
+            start_date = datetime.now(timezone.utc) - timedelta(days=7)
+            recent_data = session.query(DeviceData).filter(DeviceData.timestamp >= start_date).all()
+            report_data_list = [d.to_dict() for d in recent_data]
+
+        report_data_df = pd.DataFrame(report_data_list)
+        if not report_data_df.empty and 'timestamp' in report_data_df.columns:
+            report_data_df['timestamp'] = pd.to_datetime(report_data_df['timestamp']) # Convert ISO strings to datetime
 
         if report_data_df.empty:
             logger.warning("No data found for report generation.", task_id=self.request.id)
+            return {'status': 'SUCCESS', 'result': 'No data for report'}
 
-        report_path = report_gen.generate_comprehensive_report(data_df=report_data_df, date_range_days=7)
+        # Assuming generate_comprehensive_report now accepts DataFrame directly
+        report_path = report_gen.generate_comprehensive_report(
+             # Pass data as dict for compatibility or update generator
+             report_data={'devices': report_data_list},
+             date_range_days=7
+        )
         logger.info(f"Report generated by Celery task", task_id=self.request.id, report_path=report_path)
         return {'status': 'SUCCESS', 'report_path': str(report_path)}
     except Exception as e:
@@ -1906,15 +2194,15 @@ def export_data_task(self, format_type='json', date_range_days=7):
     try:
         export_dir = Path(get_optional_env('EXPORTS_DIR', 'EXPORTS'))
         export_dir.mkdir(parents=True, exist_ok=True)
-        timestamp_str = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S') # Use UTC
         filename = f'export_{timestamp_str}.{format_type}'
         filepath = export_dir / filename
 
         with get_session() as session:
-            start_date = datetime.utcnow() - timedelta(days=int(date_range_days))
+            start_date = datetime.now(timezone.utc) - timedelta(days=int(date_range_days)) # Use UTC
             data_query = session.query(DeviceData).filter(DeviceData.timestamp >= start_date).order_by(DeviceData.timestamp.asc())
             results = data_query.limit(50000).all() # Limit export size
-            data_list = [d.to_dict() for d in results]
+            data_list = [d.to_dict() for d in results] # .to_dict() converts datetime to ISO string
 
         if not data_list:
             logger.warning("No data found for export.", task_id=self.request.id)
@@ -1922,10 +2210,13 @@ def export_data_task(self, format_type='json', date_range_days=7):
 
         if format_type == 'csv':
             df = pd.DataFrame(data_list)
-            if 'metadata' in df.columns: df['metadata'] = df['metadata'].apply(lambda x: json.dumps(x) if isinstance(x, dict) else x)
-            df.to_csv(filepath, index=False, date_format='%Y-%m-%dT%H:%M:%S.%fZ')
+            # Handle metadata column if it contains dicts
+            if 'metadata' in df.columns:
+                 df['metadata'] = df['metadata'].apply(lambda x: json.dumps(x) if isinstance(x, dict) else x)
+            # Timestamps are already ISO strings from .to_dict()
+            df.to_csv(filepath, index=False)
         else: # JSON
-            with open(filepath, 'w') as f: json.dump(data_list, f, indent=2, default=str)
+            with open(filepath, 'w') as f: json.dump(data_list, f, indent=2)
 
         logger.info(f"Data exported by Celery task", task_id=self.request.id, export_path=str(filepath))
         return {'status': 'SUCCESS', 'export_path': str(filepath), 'filename': filename}

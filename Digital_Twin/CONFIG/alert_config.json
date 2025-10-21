@@ -3,7 +3,7 @@
     "version": "1.1.0",
     "last_updated_utc": "2025-10-19T14:30:00Z",
     "updated_by": "system_bot",
-    "description": "Configuration for alert rules, notification channels, and escalation policies. This version adds metadata and replaces hardcoded secrets with placeholders."
+    "description": "Configuration for alert rules, notification channels, and escalation policies. Secrets should be loaded from environment variables."
   },
   "configuration": {
     "alert_rules": {
@@ -51,21 +51,22 @@
         "enabled": true,
         "smtp_server": "smtp.gmail.com",
         "smtp_port": 587,
-        "username": "newmilan91@gmail.com",
-        "password": "env_SMTP_PASSWORD",
-        "recipients": [
-          "admin@company.com",
-          "maintenance@company.com"
-        ]
+        "username": "env_SMTP_USERNAME", // Load username from environment
+        "password": "env_SMTP_PASSWORD", // Load password from environment
+        "recipients_env_var": "ALERT_EMAIL_RECIPIENTS" // Load recipients from an env var (comma-separated)
+        // "recipients": [ // Alternatively, keep static list if preferred, but env var is better
+        //   "admin@company.com",
+        //   "maintenance@company.com"
+        // ]
       },
       "slack": {
         "enabled": false,
-        "webhook_url": "env_SLACK_WEBHOOK_URL",
+        "webhook_url": "env_SLACK_WEBHOOK_URL", // Load from environment
         "channel": "#alerts"
       },
       "webhook": {
         "enabled": false,
-        "url": "env_WEBHOOK_URL",
+        "url": "env_WEBHOOK_URL", // Load from environment
         "method": "POST"
       }
     },
