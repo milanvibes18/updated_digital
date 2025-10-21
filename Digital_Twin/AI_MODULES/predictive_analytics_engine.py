@@ -34,8 +34,6 @@ except ImportError:
     SecureDatabaseManager = None
 
 # --- Celery Import (FIX 1) ---
-# This import is safe because celery_app is defined at the module level
-# in enhanced_flask_app_v2.py *before* the app instance is created.
 try:
     from Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2 import celery_app
 except ImportError:
@@ -98,9 +96,13 @@ class PredictiveAnalyticsEngine:
         self.cache_path = Path(cache_path)
         self.logger = self._setup_logging()
         
+        # --- FIX 2: Add versions path ---
+        self.versions_path = self.model_path / "versions"
+        
         # Create directories
         self.model_path.mkdir(parents=True, exist_ok=True)
         self.cache_path.mkdir(parents=True, exist_ok=True)
+        self.versions_path.mkdir(parents=True, exist_ok=True) # FIX 2
         
         # Model storage
         self.models = {}
@@ -190,7 +192,7 @@ class PredictiveAnalyticsEngine:
     def _load_existing_models(self):
         """Load existing models from disk."""
         try:
-            # Load sklearn models
+            # Load sklearn models (from root model_path, not versions)
             model_files = list(self.model_path.glob("*.pkl"))
             for model_file in model_files:
                 model_name = model_file.stem
@@ -214,9 +216,13 @@ class PredictiveAnalyticsEngine:
                 except Exception as e:
                     self.logger.error(f"Failed to load .pkl model {model_name}: {e}")
             
-            # Load Keras models (NEW)
+            # Load Keras models (from root model_path, not versions) (NEW)
             if TENSORFLOW_AVAILABLE:
-                keras_model_dirs = [d for d in self.model_path.glob("*") if d.is_dir()]
+                # --- FIX 2: Exclude 'versions' directory ---
+                keras_model_dirs = [
+                    d for d in self.model_path.glob("*") 
+                    if d.is_dir() and d.name != 'versions'
+                ]
                 for model_dir in keras_model_dirs:
                     model_name = model_dir.stem
                     if model_name in self.models: continue 
@@ -238,36 +244,68 @@ class PredictiveAnalyticsEngine:
         except Exception as e:
             self.logger.error(f"Error loading models: {e}")
     
-    def _save_model(self, model_name: str, model: Any, scaler: Any = None, imputer: Any = None, metadata: Dict = None):
-        """Save model to disk."""
+    def _save_model(self, model_name: str, model: Any, scaler: Any = None, imputer: Any = None, 
+                    metadata: Dict = None, timestamp: str = None):
+        """
+        Save model to disk. (FIX 2)
+        Saves two copies:
+        1. "latest" (e.g., model.pkl) in self.model_path
+        2. "versioned" (e.g., model_20251021_090000.pkl) in self.versions_path
+        """
         try:
+            if timestamp is None:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            latest_name = model_name
+            versioned_name = f"{model_name}_{timestamp}"
+            
             preprocessors = {'scaler': scaler, 'imputer': imputer}
+            
             if TENSORFLOW_AVAILABLE and isinstance(model, (tf.keras.Model)):
-                model_dir = self.model_path / model_name
-                model.save(model_dir)
-                metadata_file = self.model_path / f"{model_name}_meta.pkl"
+                # --- Save Keras Model ---
                 model_data = {
                     'preprocessors': preprocessors,
                     'metadata': metadata or {}
                 }
-                joblib.dump(model_data, metadata_file)
+                
+                # 1. Save "latest"
+                model.save(self.model_path / latest_name)
+                metadata_file_latest = self.model_path / f"{latest_name}_meta.pkl"
+                joblib.dump(model_data, metadata_file_latest)
+                
+                # 2. Save "versioned"
+                model.save(self.versions_path / versioned_name)
+                metadata_file_versioned = self.versions_path / f"{versioned_name}_meta.pkl"
+                joblib.dump(model_data, metadata_file_versioned)
+                
                 self.models[model_name] = model
                 self.preprocessors[model_name] = preprocessors
                 if metadata:
                     self.model_metadata[model_name] = metadata
+            
             else:
+                # --- Save Sklearn Model ---
                 model_data = {
                     'model': model,
                     'preprocessors': preprocessors,
                     'metadata': metadata or {}
                 }
-                model_file = self.model_path / f"{model_name}.pkl"
-                joblib.dump(model_data, model_file)
+                
+                # 1. Save "latest"
+                model_file_latest = self.model_path / f"{latest_name}.pkl"
+                joblib.dump(model_data, model_file_latest)
+                
+                # 2. Save "versioned"
+                model_file_versioned = self.versions_path / f"{versioned_name}.pkl"
+                joblib.dump(model_data, model_file_versioned)
+                
                 self.models[model_name] = model
                 self.preprocessors[model_name] = preprocessors
                 if metadata:
                     self.model_metadata[model_name] = metadata
-            self.logger.info(f"Model saved: {model_name}")
+                    
+            self.logger.info(f"Model saved: {latest_name} (latest) and {versioned_name} (versioned)")
+            
         except Exception as e:
             self.logger.error(f"Failed to save model {model_name}: {e}")
     
@@ -392,6 +430,34 @@ class PredictiveAnalyticsEngine:
             X.append(seq_x)
         return np.array(X)
 
+    # --- NEW: Helper for Fix 2 ---
+    def _save_loss_plot(self, history: Any, model_name: str, timestamp: str):
+        """Save training/validation loss plot."""
+        try:
+            plt.figure(figsize=(10, 6))
+            plt.plot(history.history['loss'], label='Training Loss')
+            if 'val_loss' in history.history:
+                plt.plot(history.history['val_loss'], label='Validation Loss')
+            plt.title(f'{model_name} Model Loss')
+            plt.ylabel('Loss')
+            plt.xlabel('Epoch')
+            plt.legend()
+            
+            # 1. Save "latest"
+            latest_path = self.model_path / f"{model_name}_loss.png"
+            plt.savefig(latest_path)
+            
+            # 2. Save "versioned"
+            versioned_path = self.versions_path / f"{model_name}_{timestamp}_loss.png"
+            plt.savefig(versioned_path)
+            
+            plt.close()
+            self.logger.info(f"Loss plot saved to {latest_path} and {versioned_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save loss plot for {model_name}: {e}")
+    # --- End Add ---
+
     # --- Anomaly Detection (Isolation Forest) ---
     
     @celery_app.task(bind=True, name='analytics.train_anomaly_detector')
@@ -400,7 +466,11 @@ class PredictiveAnalyticsEngine:
         Train anomaly detection model (Celery Task).
         - MODULARIZED: Uses _fit_preprocessors, _transform_data
         - TRACKED: Logs params and metrics to MLflow
+        - VERSIONED: (FIX 2) Saves latest and timestamped model
         """
+        # --- FIX 2: Generate timestamp ---
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
         # MLflow Tracking (FIX 4)
         if MLFLOW_AVAILABLE:
             mlflow.set_tracking_uri(self.mlflow_tracking_uri)
@@ -448,6 +518,7 @@ class PredictiveAnalyticsEngine:
                 metadata = {
                     'model_type': 'IsolationForest',
                     'trained_at': datetime.now().isoformat(),
+                    'timestamp': timestamp, # FIX 2
                     'training_samples': len(features),
                     'features': list(features.columns),
                     'anomaly_ratio': anomaly_ratio,
@@ -455,7 +526,12 @@ class PredictiveAnalyticsEngine:
                     'mlflow_run_id': run.info.run_id if MLFLOW_AVAILABLE else None
                 }
                 
-                self._save_model(model_name, model, preprocessors['scaler'], preprocessors['imputer'], metadata)
+                # --- FIX 2: Call versioned save ---
+                self._save_model(
+                    model_name, model, 
+                    preprocessors['scaler'], preprocessors['imputer'], 
+                    metadata, timestamp=timestamp
+                )
                 
                 result = {
                     'model_name': model_name,
@@ -560,10 +636,14 @@ class PredictiveAnalyticsEngine:
         - MODULARIZED: Uses _fit_preprocessors, _transform_data
         - TRACKED: Logs params and metrics (MAE, RMSE) to MLflow
         - METRICS: Logs MAE and RMSE (FIX 3)
+        - FIX 2: Adds loss viz, threshold tuning, and versioning
         """
         if not TENSORFLOW_AVAILABLE:
             self.logger.error("TensorFlow is not installed. Cannot train Autoencoder.")
             return {'error': 'TensorFlow is not available.'}
+            
+        # --- FIX 2: Generate timestamp ---
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
         if MLFLOW_AVAILABLE:
             mlflow.set_tracking_uri(self.mlflow_tracking_uri)
@@ -620,19 +700,30 @@ class PredictiveAnalyticsEngine:
                     restore_best_weights=True
                 )
                 
+                # --- FIX 2: Manual train/val split for threshold tuning ---
+                X_train_seq, X_val_seq = train_test_split(
+                    X_seq, 
+                    test_size=dl_config['validation_split'], 
+                    random_state=42
+                )
+                
                 history = model.fit(
-                    X_seq, X_seq,
+                    X_train_seq, X_train_seq,
                     epochs=epochs,
                     batch_size=batch_size,
-                    validation_split=dl_config['validation_split'],
+                    validation_data=(X_val_seq, X_val_seq), # Use manual split
                     callbacks=[early_stopping],
                     verbose=0
                 )
                 
-                X_pred = model.predict(X_seq)
-                train_mae_loss = np.mean(np.abs(X_pred - X_seq), axis=1)
-                train_mae_loss_flat = train_mae_loss.flatten()
-                threshold = np.mean(train_mae_loss_flat) + 3 * np.std(train_mae_loss_flat)
+                # --- FIX 2: Loss Visualization ---
+                self._save_loss_plot(history, model_name, timestamp)
+                
+                # --- FIX 2: Threshold Tuning (on validation set) ---
+                X_val_pred = model.predict(X_val_seq)
+                val_mae_loss = np.mean(np.abs(X_val_pred - X_val_seq), axis=(1, 2))
+                threshold = float(np.percentile(val_mae_loss, 95))
+                self.logger.info(f"Autoencoder threshold tuned to {threshold} (95th percentile of val error).")
                 
                 # --- FIX 3 & 4: Log Metrics to MLflow ---
                 val_mae = history.history['val_loss'][-1]
@@ -655,23 +746,30 @@ class PredictiveAnalyticsEngine:
                 metadata = {
                     'model_type': 'Autoencoder',
                     'trained_at': datetime.now().isoformat(),
-                    'training_samples': X_seq.shape[0],
+                    'timestamp': timestamp, # FIX 2
+                    'training_samples': X_train_seq.shape[0],
+                    'validation_samples': X_val_seq.shape[0],
                     'features': list(features.columns),
                     'n_steps': n_steps,
                     'n_features': n_features,
-                    'reconstruction_threshold': float(threshold),
+                    'reconstruction_threshold': threshold, # FIX 2
                     'final_train_loss (mae)': float(history.history['loss'][-1]),
                     'final_val_loss (mae)': float(val_mae),
                     'final_val_rmse': float(val_rmse),
                     'mlflow_run_id': run.info.run_id if MLFLOW_AVAILABLE else None
                 }
                 
-                self._save_model(model_name, model, preprocessors['scaler'], preprocessors['imputer'], metadata)
+                # --- FIX 2: Call versioned save ---
+                self._save_model(
+                    model_name, model, 
+                    preprocessors['scaler'], preprocessors['imputer'], 
+                    metadata, timestamp=timestamp
+                )
                 
                 result = {
                     'model_name': model_name,
-                    'training_samples': X_seq.shape[0],
-                    'reconstruction_threshold': float(threshold),
+                    'training_samples': X_train_seq.shape[0],
+                    'reconstruction_threshold': threshold,
                     'metadata': metadata
                 }
                 
@@ -703,8 +801,8 @@ class PredictiveAnalyticsEngine:
             threshold = metadata.get('reconstruction_threshold')
             model_features = metadata.get('features', [])
 
-            if not n_steps or not threshold:
-                raise ValueError(f"Model metadata for {model_name} is incomplete.")
+            if not n_steps or threshold is None: # Allow threshold=0
+                raise ValueError(f"Model metadata for {model_name} is incomplete (n_steps or threshold missing).")
 
             features, _ = self.prepare_data(data)
             if model_features:
@@ -779,7 +877,11 @@ class PredictiveAnalyticsEngine:
         - MODULARIZED: Uses _fit_preprocessors, _transform_data
         - TRACKED: Logs params and metrics (F1, AUC, etc.) to MLflow
         - METRICS: F1 score already present (FIX 3)
+        - VERSIONED: (FIX 2) Saves latest and timestamped model
         """
+        # --- FIX 2: Generate timestamp ---
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
         if MLFLOW_AVAILABLE:
             mlflow.set_tracking_uri(self.mlflow_tracking_uri)
         with mlflow.start_run(run_name=f"train_failure_predictor_{model_name}") as run:
@@ -852,12 +954,18 @@ class PredictiveAnalyticsEngine:
                 if MLFLOW_AVAILABLE:
                     mlflow.log_params(model_config)
                     mlflow.log_param("class_weight", class_weight)
+                    
+                    # Remove non-scalar metrics before logging to mlflow
+                    mlflow_metrics = evaluation_metrics.copy()
+                    mlflow_metrics.pop('confusion_matrix', None)
+                    mlflow_metrics.pop('error', None)
+
                     mlflow.log_metrics({
                         'train_score': train_score,
                         'test_score': test_score,
                         'cv_mean': cv_scores.mean(),
                         'cv_std': cv_scores.std(),
-                        **evaluation_metrics # Log all calculated metrics
+                        **mlflow_metrics # Log all calculated scalar metrics
                     })
                     mlflow.sklearn.log_model(model, "model")
                 # --- END FIX 3 & 4 ---
@@ -865,6 +973,7 @@ class PredictiveAnalyticsEngine:
                 metadata = {
                     'model_type': 'RandomForestClassifier',
                     'trained_at': datetime.now().isoformat(),
+                    'timestamp': timestamp, # FIX 2
                     'training_samples': len(X_train),
                     'features': list(features.columns),
                     'target_classes': list(model.classes_),
@@ -877,7 +986,12 @@ class PredictiveAnalyticsEngine:
                     'mlflow_run_id': run.info.run_id if MLFLOW_AVAILABLE else None
                 }
                 
-                self._save_model(model_name, model, preprocessors['scaler'], preprocessors['imputer'], metadata)
+                # --- FIX 2: Call versioned save ---
+                self._save_model(
+                    model_name, model, 
+                    preprocessors['scaler'], preprocessors['imputer'], 
+                    metadata, timestamp=timestamp
+                )
                 
                 result = {
                     'model_name': model_name,
@@ -981,10 +1095,14 @@ class PredictiveAnalyticsEngine:
         - MODULARIZED: Uses _fit_preprocessors, _transform_data (adapted for 1D)
         - TRACKED: Logs params and metrics (MAE, RMSE) to MLflow
         - METRICS: Logs MAE and RMSE (FIX 3)
+        - FIX 2: Adds loss viz and versioning
         """
         if not TENSORFLOW_AVAILABLE:
             self.logger.error("TensorFlow is not installed. Cannot train LSTM.")
             return {'error': 'TensorFlow is not available.'}
+            
+        # --- FIX 2: Generate timestamp ---
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
         if MLFLOW_AVAILABLE:
             mlflow.set_tracking_uri(self.mlflow_tracking_uri)
@@ -1049,6 +1167,9 @@ class PredictiveAnalyticsEngine:
                     verbose=0
                 )
                 
+                # --- FIX 2: Loss Visualization ---
+                self._save_loss_plot(history, model_name, timestamp)
+                
                 # --- FIX 3 & 4: Log Metrics to MLflow ---
                 val_mse = history.history['val_loss'][-1]
                 val_mae = history.history['val_mae'][-1]
@@ -1069,6 +1190,7 @@ class PredictiveAnalyticsEngine:
                 metadata = {
                     'model_type': 'LSTM_Forecaster',
                     'trained_at': datetime.now().isoformat(),
+                    'timestamp': timestamp, # FIX 2
                     'target_column': target_column,
                     'training_samples': X_seq.shape[0],
                     'n_steps_in': n_steps_in,
@@ -1081,7 +1203,12 @@ class PredictiveAnalyticsEngine:
                     'mlflow_run_id': run.info.run_id if MLFLOW_AVAILABLE else None
                 }
                 
-                self._save_model(model_name, model, scaler, imputer, metadata)
+                # --- FIX 2: Call versioned save ---
+                self._save_model(
+                    model_name, model, 
+                    scaler, imputer, 
+                    metadata, timestamp=timestamp
+                )
                 
                 result = {
                     'model_name': model_name,
@@ -1740,7 +1867,7 @@ class PredictiveAnalyticsEngine:
             raise
     
     def _generate_optimization_recommendations(self, feature_importance: Dict, 
-                                               optimization_ranges: Dict) -> List[Dict]:
+                                             optimization_ranges: Dict) -> List[Dict]:
         """Generate optimization recommendations based on analysis."""
         try:
             recommendations = []
@@ -1869,7 +1996,11 @@ if __name__ == "__main__":
         ae_data = sample_data[['temperature', 'pressure', 'vibration']]
         ae_result = analytics.train_anomaly_autoencoder(ae_data)
         if 'error' not in ae_result:
-            print(f"Autoencoder trained. Threshold: {ae_result['reconstruction_threshold']:.4f}")
+            print(f"Autoencoder trained. Threshold (95th percentile): {ae_result['reconstruction_threshold']:.4f}")
+            # Check for plot
+            plot_path = analytics.model_path / "anomaly_autoencoder_loss.png"
+            if plot_path.exists():
+                print(f"Loss plot saved to {plot_path}")
         else:
             print(f"Autoencoder training failed: {ae_result['error']}")
 
@@ -1877,6 +2008,10 @@ if __name__ == "__main__":
         lstm_result = analytics.train_forecaster_lstm(sample_data, 'temperature')
         if 'error' not in lstm_result:
             print(f"LSTM Forecaster trained.")
+            # Check for plot
+            plot_path_lstm = analytics.model_path / "lstm_forecaster_loss.png"
+            if plot_path_lstm.exists():
+                print(f"Loss plot saved to {plot_path_lstm}")
         else:
             print(f"LSTM training failed: {lstm_result['error']}")
             

@@ -1,4 +1,3 @@
-# docker-compose.yml
 version: "3.8"
 
 # Define a base configuration for celery services to reduce repetition
@@ -105,13 +104,27 @@ services:
   celery-worker:
     <<: *celery-base # Inherit from the base celery configuration
     container_name: digital_twin_celery
-    command: celery -A WEB_APPLICATION.enhanced_flask_app_v2.celery worker --loglevel=info
+    # FIXED: Corrected the Python module path
+    command: celery -A Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2.celery worker --loglevel=info
 
   # Celery Beat for scheduled tasks
   celery-beat:
     <<: *celery-base # Inherit from the base celery configuration
     container_name: digital_twin_beat
-    command: celery -A WEB_APPLICATION.enhanced_flask_app_v2.celery beat --loglevel=info
+    # FIXED: Corrected the Python module path
+    command: celery -A Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2.celery beat --loglevel=info
+
+  # NEW: MQTT Ingestor service
+  mqtt_ingestor:
+    <<: *celery-base # Inherit from the base celery configuration
+    container_name: digital_twin_mqtt_ingestor
+    # This service needs to connect to mosquitto as well
+    depends_on:
+      - redis
+      - postgres
+      - mosquitto
+    # Runs the MQTT ingestor script (path based on your project structure)
+    command: python -u Digital_Twin/AI_MODULES/mqtt_ingestor.py
 
   # Nginx reverse proxy (The public-facing entrypoint)
   nginx:
@@ -165,7 +178,7 @@ services:
       - ./.env # Load Grafana admin password from .env file
     environment:
       # UPDATED: Use a variable from .env for the root URL
-      - GF_SERVER_ROOT_URL=https://${DOMAIN_NAME:-localhost}/grafana
+      - GF_SERVER_ROOT_URL=https://n-localhost/grafana
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
