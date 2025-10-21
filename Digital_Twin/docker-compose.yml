@@ -3,31 +3,33 @@ version: "3.8"
 # Define a base configuration for celery services to reduce repetition
 x-celery-base: &celery-base
   build:
-    context: .
-    dockerfile: Dockerfile
+    context: . # Build context is the Digital_Twin directory
+    dockerfile: Dockerfile # Use the main Dockerfile
   restart: unless-stopped
   env_file:
-    - ./.env # Load credentials and other secrets from .env file
+    - ./.env # Load common environment variables (DB URL, Redis URL, etc.)
   environment:
-    - FLASK_ENV=production
-    - CELERY_BROKER_URL=redis://redis:6379/0
-    - CELERY_RESULT_BACKEND=redis://redis:6379/0
-    # The DATABASE_URL is now loaded from the .env file
+    - FLASK_ENV=production # Ensure Flask runs in production mode
+    - CELERY_BROKER_URL=redis://redis:6379/1 # Redis instance for Celery broker (DB 1)
+    - CELERY_RESULT_BACKEND=redis://redis:6379/2 # Redis instance for Celery results (DB 2)
   volumes:
+    # Mount necessary volumes for data persistence and access
     - ./DATABASE:/app/DATABASE
     - ./LOGS:/app/LOGS
     - ./SECURITY:/app/SECURITY
     - ./REPORTS:/app/REPORTS
     - ./CONFIG:/app/CONFIG
-    - ./ANALYTICS:/app/ANALYTICS # Note: ANALYTICS is mounted for celery but not the main app
+    - ./ANALYTICS:/app/ANALYTICS # Mount analytics for access to models/cache
   depends_on:
-    - redis
-    - postgres
+    - redis # Celery needs Redis broker/backend
+    - postgres # Celery tasks might interact with the database
   networks:
     - digital_twin_network
 
 services:
-  # Main Digital Twin Application
+  # ----------------------------------------
+  # Main Application (Flask + SocketIO)
+  # ----------------------------------------
   digital-twin-app:
     build:
       context: .
@@ -35,192 +37,216 @@ services:
     container_name: digital_twin_app
     restart: unless-stopped
     expose:
-      - "5000" # Expose port only to the internal network
+      - "5000" # Expose internally for Nginx proxy
     env_file:
-      - ./.env # Load credentials from .env file
+      - ./.env # Load DB URL, secrets, Redis URL, etc.
     environment:
       - FLASK_ENV=production
-      # DATABASE_URL is now loaded via env_file
-      - REDIS_URL=redis://redis:6379/0
-      - ENCRYPTION_KEY_PATH=CONFIG/encryption.key
+      - REDIS_URL=redis://redis:6379/0 # Redis for caching and SocketIO message queue (DB 0)
+      - ENCRYPTION_KEY=_VALUE_FROM_DOTENV_ # Key for secure_database_manager (Loaded from .env)
+      # DATABASE_URL is loaded via env_file
     volumes:
+      # Mount persistent data and logs
       - ./DATABASE:/app/DATABASE
       - ./LOGS:/app/LOGS
-      - ./SECURITY:/app/SECURITY
-      - ./REPORTS:/app/REPORTS
-      - ./CONFIG:/app/CONFIG
+      - ./SECURITY:/app/SECURITY # For backups, potentially audit logs
+      - ./REPORTS:/app/REPORTS # Generated reports
+      - ./CONFIG:/app/CONFIG # Application configuration files
     depends_on:
-      - redis
-      - postgres
+      - redis # For caching and SocketIO message queue
+      - postgres # Main database
     networks:
       - digital_twin_network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"] # Check if the app's health endpoint is responsive
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 40s # Give the app time to start
 
-  # Redis for caching and real-time data
+  # ----------------------------------------
+  # Redis (Caching, Celery, SocketIO MQ)
+  # ----------------------------------------
   redis:
     image: redis:7-alpine
     container_name: digital_twin_redis
     restart: unless-stopped
     expose:
-      - "6379" # Expose port only to the internal network
+      - "6379" # Internal port
     volumes:
-      - redis_data:/data
-      - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: redis-server /usr/local/etc/redis/redis.conf
+      - redis_data:/data # Persistent storage for Redis data
+      # - ./redis.conf:/usr/local/etc/redis/redis.conf # Optional: Custom Redis config
+    # command: redis-server /usr/local/etc/redis/redis.conf # Uncomment if using custom config
     networks:
       - digital_twin_network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "ping"] # Check if Redis server responds to ping
       interval: 30s
       timeout: 10s
       retries: 3
 
-  # PostgreSQL for production database
+  # ----------------------------------------
+  # PostgreSQL Database
+  # ----------------------------------------
   postgres:
     image: postgres:15-alpine
     container_name: digital_twin_postgres
     restart: unless-stopped
     env_file:
-      - ./.env # All environment variables (POSTGRES_DB, etc.) are loaded from here
+      - ./.env # Load POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
     expose:
-      - "5432" # Expose port only to the internal network
+      - "5432" # Internal port
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./DATABASE/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data # Persistent storage for database files
+      # - ./DATABASE/init.sql:/docker-entrypoint-initdb.d/init.sql # Optional: Run initial SQL script on first start
     networks:
       - digital_twin_network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"] # Use $$ to escape $ for shell
+      # Use env vars loaded from .env file inside the container for the check
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"] # Check if DB is ready
       interval: 30s
       timeout: 10s
       retries: 3
 
-  # Celery Worker for background tasks
+  # ----------------------------------------
+  # Celery Worker (Background Tasks)
+  # ----------------------------------------
   celery-worker:
-    <<: *celery-base # Inherit from the base celery configuration
-    container_name: digital_twin_celery
-    # FIXED: Corrected the Python module path
-    command: celery -A Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2.celery worker --loglevel=info
+    <<: *celery-base # Inherit common config from x-celery-base
+    container_name: digital_twin_celery_worker # More descriptive name
+    command: celery -A Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2:celery_app worker --loglevel=info # Correct path to celery app instance
 
-  # Celery Beat for scheduled tasks
+  # ----------------------------------------
+  # Celery Beat (Scheduled Tasks)
+  # ----------------------------------------
   celery-beat:
-    <<: *celery-base # Inherit from the base celery configuration
-    container_name: digital_twin_beat
-    # FIXED: Corrected the Python module path
-    command: celery -A Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2.celery beat --loglevel=info
+    <<: *celery-base # Inherit common config
+    container_name: digital_twin_celery_beat # More descriptive name
+    command: celery -A Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2:celery_app beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler # Use DB scheduler if needed, or default
 
-  # NEW: MQTT Ingestor service
+  # ----------------------------------------
+  # MQTT Ingestor (Listens to MQTT Broker)
+  # ----------------------------------------
   mqtt_ingestor:
-    <<: *celery-base # Inherit from the base celery configuration
+    <<: *celery-base # Reuses build context, env vars, volumes from celery-base
     container_name: digital_twin_mqtt_ingestor
-    # This service needs to connect to mosquitto as well
     depends_on:
-      - redis
-      - postgres
-      - mosquitto
-    # Runs the MQTT ingestor script (path based on your project structure)
+      - redis # Might use Redis
+      - postgres # Stores data in DB
+      - mosquitto # Connects to MQTT broker
+    # Runs the specific MQTT ingestor script
     command: python -u Digital_Twin/AI_MODULES/mqtt_ingestor.py
 
-  # Nginx reverse proxy (The public-facing entrypoint)
+  # ----------------------------------------
+  # Nginx (Reverse Proxy & HTTPS)
+  # ----------------------------------------
   nginx:
     image: nginx:alpine
     container_name: digital_twin_nginx
     restart: unless-stopped
     ports:
-      # These are the only ports exposed to the host
+      # Expose standard HTTP/HTTPS ports to the host machine
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./ssl:/etc/nginx/ssl:ro # Mount SSL certs as read-only
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro # Mount custom Nginx config (read-only)
+      - ./ssl:/etc/nginx/ssl:ro # Mount SSL certificates (read-only) - Place your certs here
     depends_on:
-      - digital-twin-app
-      - grafana
-      - prometheus
+      - digital-twin-app # Proxies to the main Flask app
+      - grafana # Proxies to Grafana
+      - prometheus # Proxies to Prometheus
     networks:
       - digital_twin_network
 
-  # Monitoring with Prometheus
+  # ----------------------------------------
+  # Prometheus (Metrics Collection)
+  # ----------------------------------------
   prometheus:
     image: prom/prometheus:latest
     container_name: digital_twin_prometheus
     restart: unless-stopped
     expose:
-      - "9090" # Expose port only to the internal network (for Nginx)
+      - "9090" # Internal port for Nginx/Grafana
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro # Mount Prometheus config (read-only)
+      - prometheus_data:/prometheus # Persistent storage for metrics data
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--storage.tsdb.retention.time=200h'
-      - '--web.enable-lifecycle'
-      # UPDATED: Use a variable from .env for the domain name
-      - '--web.external-url=https://${DOMAIN_NAME:-localhost}/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries' # Correct paths for official image
+      - '--web.console.templates=/usr/share/prometheus/consoles' # Correct paths for official image
+      - '--storage.tsdb.retention.time=200h' # Example retention time
+      - '--web.enable-lifecycle' # Allows remote reloading of config
+      - '--web.external-url=https://${DOMAIN_NAME:-localhost}/prometheus/' # Base URL for Prometheus UI (uses .env var)
+      - '--web.route-prefix=/' # Required when using external_url subpath
     networks:
       - digital_twin_network
 
-  # Grafana for visualization
+  # ----------------------------------------
+  # Grafana (Metrics Visualization)
+  # ----------------------------------------
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana-oss:latest # Use OSS version explicitly if preferred
     container_name: digital_twin_grafana
     restart: unless-stopped
     expose:
-      - "3000" # Expose port only to the internal network (for Nginx)
+      - "3000" # Internal port for Nginx
     env_file:
-      - ./.env # Load Grafana admin password from .env file
+      - ./.env # Load GF_SECURITY_ADMIN_PASSWORD, etc.
     environment:
-      # UPDATED: Use a variable from .env for the root URL
-      - GF_SERVER_ROOT_URL=https://n-localhost/grafana
+      # Base URL for Grafana UI, proxied by Nginx
+      - GF_SERVER_ROOT_URL=https://${DOMAIN_NAME:-localhost}/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true # Important when running on a subpath
     volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana # Persistent storage for Grafana config/dashboards
+      - ./grafana/provisioning:/etc/grafana/provisioning # Mount provisioning files (datasources, dashboards)
     depends_on:
-      - prometheus
+      - prometheus # Grafana queries Prometheus for data
     networks:
       - digital_twin_network
 
-  # InfluxDB for time series data
+  # ----------------------------------------
+  # InfluxDB (Time Series Data - Optional)
+  # ----------------------------------------
   influxdb:
-    image: influxdb:2.0-alpine
+    image: influxdb:2.7-alpine # Using a specific 2.x version
     container_name: digital_twin_influxdb
     restart: unless-stopped
     env_file:
-      - ./.env # Load InfluxDB credentials from .env file
+      - ./.env # Load InfluxDB credentials (DOCKER_INFLUXDB_INIT_...)
     expose:
-      - "8086" # Expose port only to the internal network
+      - "8086" # Internal port
     volumes:
-      - influxdb_data:/var/lib/influxdb2
+      - influxdb_data:/var/lib/influxdb2 # Persistent storage
     networks:
       - digital_twin_network
 
-  # MQTT Broker for IoT communication
+  # ----------------------------------------
+  # Mosquitto (MQTT Broker)
+  # ----------------------------------------
   mosquitto:
     image: eclipse-mosquitto:latest
     container_name: digital_twin_mqtt
     restart: unless-stopped
     ports:
-      # These ports must be public for IoT devices
+      # Expose MQTT ports to the host/network for devices to connect
       - "1883:1883" # Standard MQTT
       - "9001:9001" # MQTT over WebSockets
     volumes:
-      - ./mosquitto/config:/mosquitto/config
-      - ./mosquitto/data:/mosquitto/data
-      - ./mosquitto/log:/mosquitto/log
+      - ./mosquitto/config:/mosquitto/config:ro # Mount Mosquitto config (read-only)
+      - ./mosquitto/data:/mosquitto/data # Persistent storage for retained messages, etc.
+      - ./mosquitto/log:/mosquitto/log # Persistent storage for logs
+    # user: "mosquitto" # Optional: Run as non-root user (ensure volume permissions)
     networks:
       - digital_twin_network
 
+# --- Networks Definition ---
 networks:
   digital_twin_network:
-    driver: bridge
+    driver: bridge # Default bridge network for inter-container communication
 
+# --- Volumes Definition ---
+# Defines named volumes for persistent data storage
 volumes:
   postgres_data:
     driver: local
@@ -230,5 +256,6 @@ volumes:
     driver: local
   grafana_data:
     driver: local
-  influxdb_data:
+  influxdb_data: # Make sure this matches the volume name used by the service
     driver: local
+  # Mosquitto volumes are defined via bind mounts in the service definition
