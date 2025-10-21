@@ -1,0 +1,84 @@
+# .github/workflows/deploy.yml
+name: Deploy to Staging
+
+on:
+  push:
+    branches:
+      - develop # Deploy when code is pushed to the 'develop' branch
+
+jobs:
+  deploy:
+    name: Deploy to Staging Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # 1. Download Test Artifacts (Optional but good practice)
+      # This assumes your CI job ('backend-lint-test' from ci.yml) uploaded artifacts
+      # You might need to adjust the workflow trigger if CI and Deploy run separately
+      # - name: Download Coverage Report
+      #   uses: actions/download-artifact@v4
+      #   with:
+      #     name: backend-coverage-report
+      #     path: ./coverage-reports # Download to a specific folder
+
+      # 2. Setup SSH Connection
+      - name: Setup SSH Key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }} # Add this secret in GitHub repo settings
+
+      # Add known hosts to avoid prompts
+      - name: Add Staging Host to Known Hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.STAGING_HOST }} >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      # 3. Copy Files to Staging Server (Docker Compose file, .env, etc.)
+      - name: Copy deployment files via SCP
+        run: |
+          scp -o StrictHostKeyChecking=no ./Digital_Twin/docker-compose.yml ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:/home/${{ secrets.STAGING_USER }}/app/docker-compose.yml
+          scp -o StrictHostKeyChecking=no ./Digital_Twin/.env.staging ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:/home/${{ secrets.STAGING_USER }}/app/.env # Use a staging-specific .env
+          scp -o StrictHostKeyChecking=no ./Digital_Twin/nginx.conf ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:/home/${{ secrets.STAGING_USER }}/app/nginx.conf
+          # Copy any other necessary config files (e.g., mosquitto, prometheus)
+          scp -o StrictHostKeyChecking=no -r ./Digital_Twin/mosquitto ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:/home/${{ secrets.STAGING_USER }}/app/
+          scp -o StrictHostKeyChecking=no ./Digital_Twin/prometheus.yml ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:/home/${{ secrets.STAGING_USER }}/app/prometheus.yml
+          scp -o StrictHostKeyChecking=no -r ./Digital_Twin/grafana ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:/home/${{ secrets.STAGING_USER }}/app/
+          # Ensure you have SSL certs on the server or copy them securely
+          # scp -o StrictHostKeyChecking=no -r ./Digital_Twin/ssl ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}:/home/${{ secrets.STAGING_USER }}/app/
+
+      # 4. Execute Deployment Commands on Staging Server via SSH
+      - name: Deploy using Docker Compose
+        run: |
+          ssh ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }} << 'EOF'
+            cd /home/${{ secrets.STAGING_USER }}/app
+
+            # Login to Docker registry if needed (using env vars securely passed to server or pre-configured)
+            # echo $DOCKER_PASSWORD | docker login -u $DOCKER_USERNAME --password-stdin
+
+            # Pull the latest image built by the CI workflow
+            docker compose pull digital-twin-app # Make sure service name matches docker-compose.yml
+
+            # Stop and remove old containers, then start new ones
+            # --remove-orphans cleans up containers for services no longer in the compose file
+            docker compose down --remove-orphans
+            docker compose up -d --build # Rebuild if necessary (e.g., local changes) or just `up -d` if only pulling
+
+            # Optional: Prune old images/volumes to save space
+            docker image prune -f
+            docker volume prune -f
+          EOF
+
+      # 5. Optional: Post-Deployment Steps (e.g., notify Slack)
+      # - name: Send Slack Notification
+      #   uses: rtCamp/action-slack-notify@v2
+      #   env:
+      #     SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+      #     SLACK_USERNAME: GitHub Actions Deploy Bot
+      #     SLACK_ICON_EMOJI: ':rocket:'
+      #     SLACK_COLOR: '#36a64f' # Green for success
+      #     SLACK_TITLE: Deployment to Staging Successful
+      #     SLACK_MESSAGE: 'Commit ${{ github.sha }} deployed successfully to staging.'
