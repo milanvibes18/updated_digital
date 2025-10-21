@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """
-Enhanced Flask Application for Digital Twin System v3.4 (Production-Ready - Hardened)
-Main web application with Redis caching, PostgreSQL via SQLAlchemy ORM,
-optimized SocketIO, async task support via Celery, structured logging,
-input validation, Prometheus metrics, and enhanced security.
+Enhanced Flask Application for Digital Twin System v3.6 (Production-Ready - Merged)
+Main web application with Flask Blueprints, Redis caching, PostgreSQL via SQLAlchemy ORM,
+optimized SocketIO with Namespaces, async tasks via Celery, structured logging,
+input validation, Prometheus metrics, RBAC, and enhanced security.
 
-Major Enhancements from v3.3:
-- Added Role-Based Access Control (RBAC) mechanisms (Item 4)
-- Switched password hashing from werkzeug default to bcrypt (as requested)
-- Implemented JWT Refresh Token logic (as requested)
+Merged Features from v3.4 & v3.5:
+- Flask Blueprints for route organization
+- Standardized JSON API responses
+- Bcrypt password hashing
+- JWT Access & Refresh Token flow
+- Role-Based Access Control (RBAC)
+- WebSocket Namespace with payload validation
+- Enhanced error handling throughout
+- Prometheus metrics integration
+- Celery task queue with Beat scheduler
 """
 
 import os
 import sys
 import json
-import logging # Still needed for basic setup before structlog takes over
-import structlog # For structured logging
+import logging
+import structlog
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone # Ensure timezone is imported
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set # Added Set
+from typing import Dict, List, Any, Optional, Set
 from collections import defaultdict, deque
 import threading
 import time
@@ -36,9 +42,12 @@ import pickle
 from contextlib import contextmanager
 
 # Flask imports
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash, send_from_directory, Response, current_app
+from flask import (
+    Flask, render_template, request, jsonify, session, redirect, url_for,
+    flash, send_from_directory, Response, current_app, Blueprint, g
+)
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
+from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect, Namespace
 import eventlet
 
 # Database imports
@@ -56,14 +65,12 @@ from flask_jwt_extended import (
     JWTManager, jwt_required, create_access_token,
     get_jwt_identity, unset_jwt_cookies, decode_token,
     set_access_cookies, verify_jwt_in_request, get_jwt,
-    # --- Enabled Refresh Logic ---
     create_refresh_token, set_refresh_cookies
 )
 from jwt.exceptions import ExpiredSignatureError, DecodeError, InvalidTokenError
-# from werkzeug.security import generate_password_hash, check_password_hash # Replaced with bcrypt
-import bcrypt # <-- Added bcrypt
+import bcrypt
 from werkzeug.middleware.proxy_fix import ProxyFix
-from flask_wtf.csrf import CSRFProtect # For form CSRF
+from flask_wtf.csrf import CSRFProtect
 
 # Rate Limiting
 try:
@@ -73,7 +80,6 @@ try:
 except ImportError:
     logging.warning("Flask-Limiter not installed. Rate limiting disabled.")
     FLASK_LIMITER_AVAILABLE = False
-    # Define dummy Limiter and decorators if not available
     class Limiter:
         def __init__(self, *args, **kwargs): pass
         def limit(self, *args, **kwargs): return lambda f: f
@@ -81,43 +87,40 @@ except ImportError:
         def init_app(self, app): pass
     def get_remote_address(): return "127.0.0.1"
 
-# Celery for async tasks and scheduled tasks (Beat)
+# Celery
 try:
     from celery import Celery, Task
-    from celery.schedules import crontab # For Celery Beat scheduling
+    from celery.schedules import crontab
     CELERY_AVAILABLE = True
 except ImportError:
-    logging.warning("Celery not installed. Async tasks and scheduled tasks will run synchronously or not at all.")
+    logging.warning("Celery not installed. Async tasks will run synchronously.")
     CELERY_AVAILABLE = False
-    # Define dummy Celery if not available
     class Celery:
         def __init__(self, *args, **kwargs): pass
         def task(self, *args, **kwargs): return lambda f: f
-        conf = type('obj', (object,), {'beat_schedule': {}})() # Dummy conf with beat_schedule
-    Task = object # Dummy Task base class
-    crontab = object # Dummy crontab
+        conf = type('obj', (object,), {'beat_schedule': {}})()
+    Task = object
+    crontab = object
 
-# --- NEW: Prometheus Metrics ---
+# Prometheus Metrics
 try:
     from prometheus_flask_exporter import PrometheusMetrics
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     logging.warning("prometheus-flask-exporter not installed. Prometheus metrics disabled.")
     PROMETHEUS_AVAILABLE = False
-    # Dummy class
     class PrometheusMetrics:
         def __init__(self, *args, **kwargs): pass
         def init_app(self, app): pass
-        def counter(self, *args, **kwargs): return lambda f: f # Dummy decorator
+        def counter(self, *args, **kwargs): return lambda f: f
 
-# --- NEW: Input Validation ---
+# Input Validation
 try:
     from marshmallow import Schema, fields, ValidationError
     MARSHMALLOW_AVAILABLE = True
 except ImportError:
     logging.warning("Marshmallow not installed. Input validation disabled.")
     MARSHMALLOW_AVAILABLE = False
-    # Dummy classes
     class Schema: pass
     class fields:
         Str = staticmethod(lambda **kwargs: None)
@@ -128,16 +131,16 @@ except ImportError:
         DateTime = staticmethod(lambda **kwargs: None)
         List = staticmethod(lambda **kwargs: None)
         Nested = staticmethod(lambda **kwargs: None)
+        Dict = staticmethod(lambda **kwargs: None)
     class ValidationError(Exception): pass
 
 
 # Add project root to path
-# Use relative pathing to be more robust
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# Import custom modules (Use try-except for robustness)
+# Import custom modules
 try:
     from Digital_Twin.AI_MODULES.predictive_analytics_engine import PredictiveAnalyticsEngine
     from Digital_Twin.CONFIG.unified_data_generator import UnifiedDataGenerator
@@ -153,8 +156,6 @@ except ImportError as e:
 
 
 # ==================== LOGGING SETUP (Structlog) ====================
-# Item 2: Integrate structured logging
-
 def setup_logging():
     """Setup structured logging using structlog"""
     log_dir = Path('LOGS')
@@ -162,17 +163,15 @@ def setup_logging():
     log_level_str = os.environ.get('LOG_LEVEL', 'INFO').upper()
     log_level = getattr(logging, log_level_str, logging.INFO)
 
-    # Configure standard logging first (for libraries not using structlog)
     logging.basicConfig(
         level=log_level,
-        format='%(message)s', # structlog will handle formatting
+        format='%(message)s',
         stream=sys.stdout,
     )
 
-    # Configure structlog
     structlog.configure(
         processors=[
-            structlog.contextvars.merge_contextvars, # Merge context vars
+            structlog.contextvars.merge_contextvars,
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
             structlog.stdlib.PositionalArgumentsFormatter(),
@@ -180,7 +179,6 @@ def setup_logging():
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
-            # Choose JSON or Console renderer based on environment
             structlog.processors.JSONRenderer() if os.environ.get('LOG_FORMAT') == 'json' else structlog.dev.ConsoleRenderer()
         ],
         logger_factory=structlog.stdlib.LoggerFactory(),
@@ -188,23 +186,19 @@ def setup_logging():
         cache_logger_on_first_use=True,
     )
 
-    # Get the root logger configured by structlog
     log = structlog.get_logger('DigitalTwinApp')
-
-    # Silence overly verbose libraries (using standard logging)
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
     logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
     logging.getLogger('socketio').setLevel(logging.WARNING)
     logging.getLogger('engineio').setLevel(logging.WARNING)
-    logging.getLogger('celery').setLevel(logging.INFO) # Keep celery logs visible
+    logging.getLogger('celery').setLevel(logging.INFO)
 
     log.info("Structured logging configured.", log_level=log_level_str, log_format=os.environ.get('LOG_FORMAT', 'console'))
     return log
 
-logger = setup_logging() # Use structlog logger globally
+logger = setup_logging()
 
 # ==================== HELPER FUNCTIONS ====================
-
 def get_required_env(var_name: str) -> str:
     """Get a required environment variable or raise an error."""
     value = os.environ.get(var_name)
@@ -220,9 +214,28 @@ def get_optional_env(var_name: str, default: Any = None) -> Any:
     logger.debug(f"Loaded optional env var: {var_name}", default_value=default)
     return value
 
-# ==================== INPUT VALIDATION SCHEMAS (Marshmallow) ====================
-# Item 3: Implement input validation
+# ==================== STANDARDIZED API RESPONSE HELPER ====================
+def create_standard_response(data: Any = None, error: str = None, status_code: int = 200) -> tuple:
+    """Creates a standardized JSON response."""
+    if error:
+        response = {"error": error}
+        if status_code == 200:
+            if "not found" in error.lower():
+                status_code = 404
+            elif "validation failed" in error.lower():
+                status_code = 400
+            elif "unauthorized" in error.lower():
+                status_code = 401
+            elif "forbidden" in error.lower():
+                status_code = 403
+            else:
+                status_code = 500
+    else:
+        response = {"data": data}
 
+    return jsonify(response), status_code
+
+# ==================== INPUT VALIDATION SCHEMAS (Marshmallow) ====================
 class RegisterSchema(Schema):
     username = fields.Str(required=True, validate=lambda s: len(s) >= 3)
     password = fields.Str(required=True, validate=lambda s: len(s) >= 8)
@@ -232,7 +245,20 @@ class LoginSchema(Schema):
     username = fields.Str(required=True)
     password = fields.Str(required=True)
 
-# Decorator for input validation
+class SubscribeSchema(Schema):
+    room = fields.Str(required=True, error_messages={"required": "Room name is required."})
+
+class UnsubscribeSchema(Schema):
+    room = fields.Str(required=True, error_messages={"required": "Room name is required."})
+
+class StreamSubscribeSchema(Schema):
+    stream_id = fields.Str(required=True, error_messages={"required": "Stream ID is required."})
+
+class DataRequestSchema(Schema):
+    type = fields.Str(required=True, error_messages={"required": "Data type is required."})
+    filters = fields.Dict(required=False, default={})
+
+# Decorator for HTTP JSON validation
 def validate_json(schema: Schema):
     def decorator(f):
         @wraps(f)
@@ -244,38 +270,60 @@ def validate_json(schema: Schema):
             json_data = request.get_json()
             if not json_data:
                 logger.warning("Validation failed: No JSON data received.")
-                return jsonify({"error": "Invalid JSON request"}), 400
+                return create_standard_response(error="Invalid JSON request", status_code=400)
             try:
-                validated_data = schema.load(json_data)
-                # Pass validated data to the route function if needed (e.g., via g object)
-                # from flask import g
-                # g.validated_data = validated_data
+                g.validated_data = schema.load(json_data)
                 return f(*args, **kwargs)
             except ValidationError as err:
                 logger.warning("Validation failed", errors=err.messages, received_data=json_data)
-                return jsonify({"error": "Validation failed", "messages": err.messages}), 400
+                return create_standard_response(error="Validation failed", status_code=400)
             except Exception as e:
                 logger.error("Unexpected error during validation", error=str(e), exc_info=True)
-                return jsonify({"error": "An internal error occurred during validation"}), 500
+                return create_standard_response(error="An internal error occurred during validation", status_code=500)
         return wrapper
     return decorator
 
-# --- NEW: Decorator for Role-Based Access Control ---
+# Decorator for WebSocket payload validation
+def validate_socket_payload(schema: Schema):
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            if not MARSHMALLOW_AVAILABLE:
+                logger.warning("Marshmallow not available, skipping WebSocket payload validation.")
+                return f(*args, **kwargs)
+
+            payload = args[0] if args else {}
+            if not isinstance(payload, dict):
+                logger.warning("Invalid WebSocket payload: not a dictionary.", received_payload=payload, sid=request.sid)
+                emit('error', {'message': 'Invalid payload format: Expected a JSON object.'})
+                return
+
+            try:
+                validated_payload = schema.load(payload)
+                new_args = (validated_payload,) + args[1:]
+                return f(*new_args, **kwargs)
+            except ValidationError as err:
+                logger.warning("WebSocket payload validation failed", errors=err.messages, received_payload=payload, sid=request.sid)
+                emit('error', {'message': 'Payload validation failed', 'details': err.messages})
+                return
+            except Exception as e:
+                logger.error("Unexpected error during WebSocket payload validation", error=str(e), exc_info=True, sid=request.sid)
+                emit('error', {'message': 'Internal validation error'})
+                return
+        return wrapper
+    return decorator
+
+# Decorator for RBAC
 def role_required(required_role: str):
     """Decorator to require a specific role from the JWT."""
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             try:
-                # First, verify JWT is present and valid
                 verify_jwt_in_request()
-                # Get the full token claims
                 claims = get_jwt()
-                # Get role, default to 'user' if claim is somehow missing
                 user_role = claims.get("role", "user")
 
-                # Check for 'admin' role, or if a specific role matches
-                # This logic grants 'admin' access to everything
                 if user_role == 'admin':
                     return fn(*args, **kwargs)
 
@@ -286,40 +334,38 @@ def role_required(required_role: str):
                         user_role=user_role,
                         identity=claims.get('sub')
                     )
-                    return jsonify({"error": "Access forbidden: Insufficient permissions"}), 403
+                    return create_standard_response(error="Access forbidden: Insufficient permissions", status_code=403)
 
                 return fn(*args, **kwargs)
             except (ExpiredSignatureError, DecodeError, InvalidTokenError) as e:
-                 logger.warning("Role verification failed: Invalid JWT", error=str(e))
-                 return jsonify({"error": f"Token is invalid: {str(e)}"}), 401
+                logger.warning("Role verification failed: Invalid JWT", error=str(e))
+                return create_standard_response(error=f"Token is invalid: {str(e)}", status_code=401)
             except Exception as e:
                 logger.error("Error during role verification", error=str(e), exc_info=True)
-                # This could be triggered if verify_jwt_in_request() fails (e.g., no token)
-                return jsonify({"error": "Authentication required"}), 401
+                return create_standard_response(error="Authentication required", status_code=401)
         return wrapper
     return decorator
 
-
 # ==================== DATABASE MODELS (SQLAlchemy) ====================
 Base = declarative_base()
-UTCDateTime = DateTime(timezone=True) # Use timezone-aware datetime
+UTCDateTime = DateTime(timezone=True)
 
 class DeviceData(Base):
     """SQLAlchemy model for device data"""
     __tablename__ = 'device_data'
 
-    id = Column(Integer, primary_key=True, autoinment=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     device_id = Column(String(100), nullable=False, index=True)
     device_type = Column(String(100))
     device_name = Column(String(200))
-    timestamp = Column(UTCDateTime, nullable=False, index=True, default=lambda: datetime.now(timezone.utc)) # Use UTC
+    timestamp = Column(UTCDateTime, nullable=False, index=True, default=lambda: datetime.now(timezone.utc))
     value = Column(Float)
     status = Column(String(50), index=True)
     health_score = Column(Float)
     efficiency_score = Column(Float)
     location = Column(String(200))
     unit = Column(String(50))
-    metadata = Column(Text)  # Store additional JSON data as text
+    metadata = Column(Text)
 
     __table_args__ = (
         Index('idx_device_timestamp', 'device_id', 'timestamp'),
@@ -332,9 +378,8 @@ class DeviceData(Base):
         if data.get('metadata'):
             try:
                 data['metadata'] = json.loads(data['metadata'])
-            except (json.JSONDecodeError, TypeError): # Added TypeError check
-                data['metadata'] = {} # Default to empty dict if metadata is not valid JSON
-        # Convert datetime to ISO string with timezone
+            except (json.JSONDecodeError, TypeError):
+                data['metadata'] = {}
         if isinstance(data.get('timestamp'), datetime):
             data['timestamp'] = data['timestamp'].isoformat()
         return data
@@ -343,17 +388,16 @@ class Alert(Base):
     """SQLAlchemy model for alerts"""
     __tablename__ = 'alerts'
 
-    # Changed id to String to match AlertManager's UUID generation
     id = Column(String(100), primary_key=True, default=lambda: str(uuid.uuid4()))
     device_id = Column(String(100), nullable=False, index=True)
-    rule_name = Column(String(100)) # Added rule_name
+    rule_name = Column(String(100))
     severity = Column(String(50), index=True)
-    message = Column(Text) # Renamed from description for clarity
-    timestamp = Column(UTCDateTime, nullable=False, index=True, default=lambda: datetime.now(timezone.utc)) # Use UTC
+    message = Column(Text)
+    timestamp = Column(UTCDateTime, nullable=False, index=True, default=lambda: datetime.now(timezone.utc))
     acknowledged = Column(Boolean, default=False, index=True)
-    resolved = Column(Boolean, default=False, index=True) # Added resolved status
-    value = Column(Float) # Value that triggered the alert
-    metadata = Column(Text) # Extra context
+    resolved = Column(Boolean, default=False, index=True)
+    value = Column(Float)
+    metadata = Column(Text)
 
     __table_args__ = (
         Index('idx_severity_timestamp', 'severity', 'timestamp'),
@@ -376,13 +420,12 @@ class User(Base):
     """SQLAlchemy model for users"""
     __tablename__ = 'users'
 
-    id = Column(Integer, primary_key=True, autoinment=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(100), unique=True, nullable=False, index=True)
-    password_hash = Column(String(255), nullable=False) # Store hash as string
-    email = Column(String(200), unique=True, index=True) # Added index
-    created_at = Column(UTCDateTime, default=lambda: datetime.now(timezone.utc)) # Use UTC
-    # --- NEW: Add role field ---
-    role = Column(String(50), nullable=False, default='user', index=True) # e.g., 'user', 'admin'
+    password_hash = Column(String(255), nullable=False)
+    email = Column(String(200), unique=True, index=True)
+    created_at = Column(UTCDateTime, default=lambda: datetime.now(timezone.utc))
+    role = Column(String(50), nullable=False, default='user', index=True)
 
     def to_dict(self):
         """Helper method to convert model instance to dictionary, excluding password"""
@@ -391,7 +434,7 @@ class User(Base):
             'username': self.username,
             'email': self.email,
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'role': self.role, # --- NEW: Include role ---
+            'role': self.role,
         }
 
 # ==================== DATABASE SETUP (SQLAlchemy) ====================
@@ -409,25 +452,22 @@ def init_database(db_url: str):
                 pool_size=int(get_optional_env('DB_POOL_SIZE', 20)),
                 max_overflow=int(get_optional_env('DB_MAX_OVERFLOW', 40)),
                 pool_pre_ping=True,
-                pool_recycle=3600, # Recycle connections hourly
+                pool_recycle=3600,
                 echo=get_optional_env('SQLALCHEMY_ECHO', 'False').lower() == 'true'
             )
-            # Test connection
             with engine.connect() as connection:
                 logger.info("Database connection successful.")
 
-            # Create tables
             Base.metadata.create_all(bind=engine)
             logger.info("Database tables checked/created successfully.")
 
-            # Create scoped session factory
             SessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
             SessionLocal = scoped_session(SessionFactory)
             logger.info("SQLAlchemy SessionLocal created.")
 
         except Exception as e:
             logger.critical(f"CRITICAL: Failed to initialize database: {e}", exc_info=True)
-            raise # Re-raise to prevent app from starting in broken state
+            raise
 
 @contextmanager
 def get_session():
@@ -465,17 +505,16 @@ class RedisCacheManager:
             return
         self.redis_url = redis_url or get_required_env('REDIS_URL')
         self.ttl = ttl
-        self.logger = structlog.get_logger('RedisCacheManager') # Use structlog
+        self.logger = structlog.get_logger('RedisCacheManager')
         self.client = None
         self.available = False
-        self.memory_cache = {} # Fallback
+        self.memory_cache = {}
 
         try:
-            # Decode responses=True makes get return strings directly
             self.client = redis.from_url(
                 self.redis_url,
-                decode_responses=True, # Changed for easier handling
-                socket_connect_timeout=5, # Added timeout
+                decode_responses=True,
+                socket_connect_timeout=5,
                 socket_keepalive=True
             )
             self.client.ping()
@@ -494,10 +533,8 @@ class RedisCacheManager:
                 data_str = self.client.get(key)
                 if data_str:
                     try:
-                        # Attempt to parse as JSON first
                         return json.loads(data_str)
                     except json.JSONDecodeError:
-                        # Fallback to returning the raw string if not JSON
                         self.logger.debug(f"Cache GET returned non-JSON string.", cache_key=key)
                         return data_str
                 return None
@@ -511,19 +548,17 @@ class RedisCacheManager:
         """Set value in cache with TTL, serializing complex types to JSON."""
         try:
             effective_ttl = ttl if ttl is not None else self.ttl
-            # Serialize non-primitive types to JSON
             if not isinstance(value, (str, int, float, bool)):
-                value_str = json.dumps(value, default=str) # Use default=str for datetimes etc.
+                value_str = json.dumps(value, default=str)
             else:
                 value_str = str(value)
 
             if self.available and self.client:
                 return self.client.setex(key, effective_ttl, value_str)
             else:
-                self.memory_cache[key] = value # Store original value in memory cache
-                # Simulate TTL for memory cache (basic cleanup, not perfect)
+                self.memory_cache[key] = value
                 if effective_ttl > 0:
-                        threading.Timer(effective_ttl, self.memory_cache.pop, args=[key, None]).start()
+                    threading.Timer(effective_ttl, self.memory_cache.pop, args=[key, None]).start()
                 return True
         except Exception as e:
             self.logger.error(f"Cache SET error", cache_key=key, error=str(e))
@@ -545,12 +580,11 @@ class RedisCacheManager:
         deleted_count = 0
         try:
             if self.available and self.client:
-                # Use scan_iter for potentially large number of keys
                 keys_to_delete = [key for key in self.client.scan_iter(match=pattern)]
                 if keys_to_delete:
                     deleted_count = self.client.delete(*keys_to_delete)
             else:
-                keys_to_delete = [k for k in self.memory_cache.keys() if pattern in k] # Simple pattern matching
+                keys_to_delete = [k for k in self.memory_cache.keys() if pattern in k]
                 for k in keys_to_delete:
                     del self.memory_cache[k]
                 deleted_count = len(keys_to_delete)
@@ -561,8 +595,6 @@ class RedisCacheManager:
             return 0
 
 # ==================== CELERY CONFIGURATION ====================
-# Item 5 & 7: Migrate to Celery + Celery Beat
-
 celery_app = None
 
 def make_celery(app_name=__name__):
@@ -578,7 +610,7 @@ def make_celery(app_name=__name__):
             app_name,
             broker=broker_url,
             backend=result_backend,
-            include=['Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2'] # Point to this module for tasks
+            include=['Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v3']
         )
     except Exception as e:
         logger.error(f"Failed to create Celery app", error=str(e), exc_info=True)
@@ -591,16 +623,13 @@ def init_celery(app: Flask, celery: Optional[Celery]):
     if not celery:
         return
 
-    # --- NEW: Celery Beat Schedule ---
-    # Replaces APScheduler tasks
     celery.conf.beat_schedule = {
         'cleanup-inactive-clients-every-5-minutes': {
-            'task': 'Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2.cleanup_inactive_clients_task',
+            'task': 'Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v3.cleanup_inactive_clients_task',
             'schedule': timedelta(minutes=5),
         },
         'retrain-models-daily': {
-            'task': 'Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2.run_model_retraining_task',
-            # Run daily at 1 AM UTC by default, configurable via env var
+            'task': 'Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v3.run_model_retraining_task',
             'schedule': crontab(
                 hour=int(get_optional_env('RETRAIN_HOUR_UTC', 1)),
                 minute=int(get_optional_env('RETRAIN_MINUTE_UTC', 0))
@@ -620,7 +649,6 @@ def init_celery(app: Flask, celery: Optional[Celery]):
     class ContextTask(Task):
         def __call__(self, *args, **kwargs):
             with app.app_context():
-                # Bind structlog context for the duration of the task
                 with structlog.contextvars.bound_contextvars(task_id=self.request.id, task_name=self.name):
                     logger.info("Executing Celery task within Flask context.")
                     try:
@@ -628,15 +656,18 @@ def init_celery(app: Flask, celery: Optional[Celery]):
                         logger.info("Celery task completed successfully.")
                         return result
                     except Exception as e:
-                            logger.error("Celery task failed", error=str(e), exc_info=True)
-                            raise # Re-raise for Celery error handling
+                        logger.error("Celery task failed", error=str(e), exc_info=True)
+                        raise
     celery.Task = ContextTask
     app.extensions["celery"] = celery
     logger.info("Celery initialized and linked with Flask app context.", beat_schedule_keys=list(celery.conf.beat_schedule.keys()))
 
+# ==================== FLASK BLUEPRINTS ====================
+auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
+api_bp = Blueprint('api', __name__, url_prefix='/api')
+tasks_bp = Blueprint('tasks', __name__, url_prefix='/api/tasks')
 
 # ==================== MAIN APPLICATION CLASS ====================
-
 class DigitalTwinApp:
     """Main Digital Twin Flask Application Class"""
 
@@ -652,17 +683,17 @@ class DigitalTwinApp:
         self.data_generator = None
         self.jwt: Optional[JWTManager] = None
         self.limiter: Optional[Limiter] = None
-        self.csrf: Optional[CSRFProtect] = None # NEW: CSRF Protection
-        self.metrics: Optional[PrometheusMetrics] = None # NEW: Prometheus Metrics
+        self.csrf: Optional[CSRFProtect] = None
+        self.metrics: Optional[PrometheusMetrics] = None
         self.celery: Optional[Celery] = celery_app
 
-        # Application state
         self.connected_clients: Dict[str, Dict] = {}
         self.start_time = datetime.now()
         self.rooms: Dict[str, Set[str]] = defaultdict(set)
+        self.db_available = False
 
-        self.logger = logger # Use structlog logger
-        self.logger.info("Digital Twin Application v3.4 starting...")
+        self.logger = logger
+        self.logger.info("Digital Twin Application v3.6 starting...")
 
         self._create_app()
         if not self.app:
@@ -671,9 +702,9 @@ class DigitalTwinApp:
         self._initialize_infrastructure()
         self._initialize_modules()
         self._setup_middleware()
-        self._setup_routes()
+        self._register_blueprints()
         self._setup_websocket_events()
-        self._start_background_tasks() # This will mainly start Celery Beat via config now
+        self._start_background_tasks()
         self._setup_error_handlers()
 
         self.logger.info("Application initialization complete.")
@@ -690,31 +721,26 @@ class DigitalTwinApp:
         is_production = get_optional_env('FLASK_ENV', 'development') == 'production'
 
         self.app.config.from_mapping(
-            SECRET_KEY=get_required_env('SECRET_KEY'), # Used for Flask session, CSRF
+            SECRET_KEY=get_required_env('SECRET_KEY'),
             DEBUG=get_optional_env('FLASK_DEBUG', 'False').lower() == 'true',
-            JWT_SECRET_KEY=get_required_env('JWT_SECRET_KEY'), # Separate key for JWT
+            JWT_SECRET_KEY=get_required_env('JWT_SECRET_KEY'),
             
-            # --- UPDATED: Token Expiry (Refresh Logic Enabled) ---
-            JWT_ACCESS_TOKEN_EXPIRES=timedelta(hours=int(get_optional_env('JWT_EXPIRY_HOURS', 1))), # Short-lived access token
-            JWT_REFRESH_TOKEN_EXPIRES=timedelta(days=int(get_optional_env('JWT_REFRESH_DAYS', 30))), # Long-lived refresh token
+            JWT_ACCESS_TOKEN_EXPIRES=timedelta(hours=int(get_optional_env('JWT_EXPIRY_HOURS', 1))),
+            JWT_REFRESH_TOKEN_EXPIRES=timedelta(days=int(get_optional_env('JWT_REFRESH_DAYS', 30))),
 
-            # --- UPDATED: Token Location & Cookie Settings ---
-            JWT_TOKEN_LOCATION=['headers', 'cookies'], # Allow both header and cookie
-            JWT_COOKIE_SECURE=is_production, # Use secure cookies in prod
-            JWT_COOKIE_SAMESITE='Lax', # Recommended default
-            JWT_COOKIE_CSRF_PROTECT=True, # Enable double submit CSRF protection
-            JWT_CSRF_CHECK_FORM=True, # Check CSRF for form submissions as well
+            JWT_TOKEN_LOCATION=['headers', 'cookies'],
+            JWT_COOKIE_SECURE=is_production,
+            JWT_COOKIE_SAMESITE='Lax',
+            JWT_COOKIE_CSRF_PROTECT=True,
+            JWT_CSRF_CHECK_FORM=True,
             
-            # --- NEW: Refresh Cookie Config ---
-            JWT_REFRESH_COOKIE_PATH='/api/auth/refresh', # Only send refresh cookie to the refresh endpoint
+            JWT_REFRESH_COOKIE_PATH='/api/auth/refresh',
             JWT_REFRESH_COOKIE_SECURE=is_production,
             JWT_REFRESH_COOKIE_SAMESITE='Lax',
             JWT_REFRESH_COOKIE_CSRF_PROTECT=True,
-            # --- End Update ---
 
-            # NEW: Needed for Flask-WTF CSRF
             WTF_CSRF_ENABLED=True,
-            WTF_CSRF_SECRET_KEY=get_required_env('SECRET_KEY'), # Can reuse Flask secret key
+            WTF_CSRF_SECRET_KEY=get_required_env('SECRET_KEY'),
 
             DATABASE_URL=get_required_env('DATABASE_URL'),
             REDIS_URL=get_required_env('REDIS_URL'),
@@ -723,10 +749,10 @@ class DigitalTwinApp:
             RATELIMIT_STORAGE_URI=get_required_env('REDIS_URL'),
             RATELIMIT_STRATEGY='fixed-window',
             RATELIMIT_HEADERS_ENABLED=True,
-            CORS_ALLOWED_ORIGINS=get_optional_env('CORS_ALLOWED_ORIGINS', '*').split(',') # Default to '*' if not set
+            CORS_ALLOWED_ORIGINS=get_optional_env('CORS_ALLOWED_ORIGINS', '*').split(',')
         )
 
-        self.logger.info(f"Flask app created.", environment=self.app.config['ENV'], debug=self.app.config['DEBUG'])
+        self.logger.info(f"Flask app created.", environment=get_optional_env('FLASK_ENV', 'development'), debug=self.app.config['DEBUG'])
 
     def _initialize_infrastructure(self):
         """Initialize DB, Redis, Celery, JWT, Limiter, CSRF, Prometheus"""
@@ -752,17 +778,14 @@ class DigitalTwinApp:
         else:
             self.limiter = Limiter()
 
-        # --- NEW: CSRF Protection ---
         self.csrf = CSRFProtect(self.app)
         self.logger.info("Flask-WTF CSRF protection initialized.")
 
-        # --- NEW: Prometheus Metrics ---
         if PROMETHEUS_AVAILABLE:
-            # Basic metrics: requests by endpoint, latency by endpoint
             self.metrics = PrometheusMetrics(self.app)
             self.logger.info("Prometheus metrics initialized.")
         else:
-            self.metrics = PrometheusMetrics() # Dummy
+            self.metrics = PrometheusMetrics()
 
         allowed_origins = self.app.config['CORS_ALLOWED_ORIGINS']
         try:
@@ -785,7 +808,6 @@ class DigitalTwinApp:
         except Exception as e:
             self.logger.error(f"Failed to initialize Flask-SocketIO", error=str(e), exc_info=True)
 
-
     def _initialize_modules(self):
         """Initialize AI and analytics modules"""
         self.logger.info("Initializing application modules...")
@@ -801,7 +823,6 @@ class DigitalTwinApp:
         except Exception as e:
             self.logger.error(f"Module initialization error", error=str(e), exc_info=True)
 
-
     def _setup_middleware(self):
         """Setup Flask middleware"""
         self.app.wsgi_app = ProxyFix(
@@ -815,38 +836,34 @@ class DigitalTwinApp:
 
         CORS(self.app,
              origins=self.app.config['CORS_ALLOWED_ORIGINS'],
-             supports_credentials=True, # Important for cookies
-             allow_headers=["Content-Type", "Authorization", "X-CSRF-TOKEN"]) # Allow CSRF token header
+             supports_credentials=True,
+             allow_headers=["Content-Type", "Authorization", "X-CSRF-TOKEN"])
         self.logger.info(f"CORS configured", origins=self.app.config['CORS_ALLOWED_ORIGINS'])
 
-        # --- NEW: Add request logging middleware ---
         @self.app.before_request
         def log_request_info():
-            # Bind request info to structlog context
             structlog.contextvars.bind_contextvars(
                 remote_addr=request.remote_addr,
                 method=request.method,
                 path=request.path,
                 endpoint=request.endpoint,
-                # request_id=str(uuid.uuid4()) # Optional: add request ID
             )
             logger.info("Request received")
 
         @self.app.after_request
         def log_response_info(response):
             logger.info("Request completed", status_code=response.status_code)
-            # Clear context vars for this request
             structlog.contextvars.clear_contextvars()
             return response
 
-    # ==================== DATABASE OPERATIONS (SQLAlchemy) ====================
-    # (Methods remain the same)
-    # ... bulk_insert_device_data ...
-    # ... get_latest_device_data ...
-    # ... insert_alert ...
-    # ... get_recent_alerts ...
-    # ... acknowledge_alert_db ...
+    def _register_blueprints(self):
+        """Register Flask Blueprints."""
+        self.app.register_blueprint(auth_bp)
+        self.app.register_blueprint(api_bp)
+        self.app.register_blueprint(tasks_bp)
+        self.logger.info("Flask Blueprints registered.")
 
+    # ==================== DATABASE OPERATIONS ====================
     def bulk_insert_device_data(self, data_list: List[Dict]) -> bool:
         """Bulk insert device data efficiently using SQLAlchemy"""
         inserted_count = 0
@@ -854,12 +871,10 @@ class DigitalTwinApp:
             with get_session() as session:
                 objects_to_insert = []
                 for d in data_list:
-                    # Basic validation
                     if not d.get('device_id') or not d.get('timestamp'):
                         self.logger.warning(f"Skipping invalid device data record", record=d)
                         continue
 
-                    # Ensure timestamp is datetime and timezone-aware (UTC)
                     ts = d['timestamp']
                     timestamp = None
                     if isinstance(ts, str):
@@ -882,7 +897,7 @@ class DigitalTwinApp:
                         device_id=d['device_id'],
                         device_type=d.get('device_type'),
                         device_name=d.get('device_name'),
-                        timestamp=timestamp, # Use timezone-aware datetime
+                        timestamp=timestamp,
                         value=float(d['value']) if d.get('value') is not None else None,
                         status=d.get('status'),
                         health_score=float(d['health_score']) if d.get('health_score') is not None else None,
@@ -906,29 +921,25 @@ class DigitalTwinApp:
         """Get latest device data efficiently using SQLAlchemy"""
         cache_key = f"latest_devices:{limit}"
         cached = self.cache.get(cache_key)
-        if cached is not None and isinstance(cached, list): # Check type
+        if cached is not None and isinstance(cached, list):
             self.logger.debug(f"Cache hit", cache_key=cache_key)
             try:
-                # Recreate DataFrame from cached dict list
                 df = pd.DataFrame(cached)
-                # Ensure timestamp is datetime after loading from cache
                 if 'timestamp' in df.columns:
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
                 return df
             except Exception as e:
                 self.logger.warning(f"Failed to create DataFrame from cache", cache_key=cache_key, error=str(e))
-                self.cache.delete(cache_key) # Invalidate cache
+                self.cache.delete(cache_key)
 
         self.logger.debug(f"Cache miss", cache_key=cache_key)
         try:
             with get_session() as session:
-                # Subquery to find the latest timestamp for each device_id
                 subq = session.query(
                     DeviceData.device_id,
                     func.max(DeviceData.timestamp).label('max_ts')
                 ).group_by(DeviceData.device_id).subquery()
 
-                # Join DeviceData with the subquery
                 query = session.query(DeviceData).join(
                     subq,
                     (DeviceData.device_id == subq.c.device_id) &
@@ -936,13 +947,12 @@ class DigitalTwinApp:
                 ).order_by(DeviceData.timestamp.desc()).limit(limit)
 
                 results = query.all()
-                data_list = [r.to_dict() for r in results] # Converts datetime to ISO string
+                data_list = [r.to_dict() for r in results]
 
             self.logger.info(f"Fetched latest device data from DB", count=len(results))
             if data_list:
-                self.cache.set(cache_key, data_list, ttl=60) # Cache the list of dicts
+                self.cache.set(cache_key, data_list, ttl=60)
                 df = pd.DataFrame(data_list)
-                # Ensure timestamp is datetime after loading from DB
                 if 'timestamp' in df.columns:
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
                 return df
@@ -966,11 +976,10 @@ class DigitalTwinApp:
                     except ValueError:
                         timestamp = datetime.now(timezone.utc)
                 elif isinstance(ts, datetime):
-                     timestamp = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                    timestamp = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
                 else:
                     timestamp = datetime.now(timezone.utc)
 
-                # Use AlertManager generated ID if available, else generate new
                 alert_id = alert_data.get('id', str(uuid.uuid4()))
 
                 alert = Alert(
@@ -979,7 +988,7 @@ class DigitalTwinApp:
                     rule_name=alert_data.get('rule_name'),
                     severity=alert_data['severity'],
                     message=alert_data.get('description') or alert_data.get('message'),
-                    timestamp=timestamp, # Use timezone-aware datetime
+                    timestamp=timestamp,
                     value=float(alert_data['value']) if alert_data.get('value') is not None else None,
                     acknowledged=alert_data.get('acknowledged', False),
                     resolved=alert_data.get('resolved', False),
@@ -987,7 +996,6 @@ class DigitalTwinApp:
                 )
                 session.add(alert)
             self.logger.info(f"Inserted alert", alert_id=alert_id)
-            # Invalidate relevant alert cache
             self.cache.clear_pattern("alerts:*")
             return True
         except Exception as e:
@@ -1016,9 +1024,9 @@ class DigitalTwinApp:
                 query = query.order_by(Alert.timestamp.desc()).limit(limit)
                 results = query.all()
 
-            data_list = [r.to_dict() for r in results] # Converts datetime to ISO string
+            data_list = [r.to_dict() for r in results]
             self.logger.info(f"Fetched recent alerts from DB", count=len(results))
-            self.cache.set(cache_key, data_list, ttl=30) # Cache for 30 seconds
+            self.cache.set(cache_key, data_list, ttl=30)
             return data_list
         except Exception as e:
             self.logger.error(f"Get alerts error", error=str(e), exc_info=True)
@@ -1032,18 +1040,17 @@ class DigitalTwinApp:
                 if alert:
                     if not alert.acknowledged:
                         alert.acknowledged = True
-                        alert.metadata = json.dumps({ # Add ack info to metadata
+                        alert.metadata = json.dumps({
                             **(json.loads(alert.metadata) if alert.metadata else {}),
                             "acknowledged_by": user_id,
-                            "acknowledged_at": datetime.now(timezone.utc).isoformat() # Use UTC
+                            "acknowledged_at": datetime.now(timezone.utc).isoformat()
                         })
                         self.logger.info(f"Alert acknowledged in DB", alert_id=alert_id, user_id=user_id)
-                        # Invalidate cache
                         self.cache.clear_pattern("alerts:*")
                         return True
                     else:
                         self.logger.warning(f"Alert already acknowledged", alert_id=alert_id)
-                        return False # Or True, depending on desired idempotency behavior
+                        return False
                 else:
                     self.logger.warning(f"Alert not found for acknowledgment", alert_id=alert_id)
                     return False
@@ -1051,15 +1058,12 @@ class DigitalTwinApp:
             self.logger.error(f"DB Acknowledge error", alert_id=alert_id, error=str(e), exc_info=True)
             return False
 
-
-    # --- UPDATED: create_user_sqlalchemy ---
     def create_user_sqlalchemy(self, username: str, password: str, email: Optional[str] = None) -> bool:
         """Creates a new user with bcrypt hashed password"""
         try:
-            # Hash password using bcrypt
             password_bytes = password.encode('utf-8')
             salt = bcrypt.gensalt()
-            password_hash = bcrypt.hashpw(password_bytes, salt).decode('utf-8') # Store hash as string
+            password_hash = bcrypt.hashpw(password_bytes, salt).decode('utf-8')
 
             with get_session() as session:
                 existing_user = session.query(User).filter(
@@ -1071,7 +1075,6 @@ class DigitalTwinApp:
                     self.logger.warning(f"User creation failed: Username or email already exists.", username=username, email=email)
                     return False
 
-                # Role will be set to 'user' by default from the model
                 new_user = User(username=username, password_hash=password_hash, email=email)
                 session.add(new_user)
 
@@ -1080,12 +1083,10 @@ class DigitalTwinApp:
         except SQLAlchemyError as e:
             self.logger.error(f"Error creating user via SQLAlchemy", username=username, error=str(e), exc_info=True)
             return False
-        except Exception as e: # Catch potential bcrypt errors
-             self.logger.error(f"Error hashing password during user creation", username=username, error=str(e), exc_info=True)
-             return False
+        except Exception as e:
+            self.logger.error(f"Error hashing password during user creation", username=username, error=str(e), exc_info=True)
+            return False
 
-
-    # --- UPDATED: authenticate_user_sqlalchemy ---
     def authenticate_user_sqlalchemy(self, username: str, password: str) -> Optional[User]:
         """Authenticates a user using bcrypt"""
         try:
@@ -1095,7 +1096,6 @@ class DigitalTwinApp:
             if user and user.password_hash:
                 password_bytes = password.encode('utf-8')
                 stored_hash_bytes = user.password_hash.encode('utf-8')
-                # Check password using bcrypt
                 if bcrypt.checkpw(password_bytes, stored_hash_bytes):
                     self.logger.info(f"User authenticated successfully via SQLAlchemy (bcrypt).", username=username)
                     return user
@@ -1105,715 +1105,19 @@ class DigitalTwinApp:
         except SQLAlchemyError as e:
             self.logger.error(f"Error authenticating user via SQLAlchemy", username=username, error=str(e), exc_info=True)
             return None
-        except Exception as e: # Catch potential bcrypt errors
-             self.logger.error(f"Error checking password during authentication", username=username, error=str(e), exc_info=True)
-             return None
-
-    # ==================== ROUTES ====================
-
-    def _setup_routes(self):
-        """Setup all Flask routes"""
-        self.logger.info("Setting up Flask routes...")
-        limiter = self.limiter
-        metrics = self.metrics # Get Prometheus metrics instance
-
-        # Define Prometheus metrics (if available)
-        if PROMETHEUS_AVAILABLE:
-            login_counter = metrics.counter(
-                'logins_total', 'Total number of logins',
-                labels={'status': lambda r: 'success' if r.status_code == 200 else 'failure'}
-            )
-            registration_counter = metrics.counter(
-                'registrations_total', 'Total number of registrations',
-                 labels={'status': lambda r: 'success' if r.status_code == 201 else 'failure'}
-            )
-        else: # Dummy decorators if Prometheus not available
-            login_counter = lambda f: f
-            registration_counter = lambda f: f
-
-        # ==================== AUTH ENDPOINTS (with Validation) ====================
-
-        @self.app.route('/api/auth/register', methods=['POST'])
-        @limiter.limit("5 per hour")
-        @validate_json(RegisterSchema()) # Apply validation
-        # @(registration_counter if PROMETHEUS_AVAILABLE else lambda f: f) # Apply counter conditionally
-        def register():
-            data = request.get_json() # Already validated
-            username = data['username']
-            password = data['password']
-            email = data['email']
-
-            # Use the updated method with bcrypt
-            if self.create_user_sqlalchemy(username, password, email):
-                logger.info("User registration successful", username=username)
-                # Apply counter manually for success
-                # if PROMETHEUS_AVAILABLE: registration_counter(lambda: Response(status=201))() # Execute dummy response
-                return jsonify({"message": "User registered successfully"}), 201
-            else:
-                logger.warning("User registration failed in DB layer", username=username)
-                # Apply counter manually for failure
-                # if PROMETHEUS_AVAILABLE: registration_counter(lambda: Response(status=409))() # Execute dummy response
-                return jsonify({"error": "Registration failed. Username or email may already exist."}), 409
-
-        @self.app.route('/api/auth/login', methods=['POST'])
-        @limiter.limit("10 per minute")
-        @validate_json(LoginSchema()) # Apply validation
-        # @(login_counter if PROMETHEUS_AVAILABLE else lambda f: f) # Apply counter conditionally
-        def login():
-            data = request.get_json() # Already validated
-            username = data['username']
-            password = data['password']
-
-            # Use the updated method with bcrypt
-            user = self.authenticate_user_sqlalchemy(username, password)
-
-            if not user:
-                logger.warning("Login failed: Invalid credentials", username=username)
-                # Apply counter manually for failure
-                # if PROMETHEUS_AVAILABLE: login_counter(lambda: Response(status=401))()
-                return jsonify({"error": "Invalid credentials"}), 401
-
-            # --- Add role to JWT claims ---
-            additional_claims = {"role": user.role}
-            access_token = create_access_token(identity=user.username, additional_claims=additional_claims)
-            # --- ENABLED: Add refresh token ---
-            refresh_token = create_refresh_token(identity=user.username)
-
-            response = jsonify(
-                access_token=access_token, # Client-side can store this in memory
-                # refresh_token is in HttpOnly cookie, not body
-                user=user.to_dict()
-            )
-
-            # Set HttpOnly cookie for access token
-            set_access_cookies(response, access_token)
-            # --- ENABLED: Set HttpOnly cookie for refresh token ---
-            set_refresh_cookies(response, refresh_token)
-
-            logger.info("Login successful, JWT access and refresh cookies set", username=username, role=user.role)
-
-            # Apply counter manually for success
-            # if PROMETHEUS_AVAILABLE: login_counter(lambda: Response(status=200))()
-            return response, 200
-
-        # --- ENABLED: Refresh Token Endpoint ---
-        @self.app.route('/api/auth/refresh', methods=['POST'])
-        @jwt_required(refresh=True) # Requires a valid refresh token cookie
-        @limiter.limit("5 per minute")
-        def refresh():
-            # We already know the refresh token is valid thanks to @jwt_required(refresh=True)
-            current_user = get_jwt_identity()
-            
-            # Fetch user to get current role, in case roles changed
-            user = None
-            try:
-                with get_session() as session:
-                    user = session.query(User).filter(func.lower(User.username) == func.lower(current_user)).first()
-            except Exception as e:
-                logger.error("Could not fetch user during refresh", username=current_user, error=str(e))
-                return jsonify({"error": "Error verifying user"}), 500
-
-            if not user:
-                logger.warning("User not found during refresh", username=current_user)
-                return jsonify({"error": "User not found"}), 401
-
-            user_role = user.role
-            additional_claims = {"role": user_role}
-            
-            # Create a new access token
-            new_access_token = create_access_token(identity=current_user, additional_claims=additional_claims)
-            
-            # Send back the new access token
-            # The client-side app will receive this and should store it (e.g., in memory)
-            response = jsonify(access_token=new_access_token)
-            
-            # Set the new access token in the cookie as well
-            set_access_cookies(response, new_access_token)
-            
-            logger.info("Access token refreshed", username=current_user, role=user_role)
-            return response, 200
-
-        @self.app.route('/api/auth/logout', methods=['POST'])
-        def logout():
-            # No validation needed
-            current_user = None
-            try:
-                 # Verify token to log who is logging out
-                 verify_jwt_in_request(optional=True) 
-                 current_user = get_jwt_identity()
-            except Exception:
-                 pass # Ignore if token is invalid/expired
-                 
-            response = jsonify({"message": "Logout successful"})
-            unset_jwt_cookies(response) # Clear access AND refresh cookies
-            logger.info("User logged out", username=current_user or "Unknown")
-            # TODO: Add token to blocklist if using JWT blocklisting
-            return response, 200
-
-        @self.app.route('/api/auth/me')
-        @jwt_required() # Ensures access token is valid (either header or cookie)
-        @limiter.limit("120 per minute")
-        def protected():
-            current_user_identity = get_jwt_identity()
-            # --- Get role from claims ---
-            claims = get_jwt()
-            user_role = claims.get('role', 'user')
-
-            logger.debug("Accessed protected /me endpoint", username=current_user_identity, role=user_role)
-            # Optionally fetch full user from DB if needed
-            # For now, just return identity and role
-            return jsonify(logged_in_as=current_user_identity, role=user_role)
-
-        # ==================== PAGE ROUTES ====================
-        # (Serve React App - No changes)
-        @self.app.route('/', defaults={'path': ''})
-        @self.app.route('/<path:path>')
-        def serve_react_app(path):
-            static_folder = self.app.static_folder
-            if static_folder is None:
-                logger.error("Static folder not configured.")
-                return "Static folder not found", 404
-
-            # Security: Basic path validation to prevent directory traversal
-            safe_path = os.path.normpath(os.path.join(static_folder, path)).lstrip(os.path.sep)
-            full_path = os.path.join(static_folder, safe_path)
-
-            if path != "" and os.path.exists(full_path) and os.path.isfile(full_path):
-                # Ensure the resolved path is still within the static folder
-                if os.path.commonprefix((os.path.realpath(full_path), os.path.realpath(static_folder))) == os.path.realpath(static_folder):
-                    return send_from_directory(static_folder, safe_path)
-                else:
-                    logger.warning("Attempted directory traversal", requested_path=path)
-                    return "Not Found", 404
-            else:
-                index_path = os.path.join(static_folder, 'index.html')
-                if not os.path.exists(index_path):
-                    logger.error("index.html not found in static folder.", path=index_path)
-                    return "Frontend entry point not found", 404
-                return send_from_directory(static_folder, 'index.html')
-
-
-        # ==================== API ENDPOINTS ====================
-
-        @self.app.route('/health')
-        @limiter.exempt
-        def health_check():
-            # (Remains the same)
-            db_ok = False
-            redis_ok = self.cache.available if self.cache else False
-            celery_ok = False
-            try:
-                # Use engine directly for simple check
-                with engine.connect() as connection: db_ok = True
-            except Exception as e: logger.error(f"Health check DB failed", error=str(e))
-            if self.celery:
-                try:
-                    # Basic check: ping a worker (might be slow/unreliable)
-                    # Or check connection to broker/backend
-                    self.celery.broker_connection().ensure_connection(max_retries=1)
-                    celery_ok = True
-                except Exception as e:
-                    logger.warning("Health check Celery failed", error=str(e))
-
-            status = {
-                'status': 'healthy' if db_ok and redis_ok and celery_ok else 'partial',
-                'timestamp': datetime.now().isoformat(),
-                'version': '3.4.0', # Updated version
-                'checks': {
-                    'redis': 'ok' if redis_ok else 'unavailable',
-                    'postgresql': 'ok' if db_ok else 'unavailable',
-                    'celery': 'ok' if celery_ok else 'unavailable',
-                },
-                'uptime': str(datetime.now() - self.start_time).split('.')[0]
-            }
-            status_code = 200 if status['status'] == 'healthy' else 503
-            return jsonify(status), status_code
-
-        # --- UPDATED: /metrics endpoint for Prometheus ---
-        @self.app.route('/metrics')
-        @limiter.exempt
-        def prometheus_metrics():
-            """Expose metrics for Prometheus scraping."""
-            if not PROMETHEUS_AVAILABLE or not self.metrics:
-                return jsonify({"message": "Prometheus exporter not available."}), 503
-            # The exporter handles generating the response automatically
-            logger.debug("Serving Prometheus metrics")
-            return Response("", mimetype='text/plain') # Let the middleware handle it
-
-
-        @self.app.route('/api/dashboard')
-        @jwt_required()
-        @limiter.limit("60 per minute")
-        def get_dashboard_data():
-            """Get combined dashboard data"""
-            try:
-                cache_key = 'dashboard_combined_data'
-                cached = self.cache.get(cache_key)
-                if cached: return jsonify(cached)
-
-                latest_devices_df = self.get_latest_device_data(limit=500)
-                recent_alerts = self.get_recent_alerts(limit=20, acknowledged=False)
-                overview_data = {}
-                if not latest_devices_df.empty:
-                    total_devices = latest_devices_df['device_id'].nunique()
-                    active_devices = latest_devices_df[latest_devices_df['status'] != 'offline'].shape[0]
-                    avg_health = latest_devices_df['health_score'].dropna().mean() * 100 if not latest_devices_df['health_score'].dropna().empty else 0
-                    avg_efficiency = latest_devices_df['efficiency_score'].dropna().mean() * 100 if not latest_devices_df['efficiency_score'].dropna().empty else 0
-                    status_counts = latest_devices_df['status'].value_counts().to_dict()
-                    status_distribution = { 'normal': status_counts.get('normal', 0), 'warning': status_counts.get('warning', 0), 'critical': status_counts.get('critical', 0), 'offline': status_counts.get('offline', 0) }
-                    energy_usage_df = latest_devices_df[latest_devices_df['device_type']=='power_meter']['value']
-                    energy_usage = energy_usage_df.sum() / 1000.0 if not energy_usage_df.empty else 0.0 # Convert W to kW
-
-                    overview_data = {
-                        'systemHealth': round(avg_health),
-                        'activeDevices': active_devices,
-                        'totalDevices': total_devices,
-                        'efficiency': round(avg_efficiency),
-                        'energyUsage': round(energy_usage, 1),
-                        'energyCost': round(energy_usage * 24 * 0.12), # Assuming $0.12/kWh
-                        'statusDistribution': status_distribution,
-                        'timestamp': datetime.now(timezone.utc).isoformat()
-                    }
-
-                # Generate dummy performance data
-                perf_data = []
-                if 'systemHealth' in overview_data and 'efficiency' in overview_data:
-                     base_health = overview_data['systemHealth']
-                     base_eff = overview_data['efficiency']
-                     now = datetime.now(timezone.utc)
-                     for i in range(24): # Last 24 hours
-                         ts = now - timedelta(hours=i)
-                         perf_data.append({
-                             'timestamp': ts.isoformat(),
-                             'systemHealth': max(0, min(100, base_health + random.uniform(-2, 2) - i*0.1)),
-                             'efficiency': max(0, min(100, base_eff + random.uniform(-1, 1) - i*0.05)),
-                             'energyUsage': max(0, overview_data.get('energyUsage', 0) * (1 + random.uniform(-0.1, 0.1) - i*0.01))
-                         })
-                     perf_data.reverse() # Oldest first
-
-                dashboard_payload = {
-                    **overview_data,
-                    'devices': latest_devices_df.to_dict('records')[:100],
-                    'alerts': recent_alerts,
-                    'performanceData': perf_data
-                }
-                self.cache.set(cache_key, dashboard_payload, ttl=30)
-                return jsonify(dashboard_payload)
-            except Exception as e:
-                self.logger.error(f"Error fetching dashboard data", error=str(e), exc_info=True)
-                return jsonify({"error": "Failed to retrieve dashboard data"}), 500
-
-        @self.app.route('/api/devices')
-        @jwt_required()
-        @limiter.limit("120 per minute")
-        def get_devices():
-            try:
-                limit = request.args.get('limit', default=1000, type=int)
-                devices_df = self.get_latest_device_data(limit=limit)
-                return jsonify(devices_df.to_dict('records'))
-            except Exception as e:
-                self.logger.error(f"Error getting devices", error=str(e), exc_info=True)
-                return jsonify({"error": "Failed to retrieve devices"}), 500
-
-        @self.app.route('/api/devices/<string:device_id>')
-        @jwt_required()
-        @limiter.limit("120 per minute")
-        def get_device(device_id):
-            cache_key = f'device_latest:{device_id}'
-            cached = self.cache.get(cache_key)
-            if cached: return jsonify(cached)
-            try:
-                with get_session() as session:
-                    device_data = session.query(DeviceData).filter(DeviceData.device_id == device_id).order_by(DeviceData.timestamp.desc()).first()
-                if device_data:
-                    data_dict = device_data.to_dict()
-                    self.cache.set(cache_key, data_dict, ttl=60)
-                    return jsonify(data_dict)
-                else:
-                    return jsonify({"error": "Device not found"}), 404
-            except Exception as e:
-                self.logger.error(f"Error getting device", device_id=device_id, error=str(e), exc_info=True)
-                return jsonify({"error": "Failed to retrieve device data"}), 500
-
-        @self.app.route('/api/alerts')
-        @jwt_required()
-        @limiter.limit("120 per minute")
-        def get_alerts():
-            try:
-                limit = request.args.get('limit', default=50, type=int)
-                severity = request.args.get('severity', default=None, type=str)
-                acknowledged_str = request.args.get('acknowledged', default=None, type=str)
-                acknowledged_filter: Optional[bool] = None
-                if acknowledged_str is not None: acknowledged_filter = acknowledged_str.lower() == 'true'
-                alerts = self.get_recent_alerts(limit=limit, severity=severity, acknowledged=acknowledged_filter)
-                return jsonify(alerts)
-            except Exception as e:
-                self.logger.error(f"Error getting alerts", error=str(e), exc_info=True)
-                return jsonify({"error": "Failed to retrieve alerts"}), 500
-
-        @self.app.route('/api/alerts/acknowledge/<string:alert_id>', methods=['POST'])
-        @jwt_required()
-        @limiter.limit("30 per minute")
-        # @self.csrf.exempt # Exempt if using header-based JWT primarily, or ensure CSRF token is sent
-        def acknowledge_alert_api(alert_id):
-            user_id = get_jwt_identity() # Get user from JWT
-            success = self.acknowledge_alert_db(alert_id, user_id)
-            if success:
-                updated_alert_data = None
-                with get_session() as session:
-                    alert = session.query(Alert).filter(Alert.id == alert_id).first()
-                    if alert: updated_alert_data = alert.to_dict()
-
-                if self.socketio:
-                    # Broadcast acknowledgment update
-                    self.socketio.emit('alert_acknowledged', {
-                        'alertId': alert_id,
-                        'acknowledgedBy': user_id,
-                        'timestamp': datetime.now(timezone.utc).isoformat()
-                        }, room='alerts') # Assuming an 'alerts' room
-
-                # Invalidate cache after successful DB update and broadcast
-                self.cache.clear_pattern("alerts:*")
-                return jsonify({"message": "Alert acknowledged", "alert": updated_alert_data}), 200
-            else:
-                return jsonify({"error": "Failed to acknowledge alert or alert not found"}), 404
-
-        # --- Example Admin-Only Route ---
-        @self.app.route('/api/admin/summary')
-        @jwt_required()
-        @role_required('admin') # <-- NEW RBAC DECORATOR IN USE
-        @limiter.limit("30 per minute")
-        def get_admin_summary():
-            """An example route only accessible to users with the 'admin' role."""
-            logger.info("Admin summary endpoint accessed", user=get_jwt_identity())
-            try:
-                with get_session() as session:
-                     user_count = session.query(User).count()
-                     device_count = session.query(DeviceData.device_id).distinct().count()
-                return jsonify({
-                    "message": "Welcome, Admin!",
-                    "total_users": user_count,
-                    "total_devices": device_count,
-                    "connected_clients": len(self.connected_clients)
-                })
-            except Exception as e:
-                logger.error("Error fetching admin summary", error=str(e), exc_info=True)
-                return jsonify({"error": "Failed to fetch admin summary"}), 500
-
-
-        # --- Placeholders ---
-        @self.app.route('/api/predictions')
-        @jwt_required()
-        @limiter.limit("60 per minute")
-        def get_predictions():
-            device_id = request.args.get('device_id')
-            if not device_id: return jsonify({"error": "device_id query parameter is required"}), 400
-            # TODO: Integrate with PredictiveAnalyticsEngine.predict_failure(...) etc.
-            logger.info("Serving predictions (placeholder)", device_id=device_id)
-            # Example using engine if available
-            if self.analytics_engine:
-                 # Fetch recent data for the device to feed the model
-                 try:
-                     with get_session() as session:
-                         recent_data_db = session.query(DeviceData).filter(DeviceData.device_id == device_id).order_by(DeviceData.timestamp.desc()).limit(50).all() # Fetch enough for features
-                     if not recent_data_db: return jsonify({"message": f"No recent data for {device_id}", "device_id": device_id}), 404
-                     recent_data_df = pd.DataFrame([d.to_dict() for d in recent_data_db])
-
-                     # Call prediction methods (assuming they take DataFrame)
-                     anomaly_pred = self.analytics_engine.detect_anomalies(recent_data_df)
-                     failure_pred = self.analytics_engine.predict_failure(recent_data_df)
-
-                     return jsonify({
-                         "device_id": device_id,
-                         "anomaly_prediction": anomaly_pred,
-                         "failure_prediction": failure_pred
-                     })
-                 except Exception as e:
-                    logger.error("Error generating predictions", device_id=device_id, error=str(e), exc_info=True)
-                    return jsonify({"error": "Prediction generation failed"}), 500
-            else:
-                 return jsonify({"message": f"Predictions for {device_id} (engine unavailable)", "device_id": device_id}), 501
-
-
-        @self.app.route('/api/health_scores')
-        @jwt_required()
-        @limiter.limit("60 per minute")
-        def get_health_scores():
-            # TODO: Integrate with HealthScoreCalculator.calculate_fleet_health_score(...)
-            logger.info("Serving health scores (placeholder)")
-            if self.health_calculator:
-                try:
-                    latest_devices_df = self.get_latest_device_data(limit=500)
-                    if latest_devices_df.empty:
-                        return jsonify({}), 200 # Return empty if no devices
-
-                    # Group data by device_id for fleet calculation
-                    fleet_data = {
-                        device_id: group_df
-                        for device_id, group_df in latest_devices_df.groupby('device_id')
-                    }
-                    fleet_health = self.health_calculator.calculate_fleet_health_score(fleet_data)
-                    # Return only the device_id -> health score mapping for simplicity
-                    scores_only = {
-                         dev_id: result.get('overall_score')
-                         for dev_id, result in fleet_health.get('device_results', {}).items()
-                         if not result.get('error')
-                    }
-                    return jsonify(scores_only), 200
-                except Exception as e:
-                     logger.error("Error calculating health scores", error=str(e), exc_info=True)
-                     return jsonify({"error": "Health score calculation failed"}), 500
-            else:
-                 return jsonify({"message": "Health scores (engine unavailable)"}), 501
-
-
-        @self.app.route('/api/recommendations')
-        @jwt_required()
-        @limiter.limit("30 per minute")
-        def get_recommendations():
-            # TODO: Integrate with RecommendationEngine.generate_recommendations(...)
-            logger.info("Serving recommendations (placeholder)")
-            if self.recommendation_engine:
-                 try:
-                      # Generate recommendations based on current state (needs health data, etc.)
-                      # This is a simplified example; a real implementation needs more context.
-                      health_data_mock = {'overall_score': 0.8} # Mock data
-                      recs = self.recommendation_engine.generate_recommendations(health_data=health_data_mock)
-                      # Flatten the recommendations for the API
-                      flat_recs = []
-                      for cat in ['emergency', 'maintenance', 'optimization', 'operational', 'preventive']:
-                           flat_recs.extend(recs.get(f'{cat}_recommendations', []))
-                      flat_recs.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
-                      return jsonify(flat_recs[:10]), 200 # Return top 10
-                 except Exception as e:
-                      logger.error("Error generating recommendations", error=str(e), exc_info=True)
-                      return jsonify({"error": "Recommendation generation failed"}), 500
-            else:
-                 return jsonify({"message": "Recommendations (engine unavailable)"}), 501
-
-
-        @self.app.route('/api/system_metrics')
-        @jwt_required()
-        @limiter.limit("120 per minute")
-        def get_system_metrics_api():
-            logger.info("Serving system metrics")
-            return jsonify(self._get_system_metrics())
-
-        # --- Celery Task Routes ---
-        @self.app.route('/api/tasks/start_report', methods=['POST'])
-        @jwt_required()
-        @role_required('admin') # Example: Only admins can run reports
-        @limiter.limit("5 per hour")
-        @self.csrf.exempt # Typically exempt for API calls if using header auth
-        def start_report_task():
-            if not self.celery: return jsonify({"error": "Async task runner not available"}), 503
-            try:
-                user_id = get_jwt_identity()
-                # Ensure the task name matches the one defined with @celery_app.task
-                task = celery_app.send_task('digital_twin.generate_report', args=[user_id])
-                logger.info(f"Dispatched generate_report_task", task_id=task.id, user_id=user_id)
-                return jsonify({"task_id": task.id, "status": "PENDING"}), 202
-            except Exception as e:
-                logger.error(f"Failed to dispatch Celery task", error=str(e), exc_info=True)
-                return jsonify({"error": "Failed to start report generation task"}), 500
-
-        @self.app.route('/api/tasks/status/<string:task_id>')
-        @jwt_required()
-        @limiter.limit("60 per minute")
-        def get_task_status(task_id):
-            if not self.celery: return jsonify({"error": "Async task runner not available"}), 503
-            try:
-                 # Use AsyncResult from the specific task if possible, otherwise use celery_app
-                 task_result = celery_app.AsyncResult(task_id) # Generic way
-                 # task_result = generate_report_task.AsyncResult(task_id) # Specific way if task is imported
-
-                 response = {'task_id': task_id, 'status': task_result.status}
-                 if task_result.ready():
-                     if task_result.successful():
-                         response['result'] = task_result.result
-                     else:
-                         response['error'] = str(task_result.result)
-                         logger.warning(f"Task failed", task_id=task_id, error=str(task_result.result), traceback=task_result.traceback)
-                 logger.debug("Checked task status", task_id=task_id, status=response['status'])
-                 return jsonify(response)
-            except Exception as e:
-                logger.error(f"Failed to get task status", task_id=task_id, error=str(e), exc_info=True)
-                return jsonify({"error": "Failed to retrieve task status"}), 500
-
-
-        # --- Static File Serving ---
-        @self.app.route('/reports/<path:filename>')
-        # @jwt_required() # Optional protection
-        def serve_report(filename):
-            reports_dir = Path(get_optional_env('REPORTS_DIR', 'REPORTS/generated'))
-            logger.debug(f"Attempting to serve report", filename=filename, directory=str(reports_dir))
-            if not reports_dir.is_dir():
-                logger.error(f"Reports directory not found", directory=str(reports_dir))
-                return "Reports directory configuration error", 500
-            try:
-                # Security: Ensure filename is safe
-                safe_filename = Path(filename).name # Basic sanitization
-                if safe_filename != filename:
-                    logger.warning("Potential path traversal detected in report request", filename=filename)
-                    return "Invalid filename", 400
-                return send_from_directory(reports_dir, safe_filename, as_attachment=False)
-            except FileNotFoundError:
-                logger.warning(f"Report file not found", filename=filename)
-                return "Report not found", 404
-
-        @self.app.route('/exports/<path:filename>')
-        # @jwt_required() # Optional protection
-        def serve_export(filename):
-            exports_dir = Path(get_optional_env('EXPORTS_DIR', 'EXPORTS'))
-            logger.debug(f"Attempting to serve export", filename=filename, directory=str(exports_dir))
-            if not exports_dir.is_dir():
-                logger.error(f"Exports directory not found", directory=str(exports_dir))
-                return "Exports directory configuration error", 500
-            try:
-                # Security: Ensure filename is safe
-                safe_filename = Path(filename).name # Basic sanitization
-                if safe_filename != filename:
-                    logger.warning("Potential path traversal detected in export request", filename=filename)
-                    return "Invalid filename", 400
-                return send_from_directory(exports_dir, safe_filename, as_attachment=True)
-            except FileNotFoundError:
-                logger.warning(f"Export file not found", filename=filename)
-                return "Export not found", 404
-
-        self.logger.info("Flask routes setup completed.")
-
+        except Exception as e:
+            self.logger.error(f"Error checking password during authentication", username=username, error=str(e), exc_info=True)
+            return None
 
     # ==================== WEBSOCKET EVENTS ====================
-
     def _setup_websocket_events(self):
-        """Setup optimized WebSocket events with authentication"""
+        """Setup WebSocket events using a Namespace"""
         if not self.socketio:
             self.logger.warning("SocketIO not initialized, skipping WebSocket event setup.")
             return
 
-        # --- UPDATED: SocketIO Middleware for JWT Auth (from Cookie OR Header) ---
-        @self.socketio.on('connect')
-        def handle_connect_auth():
-            # Try to verify JWT from cookie first (preferred for browsers)
-            try:
-                # We only check for the *access* token cookie here for the initial connection
-                verify_jwt_in_request(locations=['cookies'])
-                claims = get_jwt()
-                user_id = claims.get('sub')
-                user_role = claims.get('role', 'user')
-                logger.info("WS connection authenticated via Cookie", sid=request.sid, user_id=user_id, role=user_role)
-                handle_connect(identity=user_id, role=user_role) # Pass identity and role
-                return True
-            except Exception as cookie_err:
-                logger.debug(f"WS Cookie auth failed: {cookie_err}. Trying header/query param.")
-                # If cookie fails, try header or query parameter (e.g., from mobile clients)
-                auth_header = request.headers.get('Authorization')
-                token = None
-                if auth_header and auth_header.startswith('Bearer '):
-                    token = auth_header.split(' ')[1]
-                else:
-                    # Fallback to query parameter (less secure, use with caution)
-                    token = request.args.get('token')
-
-                if not token:
-                    logger.warning("WS connection attempt without valid token (Cookie/Header/Query)")
-                    return False # Reject connection
-
-                try:
-                    # Decode using app's JWT secret key
-                    secret = current_app.config['JWT_SECRET_KEY']
-                    payload = decode_token(token) # Use decode_token for flexibility
-                    user_id = payload.get('sub')
-                    user_role = payload.get('role', 'user')
-
-                    if not user_id:
-                        logger.warning("Invalid token payload (missing 'sub')")
-                        return False
-
-                    logger.info("WS connection authenticated via Header/Query", sid=request.sid, user_id=user_id, role=user_role)
-                    handle_connect(identity=user_id, role=user_role) # Pass identity and role
-                    return True
-                except (ExpiredSignatureError, DecodeError, InvalidTokenError) as e:
-                    logger.warning("WS Header/Query authentication failed", error=str(e), sid=request.sid)
-                    return False # Reject connection
-                except Exception as e:
-                    logger.error("Unexpected error during WS Header/Query auth", error=str(e), exc_info=True)
-                    return False
-
-        # Original connect handler (now called after auth success)
-        def handle_connect(identity: str = "anonymous", role: str = "user"): # Accept args
-            client_id = request.sid
-            self.connected_clients[client_id] = {
-                'connected_at': datetime.now(timezone.utc),
-                'last_ping': datetime.now(timezone.utc),
-                'identity': identity, # Store identity
-                'role': role,       # Store role
-                'subscriptions': set()
-            }
-            logger.info(f"Client connected details stored", sid=client_id, identity=identity, role=role, total_clients=len(self.connected_clients))
-            initial_data = self.cache.get('dashboard_combined_data')
-            if initial_data:
-                emit('dashboard_update', initial_data) # Send initial state
-
-
-        @self.socketio.on('disconnect')
-        def handle_disconnect():
-            """Handle client disconnection."""
-            client_id = request.sid # <-- Get sid directly
-            if client_id in self.connected_clients:
-                identity = self.connected_clients[client_id].get('identity', 'anonymous')
-                subs = self.connected_clients[client_id].get('subscriptions', set())
-                for room in list(subs): self._leave_room_internal(client_id, room)
-                del self.connected_clients[client_id]
-                logger.info(f"Client disconnected", sid=client_id, identity=identity, total_clients=len(self.connected_clients))
-            else:
-                logger.info("Untracked client disconnected", sid=client_id)
-
-        @self.socketio.on('ping_from_client')
-        def handle_ping():
-            client_id = request.sid
-            if client_id in self.connected_clients:
-                self.connected_clients[client_id]['last_ping'] = datetime.now(timezone.utc)
-                emit('pong_from_server', {'timestamp': datetime.now(timezone.utc).isoformat()})
-
-        @self.socketio.on('subscribe')
-        def handle_subscribe(data):
-            client_id = request.sid
-            if client_id not in self.connected_clients: return # Ignore unsubscribed clients
-            try:
-                room_name = data.get('room')
-                # Optional: Add RBAC check here - can user subscribe to this room?
-                # user_role = self.connected_clients[client_id].get('role', 'user')
-                # if room_name == 'admin_only' and user_role != 'admin':
-                #    logger.warning("Subscription denied", sid=client_id, room=room_name, role=user_role)
-                #    emit('error', {'message': 'Permission denied for this room'})
-                #    return
-
-                if room_name:
-                    self._join_room_internal(client_id, room_name)
-                    emit('subscribed', {'room': room_name})
-                    logger.info(f"Client subscribed to room", sid=client_id, room=room_name)
-                else: emit('error', {'message': 'Room name missing'})
-            except Exception as e:
-                logger.error(f"Subscription error", sid=client_id, error=str(e), exc_info=True)
-                emit('error', {'message': 'Subscription failed'})
-
-        @self.socketio.on('unsubscribe')
-        def handle_unsubscribe(data):
-            client_id = request.sid
-            if client_id not in self.connected_clients: return
-            try:
-                room_name = data.get('room')
-                if room_name:
-                    self._leave_room_internal(client_id, room_name)
-                    emit('unsubscribed', {'room': room_name})
-                    logger.info(f"Client unsubscribed from room", sid=client_id, room=room_name)
-                else: emit('error', {'message': 'Room name missing'})
-            except Exception as e:
-                logger.error(f"Unsubscription error", sid=client_id, error=str(e), exc_info=True)
-                emit('error', {'message': 'Unsubscription failed'})
-
-        self.logger.info("WebSocket event handlers setup.")
+        self.socketio.on_namespace(DigitalTwinNamespace('/', self))
+        self.logger.info("WebSocket Namespace registered.")
 
     def _join_room_internal(self, client_id, room_name):
         join_room(room_name, sid=client_id)
@@ -1825,30 +1129,27 @@ class DigitalTwinApp:
         leave_room(room_name, sid=client_id)
         if room_name in self.rooms:
             self.rooms[room_name].discard(client_id)
-            if not self.rooms[room_name]: del self.rooms[room_name]
+            if not self.rooms[room_name]:
+                del self.rooms[room_name]
         if client_id in self.connected_clients and 'subscriptions' in self.connected_clients[client_id]:
             self.connected_clients[client_id]['subscriptions'].discard(room_name)
 
     # ==================== BACKGROUND TASKS ====================
-
     def _start_background_tasks(self):
         """Start background tasks (Data generation). Celery Beat handles scheduled tasks."""
         self.logger.info("Setting up background data generation task...")
 
-        # Data Generation/Update Task (still useful for simulation/dev)
         def data_update_task():
             logger.info("Background data update task started.")
             last_cache_update = time.monotonic()
             while True:
                 try:
-                    # Get app instance within the greenlet/thread
                     current_app_instance = current_app.extensions.get("digital_twin_instance")
                     if not current_app_instance:
-                         logger.error("Could not get DigitalTwinApp instance in data_update_task")
-                         eventlet.sleep(60)
-                         continue
+                        logger.error("Could not get DigitalTwinApp instance in data_update_task")
+                        eventlet.sleep(60)
+                        continue
 
-                    # Use instance attributes
                     if current_app_instance.data_generator:
                         new_data_list = []
                         if not getattr(current_app_instance.data_generator, 'devices', None):
@@ -1858,13 +1159,16 @@ class DigitalTwinApp:
                             reading = current_app_instance.data_generator._generate_single_reading(device_meta, pd.Timestamp(sim_time), 0)
                             new_data_list.append(reading)
                         if new_data_list:
-                                current_app_instance.bulk_insert_device_data(new_data_list)
-                                latest_df = pd.DataFrame(new_data_list)
-                        else: latest_df = pd.DataFrame()
-                    else: latest_df = current_app_instance.get_latest_device_data(limit=100)
+                            current_app_instance.bulk_insert_device_data(new_data_list)
+                            latest_df = pd.DataFrame(new_data_list)
+                        else:
+                            latest_df = pd.DataFrame()
+                    else:
+                        latest_df = current_app_instance.get_latest_device_data(limit=100)
 
                     if not latest_df.empty:
-                        if current_app_instance.alert_manager: current_app_instance._check_and_send_alerts(latest_df)
+                        if current_app_instance.alert_manager:
+                            current_app_instance._check_and_send_alerts(latest_df)
                         current_time = time.monotonic()
                         if current_time - last_cache_update > 5:
                             logger.debug("Updating dashboard cache and broadcasting...")
@@ -1872,9 +1176,10 @@ class DigitalTwinApp:
                             current_app_instance.cache.set('dashboard_combined_data', dashboard_payload, ttl=30)
                             current_app_instance.cache.set('latest_devices:500', latest_df.to_dict('records'), ttl=60)
                             if current_app_instance.socketio:
-                                    current_app_instance.socketio.emit('dashboard_update', dashboard_payload, room='dashboard_updates') # Assume a room
+                                current_app_instance.socketio.emit('dashboard_update', {'data': dashboard_payload}, namespace='/', room='dashboard_updates')
                             last_cache_update = current_time
-                        else: logger.debug("Skipping cache update/broadcast (too soon).")
+                        else:
+                            logger.debug("Skipping cache update/broadcast (too soon).")
 
                     eventlet.sleep(float(get_optional_env('DATA_UPDATE_INTERVAL', 1)))
 
@@ -1883,7 +1188,6 @@ class DigitalTwinApp:
                     eventlet.sleep(10)
 
         if self.socketio and get_optional_env('ENABLE_DATA_GENERATOR', 'False').lower() == 'true':
-            # Store the app instance for the background task to access
             self.app.extensions["digital_twin_instance"] = self
             self.socketio.start_background_task(data_update_task)
             self.logger.info("Data generator background task started.")
@@ -1892,56 +1196,7 @@ class DigitalTwinApp:
         else:
             logger.info("Data generator background task is disabled (ENABLE_DATA_GENERATOR not true).")
 
-
-    # ==================== CELERY TASKS (moved from bottom) ====================
-    # Item 5: Define Celery tasks for scheduled jobs
-
-    @staticmethod
-    @celery_app.task(bind=True, name='digital_twin.cleanup_inactive_clients')
-    def cleanup_inactive_clients_task(self):
-        """Celery task to cleanup inactive WebSocket clients."""
-        app_instance = current_app.extensions.get("digital_twin_instance")
-        if not app_instance:
-            logger.error("Could not get DigitalTwinApp instance in Celery task")
-            return {'status': 'FAILURE', 'error': 'App instance missing'}
-
-        logger.info("Running scheduled cleanup of inactive clients...")
-        try:
-            cleaned_count = app_instance._cleanup_inactive_clients_logic() # Call internal logic
-            logger.info("Inactive client cleanup task finished", cleaned_count=cleaned_count)
-            return {'status': 'SUCCESS', 'cleaned_count': cleaned_count}
-        except Exception as e:
-            logger.error(f"Celery task cleanup_inactive_clients failed", error=str(e), exc_info=True)
-            self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
-            raise
-
-    @staticmethod
-    @celery_app.task(bind=True, name='digital_twin.run_model_retraining')
-    def run_model_retraining_task(self):
-        """Celery task to run model retraining."""
-        app_instance = current_app.extensions.get("digital_twin_instance")
-        if not app_instance:
-            logger.error("Could not get DigitalTwinApp instance in Celery task")
-            return {'status': 'FAILURE', 'error': 'App instance missing'}
-
-        if not app_instance.analytics_engine or not hasattr(app_instance.analytics_engine, 'retrain_models'):
-            logger.warning("Analytics engine or retrain_models method not available.")
-            return {'status': 'SKIPPED', 'message': 'Analytics engine not available'}
-
-        logger.info("Running scheduled model retraining via Celery...")
-        try:
-            # The retrain_models method handles data fetching internally now
-            result = app_instance.analytics_engine.retrain_models() # Call directly
-            logger.info(f"Model retraining task completed.", result_status=result.get('status'))
-            return {'status': 'SUCCESS', 'retraining_result': result}
-        except Exception as e:
-            logger.error(f"Celery task run_model_retraining failed", error=str(e), exc_info=True)
-            self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
-            raise
-
-
     # ==================== HELPER METHODS ====================
-    # (Methods remain the same)
     def _create_dashboard_payload(self, latest_devices_df: pd.DataFrame) -> Dict:
         """Helper to create the consistent dashboard data payload."""
         overview_data = {}
@@ -1951,9 +1206,14 @@ class DigitalTwinApp:
             avg_health = latest_devices_df['health_score'].dropna().mean() * 100 if not latest_devices_df['health_score'].dropna().empty else 0
             avg_efficiency = latest_devices_df['efficiency_score'].dropna().mean() * 100 if not latest_devices_df['efficiency_score'].dropna().empty else 0
             status_counts = latest_devices_df['status'].value_counts().to_dict()
-            status_distribution = { 'normal': status_counts.get('normal', 0), 'warning': status_counts.get('warning', 0), 'critical': status_counts.get('critical', 0), 'offline': status_counts.get('offline', 0) }
-            energy_usage_df = latest_devices_df[latest_devices_df['device_type']=='power_meter']['value']
-            energy_usage = energy_usage_df.sum() / 1000.0 if not energy_usage_df.empty else 0.0 # Convert W to kW
+            status_distribution = {
+                'normal': status_counts.get('normal', 0),
+                'warning': status_counts.get('warning', 0),
+                'critical': status_counts.get('critical', 0),
+                'offline': status_counts.get('offline', 0)
+            }
+            energy_usage_df = latest_devices_df[latest_devices_df['device_type'] == 'power_meter']['value']
+            energy_usage = energy_usage_df.sum() / 1000.0 if not energy_usage_df.empty else 0.0
 
             overview_data = {
                 'systemHealth': round(avg_health),
@@ -1961,26 +1221,27 @@ class DigitalTwinApp:
                 'totalDevices': total_devices,
                 'efficiency': round(avg_efficiency),
                 'energyUsage': round(energy_usage, 1),
-                'energyCost': round(energy_usage * 24 * 0.12), # Assuming $0.12/kWh
+                'energyCost': round(energy_usage * 24 * 0.12),
                 'statusDistribution': status_distribution,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
+        
         recent_alerts = self.get_recent_alerts(limit=20, acknowledged=False)
-        # Generate dummy performance data
+        
         perf_data = []
         if 'systemHealth' in overview_data and 'efficiency' in overview_data:
-             base_health = overview_data['systemHealth']
-             base_eff = overview_data['efficiency']
-             now = datetime.now(timezone.utc)
-             for i in range(24): # Last 24 hours
-                 ts = now - timedelta(hours=i)
-                 perf_data.append({
-                     'timestamp': ts.isoformat(),
-                     'systemHealth': max(0, min(100, base_health + random.uniform(-2, 2) - i*0.1)),
-                     'efficiency': max(0, min(100, base_eff + random.uniform(-1, 1) - i*0.05)),
-                     'energyUsage': max(0, overview_data.get('energyUsage', 0) * (1 + random.uniform(-0.1, 0.1) - i*0.01))
-                 })
-             perf_data.reverse() # Oldest first
+            base_health = overview_data['systemHealth']
+            base_eff = overview_data['efficiency']
+            now = datetime.now(timezone.utc)
+            for i in range(24):
+                ts = now - timedelta(hours=i)
+                perf_data.append({
+                    'timestamp': ts.isoformat(),
+                    'systemHealth': max(0, min(100, base_health + random.uniform(-2, 2) - i * 0.1)),
+                    'efficiency': max(0, min(100, base_eff + random.uniform(-1, 1) - i * 0.05)),
+                    'energyUsage': max(0, overview_data.get('energyUsage', 0) * (1 + random.uniform(-0.1, 0.1) - i * 0.01))
+                })
+            perf_data.reverse()
 
         return {
             **overview_data,
@@ -1991,175 +1252,625 @@ class DigitalTwinApp:
 
     def _check_and_send_alerts(self, devices_df: pd.DataFrame):
         """Check for alerts and broadcast via WebSocket"""
-        if not self.alert_manager or not self.socketio: return
+        if not self.alert_manager or not self.socketio:
+            return
         all_triggered_alerts = []
         try:
             for _, device_row in devices_df.iterrows():
                 device_data = device_row.to_dict()
-                # Ensure timestamp is string for alert manager if needed
-                if isinstance(device_data.get('timestamp'), datetime): device_data['timestamp'] = device_data['timestamp'].isoformat()
+                if isinstance(device_data.get('timestamp'), datetime):
+                    device_data['timestamp'] = device_data['timestamp'].isoformat()
                 triggered = self.alert_manager.evaluate_conditions(data=device_data, device_id=device_data.get('device_id'))
-                if triggered: all_triggered_alerts.extend(triggered)
+                if triggered:
+                    all_triggered_alerts.extend(triggered)
 
             if all_triggered_alerts:
                 alerts_inserted = sum(1 for alert in all_triggered_alerts if self.insert_alert(alert))
-                if alerts_inserted > 0: logger.info(f"Inserted new alerts into DB.", count=alerts_inserted)
+                if alerts_inserted > 0:
+                    logger.info(f"Inserted new alerts into DB.", count=alerts_inserted)
 
                 logger.info(f"Broadcasting triggered alerts...", count=len(all_triggered_alerts))
                 for alert in all_triggered_alerts:
-                     # Ensure timestamp is string before emitting
-                     if isinstance(alert.get('timestamp'), datetime): alert['timestamp'] = alert['timestamp'].isoformat()
-                     self.socketio.emit('alert_update', alert, room='alerts') # Assume alerts room
+                    if isinstance(alert.get('timestamp'), datetime):
+                        alert['timestamp'] = alert['timestamp'].isoformat()
+                    self.socketio.emit('alert_update', {'data': alert}, namespace='/', room='alerts')
 
         except Exception as e:
             logger.error(f"Error checking/sending alerts", error=str(e), exc_info=True)
 
     def _get_system_metrics(self) -> Dict:
-        metrics = {'timestamp': datetime.now(timezone.utc).isoformat(), 'cpu_percent': None, 'memory_percent': None, 'disk_percent': None, 'active_connections': len(self.connected_clients), 'cache_available': self.cache.available if self.cache else False, 'database_available': self.db_available, 'celery_available': CELERY_AVAILABLE}
+        metrics = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'cpu_percent': None,
+            'memory_percent': None,
+            'disk_percent': None,
+            'active_connections': len(self.connected_clients),
+            'cache_available': self.cache.available if self.cache else False,
+            'database_available': self.db_available,
+            'celery_available': CELERY_AVAILABLE
+        }
         try:
             import psutil
             metrics['cpu_percent'] = psutil.cpu_percent(interval=0.1)
             metrics['memory_percent'] = psutil.virtual_memory().percent
             metrics['disk_percent'] = psutil.disk_usage('/').percent
-        except ImportError: logger.warning("psutil not installed, cannot get detailed system metrics.")
-        except Exception as e: logger.error(f"Error getting system metrics", error=str(e))
+        except ImportError:
+            logger.warning("psutil not installed, cannot get detailed system metrics.")
+        except Exception as e:
+            logger.error(f"Error getting system metrics", error=str(e))
         return metrics
 
     def _cleanup_inactive_clients_logic(self) -> int:
         """Internal logic for cleaning up inactive WebSocket clients."""
         now = datetime.now(timezone.utc)
-        # Use a shorter timeout, clients should send pings
         timeout = timedelta(minutes=int(get_optional_env('CLIENT_TIMEOUT_MINUTES', 2)))
         disconnected_count = 0
         inactive_sids = []
 
-        # Iterate safely over a copy of the keys
         for sid, client_info in list(self.connected_clients.items()):
             last_ping = client_info.get('last_ping', client_info.get('connected_at'))
-            # Ensure last_ping is timezone-aware if needed, though it should be UTC already
             if isinstance(last_ping, str):
-                try: last_ping = datetime.fromisoformat(last_ping.replace('Z', '+00:00'))
-                except: last_ping = now - timedelta(days=1) # Treat invalid timestamp as very old
+                try:
+                    last_ping = datetime.fromisoformat(last_ping.replace('Z', '+00:00'))
+                except:
+                    last_ping = now - timedelta(days=1)
 
             if now - last_ping > timeout:
                 inactive_sids.append(sid)
 
         for sid in inactive_sids:
-            identity = self.connected_clients.get(sid, {}).get('identity', 'unknown')
-            logger.warning(f"Disconnecting inactive client", sid=sid, identity=identity)
+            user_id = self.connected_clients.get(sid, {}).get('user_id', 'unknown')
+            logger.warning(f"Disconnecting inactive client", sid=sid, user_id=user_id)
             if self.socketio:
                 try:
-                    self.socketio.disconnect(sid, silent=True) # silent=True prevents disconnect event loop
+                    self.socketio.disconnect(sid, namespace='/', silent=True)
                 except Exception as e:
                     logger.error("Error during socketio disconnect", sid=sid, error=str(e))
-            # Clean up internal state immediately
             if sid in self.connected_clients:
                 subs = self.connected_clients[sid].get('subscriptions', set())
-                for room in list(subs): self._leave_room_internal(sid, room)
+                for room in list(subs):
+                    self._leave_room_internal(sid, room)
                 try:
                     del self.connected_clients[sid]
                     disconnected_count += 1
                 except KeyError:
-                     pass # Already removed, perhaps by disconnect handler
+                    pass
 
         if disconnected_count > 0:
             logger.info(f"Cleaned up inactive client(s).", count=disconnected_count)
         return disconnected_count
 
-
-    # --- Error Handlers (No changes needed) ---
+    # ==================== ERROR HANDLERS ====================
     def _setup_error_handlers(self):
-        # (Remains the same)
         app = self.app
+
         @app.errorhandler(404)
         def not_found_error(error):
             logger.warning(f"404 Not Found", url=request.url)
-            if request.path.startswith('/api/'): return jsonify(error="Resource not found"), 404
+            if request.path.startswith('/api/'):
+                return create_standard_response(error="Resource not found", status_code=404)
             static_folder = app.static_folder
-            if static_folder and os.path.exists(os.path.join(static_folder, 'index.html')): return send_from_directory(static_folder, 'index.html')
+            if static_folder and os.path.exists(os.path.join(static_folder, 'index.html')):
+                return send_from_directory(static_folder, 'index.html')
             return "Not Found", 404
+
         @app.errorhandler(500)
         def internal_error(error):
             logger.error(f"500 Internal Server Error", error=str(error), exc_info=True)
-            return jsonify(error="Internal server error"), 500
+            return create_standard_response(error="Internal server error", status_code=500)
+
         @app.errorhandler(429)
         def ratelimit_handler(e):
             logger.warning(f"Rate limit exceeded", remote_addr=request.remote_addr, description=e.description)
-            return jsonify(error="Rate limit exceeded", description=str(e.description)), 429
+            return create_standard_response(error="Rate limit exceeded", status_code=429)
+
         @app.errorhandler(SQLAlchemyError)
         def handle_db_exception(e):
             logger.error(f"Database error occurred", error=str(e), exc_info=True)
-            return jsonify(error="Database operation failed"), 500
-        @app.errorhandler(ValidationError) # Handle Marshmallow validation errors
+            return create_standard_response(error="Database operation failed", status_code=500)
+
+        @app.errorhandler(ValidationError)
         def handle_validation_error(error):
-             logger.warning("API Input Validation Error", errors=error.messages)
-             return jsonify({"error": "Validation failed", "messages": error.messages}), 400
+            logger.warning("API Input Validation Error", errors=error.messages)
+            return create_standard_response(error="Validation failed", status_code=400)
+
         @app.errorhandler(Exception)
         def handle_exception(e):
-            # Log all other exceptions
             logger.error(f"Unhandled exception", error=str(e), exc_info=True)
-            # Avoid sending detailed internal errors to the client in production
             error_message = "An unexpected error occurred"
             if current_app.config.get('DEBUG'):
-                 error_message = str(e) # Show details in debug mode
-            return jsonify(error=error_message), 500
+                error_message = str(e)
+            return create_standard_response(error=error_message, status_code=500)
+
         logger.info("Error handlers registered.")
 
     def run(self, host='0.0.0.0', port=5000):
-        # (Remains the same)
         effective_port = int(get_optional_env('PORT', port))
         effective_host = get_optional_env('HOST', host)
         debug_mode = self.app.config.get('DEBUG', False)
         self.start_time = datetime.now()
-        logger.info(f"Starting Digital Twin App v3.4", host=effective_host, port=effective_port, debug=debug_mode)
+        logger.info(f"Starting Digital Twin App v3.6", host=effective_host, port=effective_port, debug=debug_mode)
         logger.info(f"Component Status", db_ok=self.db_available, redis_ok=self.cache.available, celery_ok=CELERY_AVAILABLE)
-        if not self.socketio: logger.critical("SocketIO failed to initialize. Cannot run."); return
+        if not self.socketio:
+            logger.critical("SocketIO failed to initialize. Cannot run.")
+            return
         try:
             self.socketio.run(self.app, host=effective_host, port=effective_port, debug=debug_mode, use_reloader=debug_mode, log_output=debug_mode)
-        except KeyboardInterrupt: logger.info("Application interrupted. Shutting down...")
-        except Exception as e: logger.critical(f"Application failed to run", error=str(e), exc_info=True)
-        finally: self._shutdown()
+        except KeyboardInterrupt:
+            logger.info("Application interrupted. Shutting down...")
+        except Exception as e:
+            logger.critical(f"Application failed to run", error=str(e), exc_info=True)
+        finally:
+            self._shutdown()
 
     def _shutdown(self):
-        # (Remains the same, removed scheduler shutdown)
         logger.info("Initiating graceful shutdown...")
         logger.info("Shutdown complete.")
 
 
-# ==================== APPLICATION FACTORY & MAIN ====================
+# ==================== WEBSOCKET NAMESPACE ====================
+class DigitalTwinNamespace(Namespace):
+    """Namespace for core Digital Twin WebSocket events."""
 
-def create_app_instance() -> DigitalTwinApp:
-    """Application factory function"""
+    def __init__(self, namespace, app_instance):
+        super().__init__(namespace)
+        self.app_instance = app_instance
+
+    def on_connect(self):
+        """Handle client connection and JWT authentication."""
+        token = request.args.get('token')
+        if not token:
+            auth_header = request.headers.get('Authorization')
+            if auth_header and auth_header.startswith('Bearer '):
+                token = auth_header.split(' ')[1]
+
+        if not token:
+            logger.warning("WS connect: No token provided", sid=request.sid)
+            emit('auth_failed', {'message': 'Authentication token required.'})
+            disconnect()
+            return False
+
+        try:
+            secret = current_app.config['JWT_SECRET_KEY']
+            payload = decode_token(token)
+            user_id = payload.get('sub')
+            user_role = payload.get('role', 'user')
+            if not user_id:
+                raise InvalidTokenError("Missing 'sub' claim")
+
+            session['user_id'] = user_id
+            session['role'] = user_role
+            self.app_instance.connected_clients[request.sid] = {
+                'user_id': user_id,
+                'role': user_role,
+                'connected_at': datetime.now(timezone.utc),
+                'last_ping': datetime.now(timezone.utc),
+                'subscriptions': set()
+            }
+            logger.info("WS Client connected & authenticated", sid=request.sid, user_id=user_id, role=user_role)
+            emit('connection_established', {'data': {'sid': request.sid, 'user_id': user_id}})
+
+            initial_data = self.app_instance.cache.get('dashboard_combined_data')
+            if initial_data:
+                emit('dashboard_update', {'data': initial_data})
+
+        except (ExpiredSignatureError, DecodeError, InvalidTokenError) as e:
+            logger.warning("WS connect: Invalid token", error=str(e), sid=request.sid)
+            emit('auth_failed', {'message': f'Invalid token: {str(e)}'})
+            disconnect()
+            return False
+        except Exception as e:
+            logger.error("WS connect: Unexpected error", error=str(e), exc_info=True, sid=request.sid)
+            emit('error', {'message': 'Connection error'})
+            disconnect()
+            return False
+
+    def on_disconnect(self):
+        """Handle client disconnection."""
+        client_info = self.app_instance.connected_clients.pop(request.sid, None)
+        if client_info:
+            user_id = client_info.get('user_id', 'unknown')
+            subs = client_info.get('subscriptions', set())
+            for room in list(subs):
+                self.app_instance._leave_room_internal(request.sid, room)
+            logger.info(f"WS Client disconnected", sid=request.sid, user_id=user_id, total_clients=len(self.app_instance.connected_clients))
+        else:
+            logger.info("WS Untracked client disconnected", sid=request.sid)
+
+    def on_ping_from_client(self):
+        """Handle ping from client."""
+        if request.sid in self.app_instance.connected_clients:
+            self.app_instance.connected_clients[request.sid]['last_ping'] = datetime.now(timezone.utc)
+            emit('pong_from_server', {'data': {'timestamp': datetime.now(timezone.utc).isoformat()}})
+        else:
+            logger.warning("Ping from unknown client", sid=request.sid)
+
+    @validate_socket_payload(SubscribeSchema())
+    def on_subscribe(self, data):
+        """Handle room subscription."""
+        room_name = data.get('room')
+        self.app_instance._join_room_internal(request.sid, room_name)
+        emit('subscribed', {'data': {'room': room_name}})
+        logger.info(f"WS Client subscribed", sid=request.sid, room=room_name, user_id=session.get('user_id'))
+
+    @validate_socket_payload(UnsubscribeSchema())
+    def on_unsubscribe(self, data):
+        """Handle room unsubscription."""
+        room_name = data.get('room')
+        self.app_instance._leave_room_internal(request.sid, room_name)
+        emit('unsubscribed', {'data': {'room': room_name}})
+        logger.info(f"WS Client unsubscribed", sid=request.sid, room=room_name, user_id=session.get('user_id'))
+
+    @validate_socket_payload(StreamSubscribeSchema())
+    def on_subscribe_stream(self, data):
+        """Handle stream subscription."""
+        stream_id = data.get('stream_id')
+        emit('stream_subscribed', {'data': {'stream_id': stream_id}})
+        logger.info(f"WS Client subscribed to stream", sid=request.sid, stream=stream_id, user_id=session.get('user_id'))
+
+    def on_error_default(self, e):
+        """Default error handler for the namespace."""
+        logger.error('WebSocket Namespace Error', error=str(e), sid=request.sid, exc_info=True)
+        try:
+            emit('error', {'message': 'An internal server error occurred.'})
+        except Exception as emit_err:
+            logger.error("Failed to emit error message to client", client_sid=request.sid, emit_error=str(emit_err))
+
+
+# ==================== BLUEPRINT ROUTE DEFINITIONS ====================
+
+# --- Auth Blueprint Routes ---
+@auth_bp.route('/register', methods=['POST'])
+@validate_json(RegisterSchema())
+def register():
+    data = g.validated_data
+    app_instance = current_app.extensions["digital_twin_instance"]
+    success = app_instance.create_user_sqlalchemy(data['username'], data['password'], data['email'])
+    if success:
+        return create_standard_response(data={"message": "User registered successfully"}, status_code=201)
+    else:
+        return create_standard_response(error="Registration failed. Username or email may already exist.", status_code=409)
+
+@auth_bp.route('/login', methods=['POST'])
+@validate_json(LoginSchema())
+def login():
+    data = g.validated_data
+    app_instance = current_app.extensions["digital_twin_instance"]
+    user = app_instance.authenticate_user_sqlalchemy(data['username'], data['password'])
+    if not user:
+        return create_standard_response(error="Invalid credentials", status_code=401)
+
+    additional_claims = {"role": user.role}
+    access_token = create_access_token(identity=user.username, additional_claims=additional_claims)
+    refresh_token = create_refresh_token(identity=user.username)
+
+    response_data = {"access_token": access_token, "user": user.to_dict()}
+    response, status_code = create_standard_response(data=response_data, status_code=200)
+
+    set_access_cookies(response, access_token)
+    set_refresh_cookies(response, refresh_token)
+    logger.info("Login successful, JWT cookies set", username=user.username, role=user.role)
+    return response, status_code
+
+@auth_bp.route('/refresh', methods=['POST'])
+@jwt_required(refresh=True)
+def refresh():
+    current_user = get_jwt_identity()
+    user = None
     try:
-        from dotenv import load_dotenv
-        load_dotenv(verbose=True)
-        logger.info(".env file loaded if present.")
-    except ImportError:
-        logger.info(".env file not loaded (dotenv not installed). Relying on system env vars.")
-    try:
-        app_instance = DigitalTwinApp()
-        # --- NEW: Store instance in app context for Celery tasks ---
-        app_instance.app.extensions["digital_twin_instance"] = app_instance
-        return app_instance
+        with get_session() as session:
+            user = session.query(User).filter(func.lower(User.username) == func.lower(current_user)).first()
     except Exception as e:
-        logger.critical(f"FATAL: Failed to create application instance", error=str(e), exc_info=True)
-        sys.exit(1)
+        logger.error("Could not fetch user during refresh", username=current_user, error=str(e))
+        return create_standard_response(error="Error verifying user", status_code=500)
+    if not user:
+        return create_standard_response(error="User not found", status_code=401)
 
-digital_twin_app_instance = create_app_instance()
-flask_app = digital_twin_app_instance.app
+    new_access_token = create_access_token(identity=current_user, additional_claims={"role": user.role})
+    response, status_code = create_standard_response(data={"access_token": new_access_token})
+    set_access_cookies(response, new_access_token)
+    logger.info("Access token refreshed", username=current_user, role=user.role)
+    return response, status_code
 
-# --- Define Celery tasks AFTER flask_app is created ---
+@auth_bp.route('/logout', methods=['POST'])
+def logout():
+    response, status_code = create_standard_response(data={"message": "Logout successful"})
+    unset_jwt_cookies(response)
+    return response, status_code
+
+@auth_bp.route('/me')
+@jwt_required()
+def me():
+    current_user = get_jwt_identity()
+    claims = get_jwt()
+    user_role = claims.get('role', 'user')
+    return create_standard_response(data={'logged_in_as': current_user, 'role': user_role})
+
+# --- API Blueprint Routes ---
+@api_bp.route('/dashboard')
+@jwt_required()
+def get_dashboard_data():
+    app_instance = current_app.extensions["digital_twin_instance"]
+    cache_key = 'dashboard_combined_data'
+    cached = app_instance.cache.get(cache_key)
+    if cached:
+        return create_standard_response(data=cached)
+    try:
+        latest_devices_df = app_instance.get_latest_device_data(limit=500)
+        dashboard_payload = app_instance._create_dashboard_payload(latest_devices_df)
+        app_instance.cache.set(cache_key, dashboard_payload, ttl=30)
+        return create_standard_response(data=dashboard_payload)
+    except Exception as e:
+        logger.error(f"Error fetching dashboard data", error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to retrieve dashboard data", status_code=500)
+
+@api_bp.route('/devices')
+@jwt_required()
+def get_devices():
+    app_instance = current_app.extensions["digital_twin_instance"]
+    try:
+        limit = request.args.get('limit', default=1000, type=int)
+        devices_df = app_instance.get_latest_device_data(limit=limit)
+        return create_standard_response(data=devices_df.to_dict('records'))
+    except Exception as e:
+        logger.error(f"Error getting devices", error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to retrieve devices", status_code=500)
+
+@api_bp.route('/devices/<string:device_id>')
+@jwt_required()
+def get_device(device_id):
+    app_instance = current_app.extensions["digital_twin_instance"]
+    cache_key = f'device_latest:{device_id}'
+    cached = app_instance.cache.get(cache_key)
+    if cached:
+        return create_standard_response(data=cached)
+    try:
+        with get_session() as session:
+            device_data = session.query(DeviceData).filter(DeviceData.device_id == device_id).order_by(DeviceData.timestamp.desc()).first()
+        if device_data:
+            data_dict = device_data.to_dict()
+            app_instance.cache.set(cache_key, data_dict, ttl=60)
+            return create_standard_response(data=data_dict)
+        else:
+            return create_standard_response(error="Device not found", status_code=404)
+    except Exception as e:
+        logger.error(f"Error getting device", device_id=device_id, error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to retrieve device data", status_code=500)
+
+@api_bp.route('/alerts')
+@jwt_required()
+def get_alerts():
+    app_instance = current_app.extensions["digital_twin_instance"]
+    try:
+        limit = request.args.get('limit', default=50, type=int)
+        severity = request.args.get('severity', type=str)
+        acknowledged_str = request.args.get('acknowledged', type=str)
+        acknowledged = acknowledged_str.lower() == 'true' if acknowledged_str else None
+        alerts = app_instance.get_recent_alerts(limit, severity, acknowledged)
+        return create_standard_response(data=alerts)
+    except Exception as e:
+        logger.error(f"Error getting alerts", error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to retrieve alerts", status_code=500)
+
+@api_bp.route('/alerts/acknowledge/<string:alert_id>', methods=['POST'])
+@jwt_required()
+def acknowledge_alert_api(alert_id):
+    app_instance = current_app.extensions["digital_twin_instance"]
+    user_id = get_jwt_identity()
+    success = app_instance.acknowledge_alert_db(alert_id, user_id)
+    if success:
+        updated_alert_data = None
+        with get_session() as session:
+            alert = session.query(Alert).filter(Alert.id == alert_id).first()
+            if alert:
+                updated_alert_data = alert.to_dict()
+
+        if app_instance.socketio:
+            app_instance.socketio.emit('alert_acknowledged', {
+                'data': {
+                    'alertId': alert_id,
+                    'acknowledgedBy': user_id,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+            }, namespace='/', room='alerts')
+
+        app_instance.cache.clear_pattern("alerts:*")
+        return create_standard_response(data={"message": "Alert acknowledged", "alert": updated_alert_data})
+    else:
+        return create_standard_response(error="Failed to acknowledge alert or alert not found", status_code=404)
+
+@api_bp.route('/predictions')
+@jwt_required()
+def get_predictions():
+    device_id = request.args.get('device_id')
+    if not device_id:
+        return create_standard_response(error="device_id query parameter is required", status_code=400)
+    
+    app_instance = current_app.extensions["digital_twin_instance"]
+    logger.info("Serving predictions", device_id=device_id)
+    
+    if app_instance.analytics_engine:
+        try:
+            with get_session() as session:
+                recent_data_db = session.query(DeviceData).filter(DeviceData.device_id == device_id).order_by(DeviceData.timestamp.desc()).limit(50).all()
+            if not recent_data_db:
+                return create_standard_response(data={"message": f"No recent data for {device_id}", "device_id": device_id}, status_code=404)
+            
+            recent_data_df = pd.DataFrame([d.to_dict() for d in recent_data_db])
+            anomaly_pred = app_instance.analytics_engine.detect_anomalies(recent_data_df)
+            failure_pred = app_instance.analytics_engine.predict_failure(recent_data_df)
+
+            return create_standard_response(data={
+                "device_id": device_id,
+                "anomaly_prediction": anomaly_pred,
+                "failure_prediction": failure_pred
+            })
+        except Exception as e:
+            logger.error("Error generating predictions", device_id=device_id, error=str(e), exc_info=True)
+            return create_standard_response(error="Prediction generation failed", status_code=500)
+    else:
+        return create_standard_response(data={"message": f"Predictions for {device_id} (engine unavailable)", "device_id": device_id}, status_code=501)
+
+@api_bp.route('/health_scores')
+@jwt_required()
+def get_health_scores():
+    app_instance = current_app.extensions["digital_twin_instance"]
+    logger.info("Serving health scores")
+    if app_instance.health_calculator:
+        try:
+            latest_devices_df = app_instance.get_latest_device_data(limit=500)
+            if latest_devices_df.empty:
+                return create_standard_response(data={})
+
+            fleet_data = {
+                device_id: group_df
+                for device_id, group_df in latest_devices_df.groupby('device_id')
+            }
+            fleet_health = app_instance.health_calculator.calculate_fleet_health_score(fleet_data)
+            scores_only = {
+                dev_id: result.get('overall_score')
+                for dev_id, result in fleet_health.get('device_results', {}).items()
+                if not result.get('error')
+            }
+            return create_standard_response(data=scores_only)
+        except Exception as e:
+            logger.error("Error calculating health scores", error=str(e), exc_info=True)
+            return create_standard_response(error="Health score calculation failed", status_code=500)
+    else:
+        return create_standard_response(data={"message": "Health scores (engine unavailable)"}, status_code=501)
+
+@api_bp.route('/recommendations')
+@jwt_required()
+def get_recommendations():
+    app_instance = current_app.extensions["digital_twin_instance"]
+    logger.info("Serving recommendations")
+    if app_instance.recommendation_engine:
+        try:
+            health_data_mock = {'overall_score': 0.8}
+            recs = app_instance.recommendation_engine.generate_recommendations(health_data=health_data_mock)
+            flat_recs = []
+            for cat in ['emergency', 'maintenance', 'optimization', 'operational', 'preventive']:
+                flat_recs.extend(recs.get(f'{cat}_recommendations', []))
+            flat_recs.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+            return create_standard_response(data=flat_recs[:10])
+        except Exception as e:
+            logger.error("Error generating recommendations", error=str(e), exc_info=True)
+            return create_standard_response(error="Recommendation generation failed", status_code=500)
+    else:
+        return create_standard_response(data={"message": "Recommendations (engine unavailable)"}, status_code=501)
+
+@api_bp.route('/system_metrics')
+@jwt_required()
+def get_system_metrics_api():
+    app_instance = current_app.extensions["digital_twin_instance"]
+    logger.info("Serving system metrics")
+    return create_standard_response(data=app_instance._get_system_metrics())
+
+@api_bp.route('/admin/summary')
+@jwt_required()
+@role_required('admin')
+def get_admin_summary():
+    """Admin-only route example."""
+    logger.info("Admin summary endpoint accessed", user=get_jwt_identity())
+    try:
+        with get_session() as session:
+            user_count = session.query(User).count()
+            device_count = session.query(DeviceData.device_id).distinct().count()
+        app_instance = current_app.extensions["digital_twin_instance"]
+        return create_standard_response(data={
+            "message": "Welcome, Admin!",
+            "total_users": user_count,
+            "total_devices": device_count,
+            "connected_clients": len(app_instance.connected_clients)
+        })
+    except Exception as e:
+        logger.error("Error fetching admin summary", error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to fetch admin summary", status_code=500)
+
+# --- Tasks Blueprint Routes ---
+@tasks_bp.route('/start_report', methods=['POST'])
+@jwt_required()
+@role_required('admin')
+def start_report_task():
+    if not celery_app:
+        return create_standard_response(error="Async task runner not available", status_code=503)
+    try:
+        user_id = get_jwt_identity()
+        task = celery_app.send_task('digital_twin.generate_report', args=[user_id])
+        logger.info(f"Dispatched generate_report_task", task_id=task.id, user_id=user_id)
+        return create_standard_response(data={"task_id": task.id, "status": "PENDING"}, status_code=202)
+    except Exception as e:
+        logger.error(f"Failed to dispatch Celery task", error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to start report generation task", status_code=500)
+
+@tasks_bp.route('/status/<string:task_id>')
+@jwt_required()
+def get_task_status(task_id):
+    if not celery_app:
+        return create_standard_response(error="Async task runner not available", status_code=503)
+    try:
+        task_result = celery_app.AsyncResult(task_id)
+        response_data = {'task_id': task_id, 'status': task_result.status}
+        if task_result.ready():
+            if task_result.successful():
+                response_data['result'] = task_result.result
+            else:
+                response_data['error'] = str(task_result.result)
+                logger.warning(f"Task failed", task_id=task_id, error=str(task_result.result))
+        logger.debug("Checked task status", task_id=task_id, status=response_data['status'])
+        return create_standard_response(data=response_data)
+    except Exception as e:
+        logger.error(f"Failed to get task status", task_id=task_id, error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to retrieve task status", status_code=500)
+
+
+# ==================== CELERY TASK DEFINITIONS ====================
+@celery_app.task(bind=True, name='digital_twin.cleanup_inactive_clients')
+def cleanup_inactive_clients_task(self):
+    """Celery task to cleanup inactive WebSocket clients."""
+    app_instance = current_app.extensions.get("digital_twin_instance")
+    if not app_instance:
+        logger.error("Could not get DigitalTwinApp instance in Celery task")
+        return {'status': 'FAILURE', 'error': 'App instance missing'}
+
+    logger.info("Running scheduled cleanup of inactive clients...")
+    try:
+        cleaned_count = app_instance._cleanup_inactive_clients_logic()
+        logger.info("Inactive client cleanup task finished", cleaned_count=cleaned_count)
+        return {'status': 'SUCCESS', 'cleaned_count': cleaned_count}
+    except Exception as e:
+        logger.error(f"Celery task cleanup_inactive_clients failed", error=str(e), exc_info=True)
+        self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
+        raise
+
+@celery_app.task(bind=True, name='digital_twin.run_model_retraining')
+def run_model_retraining_task(self):
+    """Celery task to run model retraining."""
+    app_instance = current_app.extensions.get("digital_twin_instance")
+    if not app_instance:
+        logger.error("Could not get DigitalTwinApp instance in Celery task")
+        return {'status': 'FAILURE', 'error': 'App instance missing'}
+
+    if not app_instance.analytics_engine or not hasattr(app_instance.analytics_engine, 'retrain_models'):
+        logger.warning("Analytics engine or retrain_models method not available.")
+        return {'status': 'SKIPPED', 'message': 'Analytics engine not available'}
+
+    logger.info("Running scheduled model retraining via Celery...")
+    try:
+        result = app_instance.analytics_engine.retrain_models()
+        logger.info(f"Model retraining task completed.", result_status=result.get('status'))
+        return {'status': 'SUCCESS', 'retraining_result': result}
+    except Exception as e:
+        logger.error(f"Celery task run_model_retraining failed", error=str(e), exc_info=True)
+        self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
+        raise
+
 @celery_app.task(bind=True, name='digital_twin.generate_report')
-def generate_report_task(self, user_id="system"): # Added user_id
+def generate_report_task(self, user_id="system"):
     """Async report generation task using Celery."""
     logger.info(f"Celery task started: generate_report_task", task_id=self.request.id, user_id=user_id)
-    # ContextTask handles app context
     try:
         report_gen = HealthReportGenerator()
-        # Need to ensure report_gen can access DB via SQLAlchemy sessions if needed
-        # E.g., pass the session factory or manage sessions within the generator
-
-        # Fetch data using SQLAlchemy within the task context
         with get_session() as session:
             start_date = datetime.now(timezone.utc) - timedelta(days=7)
             recent_data = session.query(DeviceData).filter(DeviceData.timestamp >= start_date).all()
@@ -2167,17 +1878,15 @@ def generate_report_task(self, user_id="system"): # Added user_id
 
         report_data_df = pd.DataFrame(report_data_list)
         if not report_data_df.empty and 'timestamp' in report_data_df.columns:
-            report_data_df['timestamp'] = pd.to_datetime(report_data_df['timestamp']) # Convert ISO strings to datetime
+            report_data_df['timestamp'] = pd.to_datetime(report_data_df['timestamp'])
 
         if report_data_df.empty:
             logger.warning("No data found for report generation.", task_id=self.request.id)
             return {'status': 'SUCCESS', 'result': 'No data for report'}
 
-        # Assuming generate_comprehensive_report now accepts DataFrame directly
         report_path = report_gen.generate_comprehensive_report(
-             # Pass data as dict for compatibility or update generator
-             report_data={'devices': report_data_list},
-             date_range_days=7
+            report_data={'devices': report_data_list},
+            date_range_days=7
         )
         logger.info(f"Report generated by Celery task", task_id=self.request.id, report_path=report_path)
         return {'status': 'SUCCESS', 'report_path': str(report_path)}
@@ -2190,19 +1899,18 @@ def generate_report_task(self, user_id="system"): # Added user_id
 def export_data_task(self, format_type='json', date_range_days=7):
     """Async data export task using Celery."""
     logger.info(f"Celery task started: export_data_task", task_id=self.request.id, format=format_type, days=date_range_days)
-    # ContextTask handles app context
     try:
         export_dir = Path(get_optional_env('EXPORTS_DIR', 'EXPORTS'))
         export_dir.mkdir(parents=True, exist_ok=True)
-        timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S') # Use UTC
+        timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
         filename = f'export_{timestamp_str}.{format_type}'
         filepath = export_dir / filename
 
         with get_session() as session:
-            start_date = datetime.now(timezone.utc) - timedelta(days=int(date_range_days)) # Use UTC
+            start_date = datetime.now(timezone.utc) - timedelta(days=int(date_range_days))
             data_query = session.query(DeviceData).filter(DeviceData.timestamp >= start_date).order_by(DeviceData.timestamp.asc())
-            results = data_query.limit(50000).all() # Limit export size
-            data_list = [d.to_dict() for d in results] # .to_dict() converts datetime to ISO string
+            results = data_query.limit(50000).all()
+            data_list = [d.to_dict() for d in results]
 
         if not data_list:
             logger.warning("No data found for export.", task_id=self.request.id)
@@ -2210,13 +1918,12 @@ def export_data_task(self, format_type='json', date_range_days=7):
 
         if format_type == 'csv':
             df = pd.DataFrame(data_list)
-            # Handle metadata column if it contains dicts
             if 'metadata' in df.columns:
-                 df['metadata'] = df['metadata'].apply(lambda x: json.dumps(x) if isinstance(x, dict) else x)
-            # Timestamps are already ISO strings from .to_dict()
+                df['metadata'] = df['metadata'].apply(lambda x: json.dumps(x) if isinstance(x, dict) else x)
             df.to_csv(filepath, index=False)
-        else: # JSON
-            with open(filepath, 'w') as f: json.dump(data_list, f, indent=2)
+        else:
+            with open(filepath, 'w') as f:
+                json.dump(data_list, f, indent=2)
 
         logger.info(f"Data exported by Celery task", task_id=self.request.id, export_path=str(filepath))
         return {'status': 'SUCCESS', 'export_path': str(filepath), 'filename': filename}
@@ -2225,5 +1932,135 @@ def export_data_task(self, format_type='json', date_range_days=7):
         self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
         raise
 
+
+# ==================== APPLICATION FACTORY & MAIN ====================
+def create_app_instance() -> DigitalTwinApp:
+    """Application factory function"""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(verbose=True)
+        logger.info(".env file loaded if present.")
+    except ImportError:
+        logger.info(".env file not loaded (dotenv not installed). Relying on system env vars.")
+    try:
+        app_instance = DigitalTwinApp()
+        app_instance.app.extensions["digital_twin_instance"] = app_instance
+        return app_instance
+    except Exception as e:
+        logger.critical(f"FATAL: Failed to create application instance", error=str(e), exc_info=True)
+        sys.exit(1)
+
+digital_twin_app_instance = create_app_instance()
+flask_app = digital_twin_app_instance.app
+
+
+# ==================== SPECIAL ROUTES (Health, Metrics, Static Files) ====================
+@flask_app.route('/health')
+def health_check():
+    """Health check endpoint"""
+    app_instance = flask_app.extensions["digital_twin_instance"]
+    db_ok = False
+    redis_ok = app_instance.cache.available if app_instance.cache else False
+    celery_ok = False
+    
+    try:
+        with engine.connect() as connection:
+            db_ok = True
+    except Exception as e:
+        logger.error(f"Health check DB failed", error=str(e))
+    
+    if app_instance.celery:
+        try:
+            app_instance.celery.broker_connection().ensure_connection(max_retries=1)
+            celery_ok = True
+        except Exception as e:
+            logger.warning("Health check Celery failed", error=str(e))
+
+    status = {
+        'status': 'healthy' if db_ok and redis_ok and celery_ok else 'partial',
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'version': '3.6.0',
+        'checks': {
+            'redis': 'ok' if redis_ok else 'unavailable',
+            'postgresql': 'ok' if db_ok else 'unavailable',
+            'celery': 'ok' if celery_ok else 'unavailable',
+        },
+        'uptime': str(datetime.now() - app_instance.start_time).split('.')[0]
+    }
+    status_code = 200 if status['status'] == 'healthy' else 503
+    return jsonify(status), status_code
+
+@flask_app.route('/metrics')
+def prometheus_metrics():
+    """Expose metrics for Prometheus scraping."""
+    app_instance = flask_app.extensions["digital_twin_instance"]
+    if not PROMETHEUS_AVAILABLE or not app_instance.metrics:
+        return jsonify({"message": "Prometheus exporter not available."}), 503
+    logger.debug("Serving Prometheus metrics")
+    return Response("", mimetype='text/plain')
+
+@flask_app.route('/reports/<path:filename>')
+def serve_report(filename):
+    """Serve generated report files"""
+    reports_dir = Path(get_optional_env('REPORTS_DIR', 'REPORTS/generated'))
+    logger.debug(f"Attempting to serve report", filename=filename, directory=str(reports_dir))
+    if not reports_dir.is_dir():
+        logger.error(f"Reports directory not found", directory=str(reports_dir))
+        return "Reports directory configuration error", 500
+    try:
+        safe_filename = Path(filename).name
+        if safe_filename != filename:
+            logger.warning("Potential path traversal detected in report request", filename=filename)
+            return "Invalid filename", 400
+        return send_from_directory(reports_dir, safe_filename, as_attachment=False)
+    except FileNotFoundError:
+        logger.warning(f"Report file not found", filename=filename)
+        return "Report not found", 404
+
+@flask_app.route('/exports/<path:filename>')
+def serve_export(filename):
+    """Serve export files"""
+    exports_dir = Path(get_optional_env('EXPORTS_DIR', 'EXPORTS'))
+    logger.debug(f"Attempting to serve export", filename=filename, directory=str(exports_dir))
+    if not exports_dir.is_dir():
+        logger.error(f"Exports directory not found", directory=str(exports_dir))
+        return "Exports directory configuration error", 500
+    try:
+        safe_filename = Path(filename).name
+        if safe_filename != filename:
+            logger.warning("Potential path traversal detected in export request", filename=filename)
+            return "Invalid filename", 400
+        return send_from_directory(exports_dir, safe_filename, as_attachment=True)
+    except FileNotFoundError:
+        logger.warning(f"Export file not found", filename=filename)
+        return "Export not found", 404
+
+@flask_app.route('/', defaults={'path': ''})
+@flask_app.route('/<path:path>')
+def serve_react_app(path):
+    """Serve React frontend application"""
+    static_folder = flask_app.static_folder
+    if static_folder is None:
+        logger.error("Static folder not configured.")
+        return "Static folder not found", 404
+
+    safe_path = os.path.normpath(os.path.join(static_folder, path)).lstrip(os.path.sep)
+    full_path = os.path.join(static_folder, safe_path)
+
+    if path != "" and os.path.exists(full_path) and os.path.isfile(full_path):
+        if os.path.commonprefix((os.path.realpath(full_path), os.path.realpath(static_folder))) == os.path.realpath(static_folder):
+            return send_from_directory(static_folder, safe_path)
+        else:
+            logger.warning("Attempted directory traversal", requested_path=path)
+            return "Not Found", 404
+    else:
+        index_path = os.path.join(static_folder, 'index.html')
+        if not os.path.exists(index_path):
+            logger.error("index.html not found in static folder.", path=index_path)
+            return "Frontend entry point not found", 404
+        return send_from_directory(static_folder, 'index.html')
+
+
+# ==================== MAIN EXECUTION ====================
 if __name__ == '__main__':
     digital_twin_app_instance.run()

@@ -204,12 +204,13 @@ class HealthScoreCalculator:
     def train_health_scorer(self, data: pd.DataFrame, failure_labels: pd.Series) -> Dict:
         """
         Trains an ML model to predict health score (1 - failure_prob).
-        
+        Vectorized version for improved performance.
+
         Args:
-            data: DataFrame of historical sensor data.
+            data: DataFrame of historical sensor data (ensure 'timestamp' column exists and is datetime).
             failure_labels: Series of 0s (healthy) and 1s (failure)
-                            corresponding to the data.
-                            
+                                corresponding to the data.
+
         Returns:
             Dictionary with training results.
         """
@@ -218,99 +219,138 @@ class HealthScoreCalculator:
             self.logger.error(msg)
             return {'error': msg}
 
-        self.logger.info(f"Starting health scorer training with {len(data)} samples...")
-        
-        # We want to predict "health" (0 to 1), so we invert failure labels.
-        health_labels = 1 - failure_labels
-        
-        # --- Feature Engineering ---
-        # We will train the model on the outputs of our component scores
-        # and the outputs of the predictive analytics engine.
-        features_list = []
-        
-        # This is slow (row-by-row) but demonstrates the concept.
-        # For production, this should be vectorized.
-        # --- REFINED --- 
-        # Use a sliding window to give component calculators enough data
-        window_size = 50 # Make this larger if more history is needed
-        
-        for i in range(window_size, len(data)):
-            # --- REFINED --- 
-            # Use a window of data, not just a single row
-            window_data = data.iloc[i-window_size:i]
-            current_row = data.iloc[i:i+1] # For predictive features
-            
-            features = {}
-            
-            # 1. Get component scores
-            num_data = window_data.select_dtypes(include=[np.number])
-            features['performance'] = self._calculate_performance_score(num_data)['score']
-            features['reliability'] = self._calculate_reliability_score(num_data, window_data)['score']
-            features['efficiency'] = self._calculate_efficiency_score(num_data)['score']
-            features['safety'] = self._calculate_safety_score(num_data)['score']
-            features['maintenance'] = self._calculate_maintenance_score(num_data, window_data)['score']
-            
-            # 2. Get predictive features (from the *current* state)
+        self.logger.info(f"Starting health scorer training (vectorized) with {len(data)} samples...")
+
+        if 'timestamp' not in data.columns:
+            msg = "Timestamp column missing in input data for training."
+            self.logger.error(msg)
+            return {'error': msg}
+        if not pd.api.types.is_datetime64_any_dtype(data['timestamp']):
             try:
-                # Use a fast anomaly model for training
-                # This call *must* match the one in calculate_overall_health_score
-                anomaly_res = self.analytics_engine.detect_anomalies(current_row, model_name="anomaly_detector")
-                features['anomaly_score'] = anomaly_res.get('anomaly_scores', [0.0])[0]
-                
-                # Use failure predictor
-                fail_res = self.analytics_engine.predict_failure(current_row)
-                features['failure_prob'] = fail_res.get('failure_probabilities', [0.0])[0]
-            except Exception:
-                features['anomaly_score'] = 0.0
-                features['failure_prob'] = 0.0
+                data['timestamp'] = pd.to_datetime(data['timestamp'])
+            except Exception as e:
+                msg = f"Could not convert timestamp column to datetime: {e}"
+                self.logger.error(msg)
+                return {'error': msg}
 
-            features_list.append(features)
+        # Sort data by timestamp for rolling operations
+        data = data.sort_values('timestamp').reset_index(drop=True)
+        failure_labels = failure_labels.loc[data.index] # Ensure labels match sorted data
 
-        X = pd.DataFrame(features_list)
-        # Adjust labels to match the features (we lost 'window_size' rows)
-        y = health_labels.iloc[window_size:] 
-        
+        health_labels = 1 - failure_labels
+        window_size = 50 # Window size for component calculations
+
+        if len(data) <= window_size:
+            msg = f"Not enough data ({len(data)}) for window size ({window_size})."
+            self.logger.error(msg)
+            return {'error': msg}
+
+        # --- Feature Engineering (Vectorized) ---
+        features_df = pd.DataFrame(index=data.index[window_size:])
+        numeric_cols = data.select_dtypes(include=[np.number]).columns
+
+        self.logger.info("Calculating component scores using rolling windows...")
+
+        # 1. Calculate Component Scores using rolling windows
+        rolling_window = data.rolling(window=window_size)
+
+        # Note: These lambda functions assume component calculators take a DataFrame window
+        # Adjust arguments if your component calculators expect Series or different inputs
+        features_df['performance'] = rolling_window[numeric_cols].apply(
+            lambda x: self._calculate_performance_score(pd.DataFrame(x, columns=numeric_cols))['score'], raw=False
+        )[window_size:]
+
+        features_df['reliability'] = rolling_window[list(data.columns)].apply(
+            lambda x: self._calculate_reliability_score(
+                pd.DataFrame(x[:, numeric_cols.get_indexer(data.columns)], columns=numeric_cols), # Numeric part
+                pd.DataFrame(x, columns=data.columns) # Full data part
+            )['score'],
+            raw=True # Use numpy array for potential speedup if possible
+        )[window_size:]
+
+        features_df['efficiency'] = rolling_window[numeric_cols].apply(
+            lambda x: self._calculate_efficiency_score(pd.DataFrame(x, columns=numeric_cols))['score'], raw=False
+        )[window_size:]
+
+        features_df['safety'] = rolling_window[numeric_cols].apply(
+            lambda x: self._calculate_safety_score(pd.DataFrame(x, columns=numeric_cols))['score'], raw=False
+        )[window_size:]
+
+        features_df['maintenance'] = rolling_window[list(data.columns)].apply(
+            lambda x: self._calculate_maintenance_score(
+                pd.DataFrame(x[:, numeric_cols.get_indexer(data.columns)], columns=numeric_cols),
+                pd.DataFrame(x, columns=data.columns)
+            )['score'],
+            raw=True
+        )[window_size:]
+
+        self.logger.info("Calculating predictive features...")
+
+        # 2. Get Predictive Features (Requires iteration for now, but potentially batchable)
+        # These are harder to vectorize fully without modifying AnalyticsEngine,
+        # but we can apply them to each row efficiently.
+        # We apply predictions based on the *current* row's data.
+        predictive_features = data[window_size:].apply(
+            lambda row: pd.Series({
+                'anomaly_score': self.analytics_engine.detect_anomalies(
+                                        row.to_frame().T, model_name="anomaly_detector"
+                                    ).get('anomaly_scores', [0.0])[0],
+                'failure_prob': self.analytics_engine.predict_failure(
+                                        row.to_frame().T
+                                    ).get('failure_probabilities', [0.0])[0]
+            }),
+            axis=1
+        )
+
+        # Merge predictive features
+        features_df = pd.concat([features_df, predictive_features.reset_index(drop=True)], axis=1)
+
+        # Fill potential NaNs generated by rolling/apply
+        features_df = features_df.fillna(0.0)
+
+        X = features_df
+        y = health_labels.iloc[window_size:] # Align labels with features
+
         # Save feature names for prediction
         self.scoring_model_metadata['features'] = list(X.columns)
-        
+
         # --- Model Training ---
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
-        # We use a Regressor to predict a continuous health score from 0 to 1
-        model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+
+        self.logger.info(f"Training RandomForestRegressor with {len(X_train)} samples...")
+        model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1, max_depth=10, min_samples_split=5)
         model.fit(X_train, y_train)
-        
+
         self.scoring_model = model
-        
+
         # --- Evaluation ---
         y_pred = model.predict(X_test)
         mse = mean_squared_error(y_test, y_pred)
-        
-        # Get feature importances
+
         importances = dict(zip(X.columns, model.feature_importances_))
-        
+
         self.scoring_model_metadata['training_mse'] = mse
         self.scoring_model_metadata['feature_importances'] = importances
         self.scoring_model_metadata['trained_at'] = datetime.now().isoformat()
-        
+
         # Save the trained model
         self._save_scoring_model()
-        
+
         self.logger.info(f"Health scorer training complete. Test MSE: {mse:.4f}")
-        
+
         return {
             'status': 'success',
             'test_mse': mse,
-            'feature_importances': importances,
+            'feature_importances': {k: round(v, 4) for k, v in sorted(importances.items(), key=lambda item: item[1], reverse=True)},
             'features': list(X.columns)
         }
 
     # --- End New Methods ---
 
     def calculate_overall_health_score(self, data: pd.DataFrame, 
-                                       device_id: str = None,
-                                       timestamp: datetime = None,
-                                       use_model: bool = True) -> Dict:
+                                           device_id: str = None,
+                                           timestamp: datetime = None,
+                                           use_model: bool = True) -> Dict:
         """
         Calculate overall health score for a system or device.
         
@@ -364,8 +404,8 @@ class HealthScoreCalculator:
             if numeric_data_latest.empty:
                 return self._create_error_result("No numeric data available in new packet")
             if numeric_data_history.empty:
-                 # No history, just use current data
-                 numeric_data_history = numeric_data_latest
+                # No history, just use current data
+                numeric_data_history = numeric_data_latest
             
             # --- 1. Calculate Component Scores (using historical data) ---
             component_scores = {}
@@ -552,12 +592,12 @@ class HealthScoreCalculator:
             
             # 2. Uptime/availability (if 'uptime' col exists or timestamp gaps)
             if 'uptime' in full_data.columns:
-                 uptime_score = full_data['uptime'].mean() # Assumes uptime is 0 or 1
+                uptime_score = full_data['uptime'].mean() # Assumes uptime is 0 or 1
             elif 'timestamp' in full_data.columns:
-                 uptime_score = self._calculate_uptime_score(full_data)
+                uptime_score = self._calculate_uptime_score(full_data)
             else:
-                 uptime_score = 0.8 # Default
-                 
+                uptime_score = 0.8 # Default
+                
             scores.append(uptime_score)
             reliability_metrics['uptime'] = {'score': uptime_score}
             
@@ -925,7 +965,7 @@ class HealthScoreCalculator:
             
             # Calculate scores
             in_safe_range_pct = ((data >= applicable_range['min']) & 
-                                (data <= applicable_range['max'])).mean()
+                                 (data <= applicable_range['max'])).mean()
             
             in_optimal_range_pct = ((data >= applicable_range['optimal_min']) & 
                                     (data <= applicable_range['optimal_max'])).mean()
@@ -1885,12 +1925,12 @@ if __name__ == "__main__":
         result = health_calculator.calculate_overall_health_score(real_time_data, device_id)
         individual_results[device_id] = result
         
-        print(f"    {device_id}:")
-        print(f"        Health Score: {result['overall_score']:.3f} (Method: {result['calculation_method']})")
-        print(f"        (Formula: {result['formula_score']:.3f}, Model: {result.get('model_score', 'N/A')})")
-        print(f"        Status: {result['health_status']}")
-        print(f"        Risk Level: {result['risk_assessment']['overall_risk_level']}")
-        print(f"        (Used {result['historical_data_points']} data points for component scores)")
+        print(f"     {device_id}:")
+        print(f"         Health Score: {result['overall_score']:.3f} (Method: {result['calculation_method']})")
+        print(f"         (Formula: {result['formula_score']:.3f}, Model: {result.get('model_score', 'N/A')})")
+        print(f"         Status: {result['health_status']}")
+        print(f"         Risk Level: {result['risk_assessment']['overall_risk_level']}")
+        print(f"         (Used {result['historical_data_points']} data points for component scores)")
         print()
     
     # 2. Calculate fleet health score (using latest data for each)
@@ -1900,46 +1940,46 @@ if __name__ == "__main__":
     latest_fleet_data = {dev_id: data.iloc[-1:] for dev_id, data in device_data.items()}
     fleet_result = health_calculator.calculate_fleet_health_score(latest_fleet_data)
     
-    print(f"    Fleet Health Score: {fleet_result['fleet_health_score']:.3f}")
-    print(f"    Fleet Status: {fleet_result['fleet_health_status']}")
-    print(f"    Healthy Devices: {fleet_result['fleet_analytics']['healthy_devices']}")
-    print(f"    Warning Devices: {fleet_result['fleet_analytics']['warning_devices']}")
-    print(f"    Critical Devices: {fleet_result['fleet_analytics']['critical_devices']}")
+    print(f"     Fleet Health Score: {fleet_result['fleet_health_score']:.3f}")
+    print(f"     Fleet Status: {fleet_result['fleet_health_status']}")
+    print(f"     Healthy Devices: {fleet_result['fleet_analytics']['healthy_devices']}")
+    print(f"     Warning Devices: {fleet_result['fleet_analytics']['warning_devices']}")
+    print(f"     Critical Devices: {fleet_result['fleet_analytics']['critical_devices']}")
     print()
     
     # 3. Show best and worst performing devices
     print("4. Device Performance Ranking:")
-    print("    Best Performing:")
+    print("     Best Performing:")
     for device in fleet_result['best_performing_devices'][:3]:
-        print(f"        {device['device_id']}: {device['score']:.3f}")
+        print(f"         {device['device_id']}: {device['score']:.3f}")
     
-    print("    Worst Performing:")
+    print("     Worst Performing:")
     for device in fleet_result['worst_performing_devices'][-3:]:
-        print(f"        {device['device_id']}: {device['score']:.3f}")
+        print(f"         {device['device_id']}: {device['score']:.3f}")
     print()
     
     # 4. Show recommendations
     print("5. Fleet Recommendations:")
     for i, rec in enumerate(fleet_result['fleet_recommendations'][:5], 1):
-        print(f"    {i}. [{rec['priority'].upper()}] {rec['action']}")
-        print(f"        Timeline: {rec['timeframe']}")
+        print(f"     {i}. [{rec['priority'].upper()}] {rec['action']}")
+        print(f"         Timeline: {rec['timeframe']}")
     print()
     
     # 5. Risk assessment summary
     print("6. Fleet Risk Assessment:")
     risk = fleet_result['fleet_risk_assessment']
-    print(f"    Fleet Risk Level: {risk['fleet_risk_level']}")
-    print(f"    High Risk Devices: {len(risk['high_risk_devices'])}")
-    print(f"    Medium Risk Devices: {len(risk['medium_risk_devices'])}")
-    print(f"    Low Risk Devices: {len(risk['low_risk_devices'])}")
+    print(f"     Fleet Risk Level: {risk['fleet_risk_level']}")
+    print(f"     High Risk Devices: {len(risk['high_risk_devices'])}")
+    print(f"     Medium Risk Devices: {len(risk['medium_risk_devices'])}")
+    print(f"     Low Risk Devices: {len(risk['low_risk_devices'])}")
     print()
     
     # 6. Statistics
     print("7. Health Scoring Statistics:")
     stats = health_calculator.get_health_statistics()
-    print(f"    Total health records: {stats['history_summary']['total_health_records']}")
-    print(f"    Devices tracked: {stats['history_summary']['devices_tracked']}")
-    print(f"    Model Loaded: {stats['configuration_summary']['model_loaded']}")
-    print(f"    Baseline metrics (EMAs): {stats['configuration_summary']['baseline_metrics']}")
+    print(f"     Total health records: {stats['history_summary']['total_health_records']}")
+    print(f"     Devices tracked: {stats['history_summary']['devices_tracked']}")
+    print(f"     Model Loaded: {stats['configuration_summary']['model_loaded']}")
+    print(f"     Baseline metrics (EMAs): {stats['configuration_summary']['baseline_metrics']}")
     
     print("\n=== HEALTH SCORE ANALYSIS COMPLETED ===")
