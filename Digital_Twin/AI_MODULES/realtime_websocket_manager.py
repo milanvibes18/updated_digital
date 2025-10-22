@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+Advanced WebSocket manager for real-time data streaming, room management,
+JWT authentication, and scalable communication in the Digital Twin system.
+(File: Digital_Twin/AI_MODULES/realtime_websocket_manager.py)
+"""
+
 import json
 import logging
 import uuid
@@ -19,8 +26,8 @@ class RealtimeWebSocketManager:
     JWT authentication, and scalable communication in the Digital Twin system.
     """
     
-    def __init__(self, app=None, redis_url="redis://localhost:6379/0", max_connections=1000):
-        self.app = app
+    def __init__(self, redis_url="redis://localhost:6379/0", max_connections=1000):
+        self.app = None
         self.socketio: Optional[SocketIO] = None
         self.redis_client: Optional[redis.Redis] = None
         self.redis_url = redis_url # <-- Store Redis URL
@@ -51,8 +58,6 @@ class RealtimeWebSocketManager:
         
         # Initialize components
         self._initialize_redis() # <-- Uses self.redis_url
-        if app:
-            self.initialize_socketio(app)
     
     def _setup_logging(self):
         """Setup logging for WebSocket manager."""
@@ -62,14 +67,17 @@ class RealtimeWebSocketManager:
         if not logger.handlers:
             # Ensure LOGS directory exists or handle appropriately
             try:
-                handler = logging.FileHandler('LOGS/digital_twin_websocket.log')
+                # Try to use the main app's log directory if configured, else default
+                log_dir = current_app.config.get('LOG_DIR', 'LOGS')
+                os.makedirs(log_dir, exist_ok=True)
+                handler = logging.FileHandler(os.path.join(log_dir, 'digital_twin_websocket.log'))
                 formatter = logging.Formatter(
                     '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
                 )
                 handler.setFormatter(formatter)
                 logger.addHandler(handler)
-            except FileNotFoundError:
-                print("Warning: LOGS directory not found. Logging to console.")
+            except (AttributeError, FileNotFoundError, ImportError):
+                print("Warning: Could not configure file logging. Logging to console.")
                 handler = logging.StreamHandler()
                 logger.addHandler(handler)
 
@@ -91,23 +99,19 @@ class RealtimeWebSocketManager:
             self.app = app
             
             # Configure SocketIO with Redis if available
-            if self.redis_client:
-                self.socketio = SocketIO(
-                    app,
-                    cors_allowed_origins="*",
-                    async_mode='eventlet',
-                    message_queue=self.redis_url, # <-- Corrected: Pass Redis URL
-                    logger=True,
-                    engineio_logger=True
-                )
-            else:
-                self.socketio = SocketIO(
-                    app,
-                    cors_allowed_origins="*",
-                    async_mode='eventlet',
-                    logger=True,
-                    engineio_logger=True
-                )
+            message_queue_url = self.redis_url if self.redis_client else None
+            
+            self.socketio = SocketIO(
+                app,
+                cors_allowed_origins=app.config.get('CORS_ALLOWED_ORIGINS', '*'),
+                async_mode='eventlet',
+                message_queue=message_queue_url,
+                logger=app.config.get('DEBUG', False),
+                engineio_logger=app.config.get('DEBUG', False),
+                ping_timeout=60,
+                ping_interval=25,
+                channel=os.environ.get('SOCKETIO_CHANNEL', 'digital_twin')
+            )
             
             self._register_event_handlers()
             self._start_processing_thread()
@@ -125,34 +129,46 @@ class RealtimeWebSocketManager:
         def handle_connect(auth: Optional[Dict] = None):
             """
             Handle client connection and JWT authentication.
-            Client must send {'token': '...'} in the auth payload.
+            Client must send {'token': '...'} in the auth payload or query string.
             """
             try:
-                token = auth.get('token') if auth else None
+                token = None
+                if auth and 'token' in auth:
+                    token = auth.get('token')
+                elif request.args.get('token'):
+                    token = request.args.get('token')
                 
                 if not token:
-                    self.logger.warning("Connection attempt without token.")
-                    # Emit before returning False to notify client
+                    auth_header = request.headers.get('Authorization')
+                    if auth_header and auth_header.startswith('Bearer '):
+                        token = auth_header.split(' ')[1]
+
+                if not token:
+                    self.logger.warning("Connection attempt without token.", sid=request.sid)
                     emit('auth_failed', {'status': 'error', 'message': 'Authentication token required.'})
                     return False  # Reject connection
 
                 try:
                     # Decode JWT. Assumes secret key is in Flask app config
-                    secret = current_app.config['SECRET_KEY']
+                    # --- FIX: Use JWT_SECRET_KEY, not SECRET_KEY ---
+                    secret = current_app.config['JWT_SECRET_KEY']
                     payload = jwt.decode(token, secret, algorithms=["HS256"])
                     user_id = payload.get('sub') # 'sub' is standard for user ID
                     
+                    # --- FIX: Get role from payload ---
+                    user_role = payload.get('role', 'user') 
+                    
                     if not user_id:
-                        self.logger.warning("Invalid token payload (missing 'sub').")
+                        self.logger.warning("Invalid token payload (missing 'sub').", sid=request.sid)
                         emit('auth_failed', {'status': 'error', 'message': 'Invalid token payload.'})
                         return False
                         
                 except jwt.ExpiredSignatureError:
-                    self.logger.warning("Connection attempt with expired token.")
+                    self.logger.warning("Connection attempt with expired token.", sid=request.sid)
                     emit('auth_failed', {'status': 'error', 'message': 'Token has expired.'})
                     return False
                 except jwt.InvalidTokenError as e:
-                    self.logger.warning(f"Invalid token: {e}")
+                    self.logger.warning(f"Invalid token: {e}", sid=request.sid)
                     emit('auth_failed', {'status': 'error', 'message': 'Invalid authentication token.'})
                     return False
 
@@ -160,13 +176,14 @@ class RealtimeWebSocketManager:
                 session_id = request.sid
                 
                 if len(self.active_connections) >= self.max_connections:
-                    self.logger.warning(f"Maximum connections reached. Rejecting user {user_id}.")
+                    self.logger.warning(f"Maximum connections reached. Rejecting user {user_id}.", sid=request.sid)
                     emit('error', {'status': 'error', 'message': 'Server is at capacity. Please try again later.'})
                     return False
 
                 client_info = {
                     'session_id': session_id,
                     'user_id': user_id, # <-- Store authenticated user
+                    'role': user_role, # <-- FIX: Store user role
                     'connected_at': datetime.now().isoformat(),
                     'ip_address': self._get_client_ip(),
                     'user_agent': self._get_user_agent(),
@@ -176,21 +193,33 @@ class RealtimeWebSocketManager:
                 
                 self.active_connections[session_id] = client_info
                 
-                # Send welcome message (Payload Schema update)
+                # Send welcome message
                 emit('connection_established', {
                     'status': 'success',
                     'data': {
                         'session_id': session_id,
                         'user_id': user_id,
+                        'role': user_role,
                         'server_time': datetime.now().isoformat(),
                     }
                 })
                 
-                self.logger.info(f"Client connected: {session_id} (User: {user_id})")
+                self.logger.info(f"Client connected: {session_id} (User: {user_id}, Role: {user_role})")
+                
+                # Try to send initial data
+                try:
+                    cache = getattr(current_app.extensions.get("digital_twin_instance"), 'cache', None)
+                    if cache:
+                        initial_data = cache.get('dashboard_combined_data')
+                        if initial_data:
+                            emit('dashboard_update', {'data': initial_data})
+                except Exception as e:
+                    self.logger.warning(f"Could not send initial dashboard data: {e}")
+                    
                 return True
                 
             except Exception as e:
-                self.logger.error(f"Connection error: {e}")
+                self.logger.error(f"Connection error: {e}", exc_info=True)
                 emit('error', {'status': 'error', 'message': 'An internal server error occurred during connection.'})
                 return False
         
@@ -215,12 +244,14 @@ class RealtimeWebSocketManager:
             except Exception as e:
                 self.logger.error(f"Disconnection error: {e}")
         
-        @self.socketio.on('join_room')
+        @self.socketio.on('join_room') # Renamed from 'subscribe' in main app
+        @self.socketio.on('subscribe') # Add alias for compatibility
         def handle_join_room(data):
             """Handle room join requests."""
             session_id = request.sid
             try:
-                room_name = data.get('room')
+                # Support both 'room' and 'room_name' keys
+                room_name = data.get('room') or data.get('room_name')
                 
                 if not room_name:
                     emit('error', {'status': 'error', 'message': 'Room name required'})
@@ -232,25 +263,26 @@ class RealtimeWebSocketManager:
                 
                 self._join_room(session_id, room_name)
                 
-                # Payload schema update
-                emit('room_joined', {
+                emit('room_joined', { # Main app used 'subscribed'
                     'status': 'success',
                     'data': {
                         'room': room_name,
                         'members_count': len(self.room_subscriptions.get(room_name, set()))
                     }
                 })
+                emit('subscribed', {'data': {'room': room_name}}) # For compatibility
                 
             except Exception as e:
                 self.logger.error(f"Join room error: {e}")
                 emit('error', {'status': 'error', 'message': 'Failed to join room'})
         
-        @self.socketio.on('leave_room')
+        @self.socketio.on('leave_room') # Renamed from 'unsubscribe' in main app
+        @self.socketio.on('unsubscribe') # Add alias for compatibility
         def handle_leave_room(data):
             """Handle room leave requests."""
             session_id = request.sid
             try:
-                room_name = data.get('room')
+                room_name = data.get('room') or data.get('room_name')
                 
                 if not room_name:
                     emit('error', {'status': 'error', 'message': 'Room name required'})
@@ -258,11 +290,11 @@ class RealtimeWebSocketManager:
                 
                 self._leave_room(session_id, room_name)
                 
-                # Payload schema update
-                emit('room_left', {
+                emit('room_left', { # Main app used 'unsubscribed'
                     'status': 'success',
                     'data': {'room': room_name}
                 })
+                emit('unsubscribed', {'data': {'room': room_name}}) # For compatibility
                 
             except Exception as e:
                 self.logger.error(f"Leave room error: {e}")
@@ -285,20 +317,17 @@ class RealtimeWebSocketManager:
                 
                 self._subscribe_to_stream(session_id, stream_id)
                 
-                # Send recent data if available
                 recent_data = list(self.data_streams[stream_id])[-10:]
                 if recent_data:
-                    # Payload schema update
                     emit('stream_data', {
                         'status': 'success',
                         'data': {
                             'stream_id': stream_id,
-                            'payload': recent_data, # Renamed 'data' to 'payload'
+                            'payload': recent_data,
                             'type': 'historical'
                         }
                     })
                 
-                # Payload schema update
                 emit('stream_subscribed', {
                     'status': 'success',
                     'data': {'stream_id': stream_id}
@@ -321,7 +350,6 @@ class RealtimeWebSocketManager:
                 
                 self._unsubscribe_from_stream(session_id, stream_id)
                 
-                # Payload schema update
                 emit('stream_unsubscribed', {
                     'status': 'success',
                     'data': {'stream_id': stream_id}
@@ -332,6 +360,7 @@ class RealtimeWebSocketManager:
                 emit('error', {'status': 'error', 'message': 'Failed to unsubscribe from stream'})
         
         @self.socketio.on('ping')
+        @self.socketio.on('ping_from_client') # Alias for compatibility
         def handle_ping():
             """Handle ping requests for connection health."""
             session_id = request.sid
@@ -339,11 +368,11 @@ class RealtimeWebSocketManager:
                 if session_id in self.active_connections:
                     self.active_connections[session_id]['last_activity'] = time.time()
                 
-                # Payload schema update
                 emit('pong', {
                     'status': 'success',
                     'data': {'timestamp': datetime.now().isoformat()}
                 })
+                emit('pong_from_server', {'data': {'timestamp': datetime.now().isoformat()}}) # For compatibility
                 
             except Exception as e:
                 self.logger.error(f"Ping error: {e}")
@@ -360,7 +389,6 @@ class RealtimeWebSocketManager:
                     emit('error', {'status': 'error', 'message': 'Rate limit exceeded'})
                     return
                 
-                # Queue the data request for processing
                 self.message_queue.put({
                     'type': 'data_request',
                     'session_id': session_id,
@@ -377,15 +405,10 @@ class RealtimeWebSocketManager:
     # Helpers, processing & API
     # -------------------------------
 
-    # Removed _generate_session_id and _get_session_id
-    # We now use request.sid directly in all event handlers.
-
     def _get_client_ip(self):
         """Get client IP address."""
-        # Respect common proxy headers if present
         x_forwarded = request.headers.get('X-Forwarded-For', '')
         if x_forwarded:
-            # X-Forwarded-For may contain a list of IPs; take the first
             return x_forwarded.split(',')[0].strip()
         return request.environ.get('HTTP_X_REAL_IP', request.remote_addr)
 
@@ -397,35 +420,27 @@ class RealtimeWebSocketManager:
         """Check if client is within rate limits."""
         if not session_id:
             return False
-
         now = time.time()
         client_requests = self.rate_limits[session_id]
-
-        # Remove old requests
         while client_requests and client_requests[0] < now - self.rate_limit_window:
             client_requests.pop(0)
-
         if len(client_requests) >= self.rate_limit_max:
             return False
-
         client_requests.append(now)
         return True
 
     def _join_room(self, session_id, room_name):
         """Add client to a room (and make the Socket.IO 'join_room' call)."""
         try:
-            # Make Socket.IO join the room for the current request context
             join_room(room_name)
         except Exception:
-            # join_room requires proper request context; ignore if called outside handler
             self.logger.warning(f"join_room({room_name}) failed for {session_id} (no request context)")
             pass
 
         self.room_subscriptions[room_name].add(session_id)
-        self.user_rooms[session_id].add(room_name)
-
         if session_id in self.active_connections:
-            self.active_connections[session_id]['rooms'].add(room_name)
+            self.user_rooms[session_id] = self.active_connections[session_id]['rooms']
+        self.user_rooms[session_id].add(room_name)
         
         self.logger.info(f"Client {session_id} joined room {room_name}")
 
@@ -445,7 +460,6 @@ class RealtimeWebSocketManager:
         if session_id in self.active_connections:
              self.active_connections[session_id]['rooms'].discard(room_name)
 
-        # Clean up empty rooms
         if not self.room_subscriptions.get(room_name):
             self.room_subscriptions.pop(room_name, None)
 
@@ -527,19 +541,16 @@ class RealtimeWebSocketManager:
             else:
                 data = {'error': 'Unknown data type', 'requested_type': data_type}
 
-            # Emit to the requesting client's room
             if self.socketio:
                 try:
-                    # Payload schema update
                     response_data = {
                         'status': 'success',
                         'data': {
                             'data_type': data_type,
-                            'payload': data, # Renamed
+                            'payload': data,
                             'timestamp': datetime.now().isoformat()
                         }
                     }
-                    # Handle errors from the data retrieval
                     if isinstance(data, dict) and 'error' in data:
                         response_data['status'] = 'error'
                         response_data['data']['message'] = data['error']
@@ -560,21 +571,18 @@ class RealtimeWebSocketManager:
                 self.logger.warning("Stream data message missing stream_id")
                 return
 
-            # Add to circular buffer
             self.data_streams[stream_id].append({
                 'data': data,
                 'timestamp': datetime.now().isoformat()
             })
 
-            # Broadcast to subscribers
             if self.socketio:
                 try:
-                    # Payload schema update
                     self.socketio.emit('stream_data', {
                         'status': 'success',
                         'data': {
                             'stream_id': stream_id,
-                            'payload': data, # Renamed
+                            'payload': data,
                             'timestamp': datetime.now().isoformat(),
                             'type': 'real_time'
                         }
@@ -617,7 +625,7 @@ class RealtimeWebSocketManager:
         try:
             if self.socketio:
                 self.socketio.emit(event, data, room=room_name)
-                self.logger.info(f"Broadcasted {event} to room {room_name}")
+                self.logger.debug(f"Broadcasted {event} to room {room_name}")
         except Exception as e:
             self.logger.error(f"Broadcast error: {e}")
 
@@ -629,7 +637,7 @@ class RealtimeWebSocketManager:
         try:
             if self.socketio:
                 self.socketio.emit(event, data, room=session_id)
-                self.logger.info(f"Sent {event} to client {session_id}")
+                self.logger.debug(f"Sent {event} to client {session_id}")
         except Exception as e:
             self.logger.error(f"Send to client error: {e}")
 
@@ -707,6 +715,7 @@ class RealtimeWebSocketManager:
                     {
                         'session_id': sid,
                         'user_id': info.get('user_id'),
+                        'role': info.get('role'),
                         'connected_at': info.get('connected_at'),
                         'rooms': list(info.get('rooms', [])),
                         'ip_address': info.get('ip_address', 'unknown'),
@@ -724,6 +733,9 @@ class RealtimeWebSocketManager:
         try:
             now = time.time()
             inactive_sessions = []
+            
+            # Check for timeout (default 5 minutes)
+            timeout = int(os.environ.get('CLIENT_TIMEOUT_MINUTES', 5)) * 60
 
             for session_id, info in list(self.active_connections.items()):
                 if now - info.get('last_activity', 0) > timeout:
@@ -732,8 +744,17 @@ class RealtimeWebSocketManager:
             for session_id in inactive_sessions:
                 client_rooms = self.active_connections[session_id].get('rooms', set()).copy()
                 for room in client_rooms:
-                    self._leave_room(session_id, room)
-                del self.active_connections[session_id]
+                    self._leave_room(session_id, room, is_disconnecting=True)
+                
+                if self.socketio:
+                    try:
+                        self.socketio.disconnect(session_id, silent=True)
+                    except Exception as e:
+                        self.logger.error(f"Error during socketio disconnect on cleanup: {e}", sid=session_id)
+
+                if session_id in self.active_connections:
+                    del self.active_connections[session_id]
+                
                 self.logger.info(f"Cleaned up inactive connection: {session_id}")
 
             return len(inactive_sessions)
@@ -745,34 +766,22 @@ class RealtimeWebSocketManager:
     def add_event_handler(self, event_name: str, handler: Callable):
         """
         Add a custom event handler.
-        This will register a single dispatcher for the event_name on first call,
-        and append all subsequent handlers to an internal list.
         """
         try:
-            # Add the handler to our internal list
             self.event_handlers[event_name].append(handler)
-
-            # Check if we've already registered a dispatcher for this event
             dispatcher_attr = f'_dispatcher_registered_{event_name}'
             
             if self.socketio and not getattr(self.socketio, dispatcher_attr, False):
                 
-                # Create a closure to capture the event_name
                 def create_dispatcher(event):
                     def dispatcher(*args, **kwargs):
-                        """Generic dispatcher for custom events."""
                         self.logger.debug(f"Dispatching custom event '{event}'")
                         try:
-                            # Call handlers with request.sid as first arg if they expect it
-                            # This is a convention, adjust as needed
                             sid = request.sid
                             for h in self.event_handlers[event]:
-                                # Simple check for arg count, or use inspect
-                                # For simplicity, just pass sid + args
                                 h(sid, *args, **kwargs)
                         except TypeError:
                             try:
-                                # Fallback for handlers that don't expect sid
                                 for h in self.event_handlers[event]:
                                     h(*args, **kwargs)
                             except Exception as e:
@@ -781,9 +790,7 @@ class RealtimeWebSocketManager:
                             self.logger.error(f"Custom handler error for {event}: {e}")
                     return dispatcher
 
-                # Register the new dispatcher
                 self.socketio.on(event_name, create_dispatcher(event_name))
-                # Mark it as registered
                 setattr(self.socketio, dispatcher_attr, True)
                 self.logger.info(f"Registered SocketIO dispatcher for: {event_name}")
             
@@ -815,12 +822,10 @@ class RealtimeWebSocketManager:
         try:
             self.logger.info("Shutting down WebSocket manager...")
 
-            # Stop processing thread
             self.should_stop.set()
             if self.processing_thread and self.processing_thread.is_alive():
                 self.processing_thread.join(timeout=5)
 
-            # Notify clients (Payload schema update)
             if self.socketio:
                 try:
                     self.socketio.emit('server_shutdown', {
@@ -833,7 +838,6 @@ class RealtimeWebSocketManager:
                 except Exception as e:
                     self.logger.error(f"Failed to emit shutdown: {e}")
 
-            # Clear internal state
             self.active_connections.clear()
             self.room_subscriptions.clear()
             self.user_rooms.clear()
@@ -844,48 +848,3 @@ class RealtimeWebSocketManager:
 
         except Exception as e:
             self.logger.error(f"Shutdown error: {e}")
-
-# -------------------------------
-# Example usage (run guard)
-# -------------------------------
-if __name__ == "__main__":
-    from flask import Flask, jsonify
-
-    app = Flask(__name__)
-    # IMPORTANT: Set a secret key for JWT validation
-    app.config['SECRET_KEY'] = 'your-super-secret-key-for-jwt-and-flask'
-
-    # Instantiate manager
-    ws_manager = RealtimeWebSocketManager(app)
-
-    # Example custom event handler
-    # Note: handler now receives sid as first arg
-    def handle_custom_event(sid, data):
-        print(f"Custom event received from {sid}: {data}")
-        # Echo back to the client
-        ws_manager.send_to_client(sid, 'custom_response', {
-            'status': 'success',
-            'data': {'received': data}
-        })
-
-    ws_manager.add_event_handler('custom_event', handle_custom_event)
-
-    # Create some rooms
-    ws_manager.create_room('device_alerts', 'Device alert notifications')
-    ws_manager.create_room('system_health', 'System health monitoring')
-
-    # Example: How to generate a test token (e.g., in your /login route)
-    @app.route('/get_token/<user_id>')
-    def get_token(user_id):
-        token = jwt.encode(
-            {'sub': user_id, 'iat': datetime.now()},
-            app.config['SECRET_KEY'],
-            algorithm="HS256"
-        )
-        return jsonify({'token': token})
-
-    # Start the Socket.IO server if present
-    if ws_manager.socketio:
-        print("WebSocket server starting on http://127.0.0.1:5000")
-        print("Visit http://127.0.0.1:5000/get_token/user123 to get a test token.")
-        ws_manager.socketio.run(app, debug=True, port=5000, host='127.0.0.1')

@@ -2,19 +2,10 @@
 """
 Enhanced Flask Application for Digital Twin System v3.6 (Production-Ready - Merged)
 Main web application with Flask Blueprints, Redis caching, PostgreSQL via SQLAlchemy ORM,
-optimized SocketIO with Namespaces, async tasks via Celery, structured logging,
+optimized SocketIO (via Manager), async tasks via Celery, structured logging,
 input validation, Prometheus metrics, RBAC, and enhanced security.
 
-Merged Features from v3.4 & v3.5:
-- Flask Blueprints for route organization
-- Standardized JSON API responses
-- Bcrypt password hashing
-- JWT Access & Refresh Token flow
-- Role-Based Access Control (RBAC)
-- WebSocket Namespace with payload validation
-- Enhanced error handling throughout
-- Prometheus metrics integration
-- Celery task queue with Beat scheduler
+Refactored to delegate WebSocket logic to RealtimeWebSocketManager.
 """
 
 import os
@@ -47,7 +38,7 @@ from flask import (
     flash, send_from_directory, Response, current_app, Blueprint, g
 )
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect, Namespace
+# -- SocketIO imports removed, will be handled by manager --
 import eventlet
 
 # Database imports
@@ -150,9 +141,11 @@ try:
     from Digital_Twin.AI_MODULES.pattern_analyzer import PatternAnalyzer
     from Digital_Twin.AI_MODULES.recommendation_engine import RecommendationEngine
     from Digital_Twin.AI_MODULES.secure_database_manager import SecureDatabaseManager
+    # --- Import WebSocket Manager ---
+    from Digital_Twin.AI_MODULES.realtime_websocket_manager import RealtimeWebSocketManager
 except ImportError as e:
     logging.warning(f"Could not import some modules: {e}. Functionality might be limited.")
-    PredictiveAnalyticsEngine = HealthScoreCalculator = AlertManager = PatternAnalyzer = RecommendationEngine = UnifiedDataGenerator = HealthReportGenerator = SecureDatabaseManager = object
+    PredictiveAnalyticsEngine = HealthScoreCalculator = AlertManager = PatternAnalyzer = RecommendationEngine = UnifiedDataGenerator = HealthReportGenerator = SecureDatabaseManager = RealtimeWebSocketManager = object
 
 
 # ==================== LOGGING SETUP (Structlog) ====================
@@ -283,35 +276,7 @@ def validate_json(schema: Schema):
         return wrapper
     return decorator
 
-# Decorator for WebSocket payload validation
-def validate_socket_payload(schema: Schema):
-    def decorator(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            if not MARSHMALLOW_AVAILABLE:
-                logger.warning("Marshmallow not available, skipping WebSocket payload validation.")
-                return f(*args, **kwargs)
-
-            payload = args[0] if args else {}
-            if not isinstance(payload, dict):
-                logger.warning("Invalid WebSocket payload: not a dictionary.", received_payload=payload, sid=request.sid)
-                emit('error', {'message': 'Invalid payload format: Expected a JSON object.'})
-                return
-
-            try:
-                validated_payload = schema.load(payload)
-                new_args = (validated_payload,) + args[1:]
-                return f(*new_args, **kwargs)
-            except ValidationError as err:
-                logger.warning("WebSocket payload validation failed", errors=err.messages, received_payload=payload, sid=request.sid)
-                emit('error', {'message': 'Payload validation failed', 'details': err.messages})
-                return
-            except Exception as e:
-                logger.error("Unexpected error during WebSocket payload validation", error=str(e), exc_info=True, sid=request.sid)
-                emit('error', {'message': 'Internal validation error'})
-                return
-        return wrapper
-    return decorator
+# --- WebSocket validation decorator removed, as logic is now in the manager ---
 
 # Decorator for RBAC
 def role_required(required_role: str):
@@ -673,7 +638,8 @@ class DigitalTwinApp:
 
     def __init__(self):
         self.app: Optional[Flask] = None
-        self.socketio: Optional[SocketIO] = None
+        # --- Use the WebSocket Manager ---
+        self.socketio_manager: Optional[RealtimeWebSocketManager] = None
         self.cache: Optional[RedisCacheManager] = None
         self.analytics_engine = None
         self.health_calculator = None
@@ -687,13 +653,12 @@ class DigitalTwinApp:
         self.metrics: Optional[PrometheusMetrics] = None
         self.celery: Optional[Celery] = celery_app
 
-        self.connected_clients: Dict[str, Dict] = {}
+        # --- Client/Room state removed, now handled by socketio_manager ---
         self.start_time = datetime.now()
-        self.rooms: Dict[str, Set[str]] = defaultdict(set)
         self.db_available = False
 
         self.logger = logger
-        self.logger.info("Digital Twin Application v3.6 starting...")
+        self.logger.info("Digital Twin Application v3.6 (Refactored) starting...")
 
         self._create_app()
         if not self.app:
@@ -703,7 +668,7 @@ class DigitalTwinApp:
         self._initialize_modules()
         self._setup_middleware()
         self._register_blueprints()
-        self._setup_websocket_events()
+        # --- _setup_websocket_events removed ---
         self._start_background_tasks()
         self._setup_error_handlers()
 
@@ -755,7 +720,7 @@ class DigitalTwinApp:
         self.logger.info(f"Flask app created.", environment=get_optional_env('FLASK_ENV', 'development'), debug=self.app.config['DEBUG'])
 
     def _initialize_infrastructure(self):
-        """Initialize DB, Redis, Celery, JWT, Limiter, CSRF, Prometheus"""
+        """Initialize DB, Redis, Celery, JWT, Limiter, CSRF, Prometheus, and WebSocket Manager"""
         global engine, SessionLocal
 
         init_database(self.app.config['DATABASE_URL'])
@@ -787,26 +752,17 @@ class DigitalTwinApp:
         else:
             self.metrics = PrometheusMetrics()
 
-        allowed_origins = self.app.config['CORS_ALLOWED_ORIGINS']
+        # --- Initialize the WebSocket Manager ---
         try:
-            message_queue_url = self.app.config['REDIS_URL'] if self.cache.available else None
-            if message_queue_url:
-                logger.info(f"Using Redis message queue for SocketIO", url=message_queue_url)
-
-            self.socketio = SocketIO(
-                self.app,
-                cors_allowed_origins=allowed_origins,
-                async_mode='eventlet',
-                logger=self.app.config['DEBUG'],
-                engineio_logger=self.app.config['DEBUG'],
-                ping_timeout=60,
-                ping_interval=25,
-                message_queue=message_queue_url,
-                channel=get_optional_env('SOCKETIO_CHANNEL', 'digital_twin')
-            )
-            self.logger.info("Flask-SocketIO initialized.")
+            if RealtimeWebSocketManager:
+                self.socketio_manager = RealtimeWebSocketManager(redis_url=self.app.config['REDIS_URL'])
+                self.socketio_manager.initialize_socketio(self.app)
+                self.logger.info("RealtimeWebSocketManager initialized.")
+            else:
+                self.logger.error("RealtimeWebSocketManager module not loaded. WebSockets disabled.")
         except Exception as e:
-            self.logger.error(f"Failed to initialize Flask-SocketIO", error=str(e), exc_info=True)
+            self.logger.error(f"Failed to initialize RealtimeWebSocketManager", error=str(e), exc_info=True)
+
 
     def _initialize_modules(self):
         """Initialize AI and analytics modules"""
@@ -1110,29 +1066,7 @@ class DigitalTwinApp:
             return None
 
     # ==================== WEBSOCKET EVENTS ====================
-    def _setup_websocket_events(self):
-        """Setup WebSocket events using a Namespace"""
-        if not self.socketio:
-            self.logger.warning("SocketIO not initialized, skipping WebSocket event setup.")
-            return
-
-        self.socketio.on_namespace(DigitalTwinNamespace('/', self))
-        self.logger.info("WebSocket Namespace registered.")
-
-    def _join_room_internal(self, client_id, room_name):
-        join_room(room_name, sid=client_id)
-        self.rooms[room_name].add(client_id)
-        if client_id in self.connected_clients:
-            self.connected_clients[client_id]['subscriptions'].add(room_name)
-
-    def _leave_room_internal(self, client_id, room_name):
-        leave_room(room_name, sid=client_id)
-        if room_name in self.rooms:
-            self.rooms[room_name].discard(client_id)
-            if not self.rooms[room_name]:
-                del self.rooms[room_name]
-        if client_id in self.connected_clients and 'subscriptions' in self.connected_clients[client_id]:
-            self.connected_clients[client_id]['subscriptions'].discard(room_name)
+    # --- All WebSocket event logic removed, now handled by RealtimeWebSocketManager ---
 
     # ==================== BACKGROUND TASKS ====================
     def _start_background_tasks(self):
@@ -1175,8 +1109,14 @@ class DigitalTwinApp:
                             dashboard_payload = current_app_instance._create_dashboard_payload(latest_df)
                             current_app_instance.cache.set('dashboard_combined_data', dashboard_payload, ttl=30)
                             current_app_instance.cache.set('latest_devices:500', latest_df.to_dict('records'), ttl=60)
-                            if current_app_instance.socketio:
-                                current_app_instance.socketio.emit('dashboard_update', {'data': dashboard_payload}, namespace='/', room='dashboard_updates')
+                            
+                            # --- Use WebSocket Manager to broadcast ---
+                            if current_app_instance.socketio_manager:
+                                current_app_instance.socketio_manager.broadcast_to_room(
+                                    'dashboard_updates',
+                                    'dashboard_update',
+                                    {'data': dashboard_payload}
+                                )
                             last_cache_update = current_time
                         else:
                             logger.debug("Skipping cache update/broadcast (too soon).")
@@ -1187,12 +1127,13 @@ class DigitalTwinApp:
                     logger.error(f"Error in data update task", error=str(e), exc_info=True)
                     eventlet.sleep(10)
 
-        if self.socketio and get_optional_env('ENABLE_DATA_GENERATOR', 'False').lower() == 'true':
+        # --- Check for socketio_manager.socketio ---
+        if self.socketio_manager and self.socketio_manager.socketio and get_optional_env('ENABLE_DATA_GENERATOR', 'False').lower() == 'true':
             self.app.extensions["digital_twin_instance"] = self
-            self.socketio.start_background_task(data_update_task)
+            self.socketio_manager.socketio.start_background_task(data_update_task)
             self.logger.info("Data generator background task started.")
-        elif not self.socketio:
-            logger.warning("SocketIO not available, cannot start background data task.")
+        elif not self.socketio_manager or not self.socketio_manager.socketio:
+            logger.warning("SocketIO Manager not available, cannot start background data task.")
         else:
             logger.info("Data generator background task is disabled (ENABLE_DATA_GENERATOR not true).")
 
@@ -1252,7 +1193,8 @@ class DigitalTwinApp:
 
     def _check_and_send_alerts(self, devices_df: pd.DataFrame):
         """Check for alerts and broadcast via WebSocket"""
-        if not self.alert_manager or not self.socketio:
+        # --- Check for socketio_manager ---
+        if not self.alert_manager or not self.socketio_manager:
             return
         all_triggered_alerts = []
         try:
@@ -1273,18 +1215,29 @@ class DigitalTwinApp:
                 for alert in all_triggered_alerts:
                     if isinstance(alert.get('timestamp'), datetime):
                         alert['timestamp'] = alert['timestamp'].isoformat()
-                    self.socketio.emit('alert_update', {'data': alert}, namespace='/', room='alerts')
+                    
+                    # --- Use WebSocket Manager to broadcast ---
+                    self.socketio_manager.broadcast_to_room(
+                        'alerts',
+                        'alert_update',
+                        {'data': alert}
+                    )
 
         except Exception as e:
             logger.error(f"Error checking/sending alerts", error=str(e), exc_info=True)
 
     def _get_system_metrics(self) -> Dict:
+        # --- Get active connections from socketio_manager ---
+        active_connections = 0
+        if self.socketio_manager:
+            active_connections = len(self.socketio_manager.active_connections)
+
         metrics = {
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'cpu_percent': None,
             'memory_percent': None,
             'disk_percent': None,
-            'active_connections': len(self.connected_clients),
+            'active_connections': active_connections,
             'cache_available': self.cache.available if self.cache else False,
             'database_available': self.db_available,
             'celery_available': CELERY_AVAILABLE
@@ -1301,44 +1254,13 @@ class DigitalTwinApp:
         return metrics
 
     def _cleanup_inactive_clients_logic(self) -> int:
-        """Internal logic for cleaning up inactive WebSocket clients."""
-        now = datetime.now(timezone.utc)
-        timeout = timedelta(minutes=int(get_optional_env('CLIENT_TIMEOUT_MINUTES', 2)))
-        disconnected_count = 0
-        inactive_sids = []
-
-        for sid, client_info in list(self.connected_clients.items()):
-            last_ping = client_info.get('last_ping', client_info.get('connected_at'))
-            if isinstance(last_ping, str):
-                try:
-                    last_ping = datetime.fromisoformat(last_ping.replace('Z', '+00:00'))
-                except:
-                    last_ping = now - timedelta(days=1)
-
-            if now - last_ping > timeout:
-                inactive_sids.append(sid)
-
-        for sid in inactive_sids:
-            user_id = self.connected_clients.get(sid, {}).get('user_id', 'unknown')
-            logger.warning(f"Disconnecting inactive client", sid=sid, user_id=user_id)
-            if self.socketio:
-                try:
-                    self.socketio.disconnect(sid, namespace='/', silent=True)
-                except Exception as e:
-                    logger.error("Error during socketio disconnect", sid=sid, error=str(e))
-            if sid in self.connected_clients:
-                subs = self.connected_clients[sid].get('subscriptions', set())
-                for room in list(subs):
-                    self._leave_room_internal(sid, room)
-                try:
-                    del self.connected_clients[sid]
-                    disconnected_count += 1
-                except KeyError:
-                    pass
-
-        if disconnected_count > 0:
-            logger.info(f"Cleaned up inactive client(s).", count=disconnected_count)
-        return disconnected_count
+        """
+        Internal logic for cleaning up inactive WebSocket clients.
+        This is now delegated to the RealtimeWebSocketManager.
+        """
+        if self.socketio_manager:
+            return self.socketio_manager.cleanup_inactive_connections()
+        return 0
 
     # ==================== ERROR HANDLERS ====================
     def _setup_error_handlers(self):
@@ -1391,11 +1313,21 @@ class DigitalTwinApp:
         self.start_time = datetime.now()
         logger.info(f"Starting Digital Twin App v3.6", host=effective_host, port=effective_port, debug=debug_mode)
         logger.info(f"Component Status", db_ok=self.db_available, redis_ok=self.cache.available, celery_ok=CELERY_AVAILABLE)
-        if not self.socketio:
-            logger.critical("SocketIO failed to initialize. Cannot run.")
+        
+        # --- Check for socketio_manager.socketio ---
+        if not self.socketio_manager or not self.socketio_manager.socketio:
+            logger.critical("SocketIO Manager failed to initialize. Cannot run.")
             return
         try:
-            self.socketio.run(self.app, host=effective_host, port=effective_port, debug=debug_mode, use_reloader=debug_mode, log_output=debug_mode)
+            # --- Run using the manager's socketio instance ---
+            self.socketio_manager.socketio.run(
+                self.app, 
+                host=effective_host, 
+                port=effective_port, 
+                debug=debug_mode, 
+                use_reloader=debug_mode, 
+                log_output=debug_mode
+            )
         except KeyboardInterrupt:
             logger.info("Application interrupted. Shutting down...")
         except Exception as e:
@@ -1405,116 +1337,14 @@ class DigitalTwinApp:
 
     def _shutdown(self):
         logger.info("Initiating graceful shutdown...")
+        if self.socketio_manager:
+            self.socketio_manager.shutdown()
         logger.info("Shutdown complete.")
 
 
 # ==================== WEBSOCKET NAMESPACE ====================
-class DigitalTwinNamespace(Namespace):
-    """Namespace for core Digital Twin WebSocket events."""
-
-    def __init__(self, namespace, app_instance):
-        super().__init__(namespace)
-        self.app_instance = app_instance
-
-    def on_connect(self):
-        """Handle client connection and JWT authentication."""
-        token = request.args.get('token')
-        if not token:
-            auth_header = request.headers.get('Authorization')
-            if auth_header and auth_header.startswith('Bearer '):
-                token = auth_header.split(' ')[1]
-
-        if not token:
-            logger.warning("WS connect: No token provided", sid=request.sid)
-            emit('auth_failed', {'message': 'Authentication token required.'})
-            disconnect()
-            return False
-
-        try:
-            secret = current_app.config['JWT_SECRET_KEY']
-            payload = decode_token(token)
-            user_id = payload.get('sub')
-            user_role = payload.get('role', 'user')
-            if not user_id:
-                raise InvalidTokenError("Missing 'sub' claim")
-
-            session['user_id'] = user_id
-            session['role'] = user_role
-            self.app_instance.connected_clients[request.sid] = {
-                'user_id': user_id,
-                'role': user_role,
-                'connected_at': datetime.now(timezone.utc),
-                'last_ping': datetime.now(timezone.utc),
-                'subscriptions': set()
-            }
-            logger.info("WS Client connected & authenticated", sid=request.sid, user_id=user_id, role=user_role)
-            emit('connection_established', {'data': {'sid': request.sid, 'user_id': user_id}})
-
-            initial_data = self.app_instance.cache.get('dashboard_combined_data')
-            if initial_data:
-                emit('dashboard_update', {'data': initial_data})
-
-        except (ExpiredSignatureError, DecodeError, InvalidTokenError) as e:
-            logger.warning("WS connect: Invalid token", error=str(e), sid=request.sid)
-            emit('auth_failed', {'message': f'Invalid token: {str(e)}'})
-            disconnect()
-            return False
-        except Exception as e:
-            logger.error("WS connect: Unexpected error", error=str(e), exc_info=True, sid=request.sid)
-            emit('error', {'message': 'Connection error'})
-            disconnect()
-            return False
-
-    def on_disconnect(self):
-        """Handle client disconnection."""
-        client_info = self.app_instance.connected_clients.pop(request.sid, None)
-        if client_info:
-            user_id = client_info.get('user_id', 'unknown')
-            subs = client_info.get('subscriptions', set())
-            for room in list(subs):
-                self.app_instance._leave_room_internal(request.sid, room)
-            logger.info(f"WS Client disconnected", sid=request.sid, user_id=user_id, total_clients=len(self.app_instance.connected_clients))
-        else:
-            logger.info("WS Untracked client disconnected", sid=request.sid)
-
-    def on_ping_from_client(self):
-        """Handle ping from client."""
-        if request.sid in self.app_instance.connected_clients:
-            self.app_instance.connected_clients[request.sid]['last_ping'] = datetime.now(timezone.utc)
-            emit('pong_from_server', {'data': {'timestamp': datetime.now(timezone.utc).isoformat()}})
-        else:
-            logger.warning("Ping from unknown client", sid=request.sid)
-
-    @validate_socket_payload(SubscribeSchema())
-    def on_subscribe(self, data):
-        """Handle room subscription."""
-        room_name = data.get('room')
-        self.app_instance._join_room_internal(request.sid, room_name)
-        emit('subscribed', {'data': {'room': room_name}})
-        logger.info(f"WS Client subscribed", sid=request.sid, room=room_name, user_id=session.get('user_id'))
-
-    @validate_socket_payload(UnsubscribeSchema())
-    def on_unsubscribe(self, data):
-        """Handle room unsubscription."""
-        room_name = data.get('room')
-        self.app_instance._leave_room_internal(request.sid, room_name)
-        emit('unsubscribed', {'data': {'room': room_name}})
-        logger.info(f"WS Client unsubscribed", sid=request.sid, room=room_name, user_id=session.get('user_id'))
-
-    @validate_socket_payload(StreamSubscribeSchema())
-    def on_subscribe_stream(self, data):
-        """Handle stream subscription."""
-        stream_id = data.get('stream_id')
-        emit('stream_subscribed', {'data': {'stream_id': stream_id}})
-        logger.info(f"WS Client subscribed to stream", sid=request.sid, stream=stream_id, user_id=session.get('user_id'))
-
-    def on_error_default(self, e):
-        """Default error handler for the namespace."""
-        logger.error('WebSocket Namespace Error', error=str(e), sid=request.sid, exc_info=True)
-        try:
-            emit('error', {'message': 'An internal server error occurred.'})
-        except Exception as emit_err:
-            logger.error("Failed to emit error message to client", client_sid=request.sid, emit_error=str(emit_err))
+# --- DigitalTwinNamespace class removed ---
+# --- All WebSocket logic is now in RealtimeWebSocketManager ---
 
 
 # ==================== BLUEPRINT ROUTE DEFINITIONS ====================
@@ -1665,14 +1495,19 @@ def acknowledge_alert_api(alert_id):
             if alert:
                 updated_alert_data = alert.to_dict()
 
-        if app_instance.socketio:
-            app_instance.socketio.emit('alert_acknowledged', {
-                'data': {
-                    'alertId': alert_id,
-                    'acknowledgedBy': user_id,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
+        # --- Use WebSocket Manager to broadcast ---
+        if app_instance.socketio_manager:
+            app_instance.socketio_manager.broadcast_to_room(
+                'alerts',
+                'alert_acknowledged',
+                {
+                    'data': {
+                        'alertId': alert_id,
+                        'acknowledgedBy': user_id,
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    }
                 }
-            }, namespace='/', room='alerts')
+            )
 
         app_instance.cache.clear_pattern("alerts:*")
         return create_standard_response(data={"message": "Alert acknowledged", "alert": updated_alert_data})
@@ -1777,11 +1612,17 @@ def get_admin_summary():
             user_count = session.query(User).count()
             device_count = session.query(DeviceData.device_id).distinct().count()
         app_instance = current_app.extensions["digital_twin_instance"]
+        
+        # --- Get connected clients from manager ---
+        connected_clients = 0
+        if app_instance.socketio_manager:
+            connected_clients = len(app_instance.socketio_manager.active_connections)
+            
         return create_standard_response(data={
             "message": "Welcome, Admin!",
             "total_users": user_count,
             "total_devices": device_count,
-            "connected_clients": len(app_instance.connected_clients)
+            "connected_clients": connected_clients
         })
     except Exception as e:
         logger.error("Error fetching admin summary", error=str(e), exc_info=True)
@@ -1832,10 +1673,15 @@ def cleanup_inactive_clients_task(self):
     if not app_instance:
         logger.error("Could not get DigitalTwinApp instance in Celery task")
         return {'status': 'FAILURE', 'error': 'App instance missing'}
+    
+    if not app_instance.socketio_manager:
+        logger.error("SocketIO Manager not found in Celery task")
+        return {'status': 'FAILURE', 'error': 'SocketIO Manager missing'}
 
     logger.info("Running scheduled cleanup of inactive clients...")
     try:
-        cleaned_count = app_instance._cleanup_inactive_clients_logic()
+        # --- Call manager's cleanup method ---
+        cleaned_count = app_instance.socketio_manager.cleanup_inactive_connections()
         logger.info("Inactive client cleanup task finished", cleaned_count=cleaned_count)
         return {'status': 'SUCCESS', 'cleaned_count': cleaned_count}
     except Exception as e:
