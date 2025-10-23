@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Iterator, Union
 import math
 import warnings
 # --- NEW: Import dotenv ---
@@ -39,6 +39,9 @@ except ImportError:
     # Define a dummy class if import fails to avoid NameErrors
     class mqtt:
         Client = object
+        MQTT_ERR_SUCCESS = 0  # Add dummy constant
+        CallbackAPIVersion = object  # Add dummy class
+        VERSION1 = 1 # Add dummy constant
 
 # --- Merged Feature (Config Import from File 2) ---
 # Add project root to path
@@ -73,11 +76,22 @@ class UnifiedDataGenerator:
 
     # --- UPDATED __init__ with MQTT support AND .env loading ---
     def __init__(self,
-                 db_path: str = None,
+                 db_path: Optional[str] = None,
                  seed: int = 42,
                  mqtt_broker: Optional[str] = None,
-                 mqtt_port: Optional[int] = None): # Allow None for port
+                 mqtt_port: Optional[int] = None):
+        """
+        Initialize the UnifiedDataGenerator.
 
+        Args:
+            db_path (Optional[str]): Path to the SQLite database.
+                If None, uses path from app_config.
+            seed (int): Random seed for reproducibility.
+            mqtt_broker (Optional[str]): MQTT broker host address.
+                Overrides environment variables if provided.
+            mqtt_port (Optional[int]): MQTT broker port.
+                Overrides environment variables if provided.
+        """
         self.db_path = db_path or config.database.primary_path
         self.seed = seed
         self.logger = self._setup_logging()
@@ -131,9 +145,9 @@ class UnifiedDataGenerator:
         self.maintenance_probability = 0.02
 
         # --- State variables for simulation ---
-        self.devices = []
-        self.device_drifts = {}
-        self.sim_cumulative_energy = 0
+        self.devices: List[Dict] = []
+        self.device_drifts: Dict[str, float] = {}
+        self.sim_cumulative_energy: float = 0
 
         # --- MQTT Setup (Reading from Env Vars) ---
         # Prioritize arguments, then env vars, then defaults
@@ -162,8 +176,13 @@ class UnifiedDataGenerator:
             self.logger.info("Disconnecting from MQTT broker.")
             self._disconnect_mqtt()
 
-    def _setup_logging(self):
-        """Setup logging for data generator."""
+    def _setup_logging(self) -> logging.Logger:
+        """
+        Setup logging for the data generator.
+
+        Returns:
+            logging.Logger: Configured logger instance.
+        """
         logger = logging.getLogger('UnifiedDataGenerator')
         logger.setLevel(logging.INFO)
 
@@ -187,19 +206,43 @@ class UnifiedDataGenerator:
 
     # --- New MQTT Methods ---
 
-    def _on_mqtt_connect(self, client, userdata, flags, rc):
+    def _on_mqtt_connect(self, client: mqtt.Client, userdata: Any, flags: Dict, rc: int):
+        """
+        Callback for when the MQTT client connects.
+
+        Args:
+            client (mqtt.Client): The client instance.
+            userdata (Any): User data as set in Client().
+            flags (Dict): Response flags from the broker.
+            rc (int): Connection result code.
+        """
         if rc == 0:
             self.logger.info(f"Successfully connected to MQTT broker.")
             self.mqtt_connected = True
         else:
             self.logger.error(f"Failed to connect to MQTT broker, return code {rc}")
+            self.mqtt_connected = False # Ensure state is false on failure
 
-    def _on_mqtt_disconnect(self, client, userdata, rc):
-        self.logger.info("Disconnected from MQTT broker.")
+    def _on_mqtt_disconnect(self, client: mqtt.Client, userdata: Any, rc: int):
+        """
+        Callback for when the MQTT client disconnects.
+
+        Args:
+            client (mqtt.Client): The client instance.
+            userdata (Any): User data as set in Client().
+            rc (int): Disconnection result code.
+        """
+        self.logger.info(f"Disconnected from MQTT broker with code {rc}.")
         self.mqtt_connected = False
 
     def _setup_mqtt(self, broker: str, port: int):
-        """Initialize and connect the MQTT client."""
+        """
+        Initialize and connect the MQTT client.
+
+        Args:
+            broker (str): MQTT broker host address.
+            port (int): MQTT broker port.
+        """
         if not PAHO_MQTT_AVAILABLE:
             return
 
@@ -234,7 +277,13 @@ class UnifiedDataGenerator:
                 self.mqtt_client = None
 
     def _publish_mqtt(self, topic: str, payload: Dict):
-        """Publish a data payload to an MQTT topic."""
+        """
+        Publish a data payload to an MQTT topic.
+
+        Args:
+            topic (str): The MQTT topic to publish to.
+            payload (Dict): The data payload (must be JSON serializable).
+        """
         if self.mqtt_client and self.mqtt_connected:
             try:
                 # Convert datetime to ISO format string for JSON serialization
@@ -258,14 +307,21 @@ class UnifiedDataGenerator:
              self.logger.debug(f"Skipping MQTT publish: Client not connected.")
         # else: No client configured
 
-    # --- Batch Generation Methods (Original Logic - No changes needed here) ---
-    # ... (generate_device_data, _generate_device_metadata, _generate_device_time_series) ...
+    # --- Batch Generation Methods ---
     def generate_device_data(self,
                              device_count: int = 20,
                              days_of_data: int = 30,
                              interval_minutes: int = 5) -> pd.DataFrame:
         """
         Generate comprehensive historical device sensor data.
+
+        Args:
+            device_count (int): Number of devices to simulate.
+            days_of_data (int): How many past days of data to generate.
+            interval_minutes (int): Time interval between data points.
+
+        Returns:
+            pd.DataFrame: A DataFrame containing all generated device data.
         """
         try:
             self.logger.info(f"Generating historical device data for {device_count} devices over {days_of_data} days")
@@ -299,7 +355,17 @@ class UnifiedDataGenerator:
             raise
 
     def _generate_device_metadata(self, count: int, start_time: datetime) -> List[Dict]:
-        """Generate metadata for devices."""
+        """
+        Generate metadata for a specified number of devices.
+
+        Args:
+            count (int): The number of devices to generate.
+            start_time (datetime): The simulation start time, used as a baseline
+                for installation/maintenance dates.
+
+        Returns:
+            List[Dict]: A list of device metadata dictionaries.
+        """
         devices = []
         for i in range(count):
             device_type = np.random.choice(list(self.device_types.keys()))
@@ -313,19 +379,28 @@ class UnifiedDataGenerator:
                 'location_x': location['x'],
                 'location_y': location['y'],
                 'zone': location['zone'],
-                'installation_date': (start_time + timedelta(days=random.randint(0, 30))).isoformat(), # Store as ISO string
+                'installation_date': (start_time - timedelta(days=random.randint(30, 365))).isoformat(), # Store as ISO string
                 'manufacturer': random.choice(['Siemens', 'ABB', 'Schneider', 'Rockwell', 'Honeywell']),
                 'model': f"Model-{random.randint(1000, 9999)}",
                 'firmware_version': f"{random.randint(1, 5)}.{random.randint(0, 9)}.{random.randint(0, 9)}",
                 'status': 'active',
-                'last_maintenance': (start_time + timedelta(days=random.randint(0, 60))).isoformat(), # Store as ISO string
-                'config': self.device_types[device_type] # Config might contain non-serializable, handle if needed later
+                'last_maintenance': (start_time - timedelta(days=random.randint(0, 60))).isoformat(), # Store as ISO string
+                'config': self.device_types[device_type] # Store config for reference
             }
             devices.append(device)
         return devices
 
     def _generate_device_time_series(self, device: Dict, time_points: pd.DatetimeIndex) -> List[Dict]:
-        """Generate time series data for a single device for batch processing."""
+        """
+        Generate time series data for a single device for batch processing.
+
+        Args:
+            device (Dict): The device metadata dictionary.
+            time_points (pd.DatetimeIndex): The range of timestamps to generate data for.
+
+        Returns:
+            List[Dict]: A list of data records for the device.
+        """
         device_data = []
         for i, timestamp in enumerate(time_points):
             # Use the new single-reading generator
@@ -334,10 +409,19 @@ class UnifiedDataGenerator:
         return device_data
 
 
-    # --- Refactored Single-Reading Generators (No changes needed) ---
-    # ... (_generate_single_reading, _generate_single_system_metric, _generate_single_energy_metric) ...
+    # --- Refactored Single-Reading Generators ---
     def _generate_single_reading(self, device: Dict, timestamp: pd.Timestamp, step_index: int) -> Dict:
-        """Generates a single, stateful data reading for a device at a given timestamp."""
+        """
+        Generates a single, stateful data reading for a device.
+
+        Args:
+            device (Dict): The device metadata dictionary.
+            timestamp (pd.Timestamp): The timestamp for this reading.
+            step_index (int): The index of this step in the simulation (used for drift).
+
+        Returns:
+            Dict: A dictionary representing the sensor reading.
+        """
         config = device['config']
         device_id = device['device_id']
 
@@ -424,7 +508,15 @@ class UnifiedDataGenerator:
         return record
 
     def _generate_single_system_metric(self, timestamp: pd.Timestamp) -> Dict:
-        """Generates a single system metric record for a given timestamp."""
+        """
+        Generates a single system metric record for a given timestamp.
+
+        Args:
+            timestamp (pd.Timestamp): The timestamp for this metric.
+
+        Returns:
+            Dict: A dictionary of system performance metrics.
+        """
         hour = timestamp.hour
         is_weekend = timestamp.weekday() >= 5
 
@@ -455,7 +547,15 @@ class UnifiedDataGenerator:
         return record
 
     def _generate_single_energy_metric(self, timestamp: pd.Timestamp) -> Dict:
-        """Generates a single energy metric record, updating cumulative state."""
+        """
+        Generates a single energy metric record, updating cumulative state.
+
+        Args:
+            timestamp (pd.Timestamp): The timestamp for this metric.
+
+        Returns:
+            Dict: A dictionary of energy metrics.
+        """
         hour = timestamp.hour
         is_weekend = timestamp.weekday() >= 5
 
@@ -495,10 +595,18 @@ class UnifiedDataGenerator:
         return record
 
 
-    # --- Helper Methods (No changes needed) ---
-    # ... (_calculate_base_value, _get_unit_for_device_type, _calculate_heat_index) ...
+    # --- Helper Methods ---
     def _calculate_base_value(self, timestamp: pd.Timestamp, config: Dict) -> float:
-        """Calculate base value with seasonal and daily patterns."""
+        """
+        Calculate base value with seasonal and daily patterns.
+
+        Args:
+            timestamp (pd.Timestamp): The timestamp for the calculation.
+            config (Dict): The device type's configuration dictionary.
+
+        Returns:
+            float: The calculated base value.
+        """
         normal_min, normal_max = config['normal_range']
         base_value = (normal_min + normal_max) / 2
 
@@ -517,7 +625,15 @@ class UnifiedDataGenerator:
         return base_value + seasonal_adjustment + daily_adjustment * weekly_factor
 
     def _get_unit_for_device_type(self, device_type: str) -> str:
-        """Get measurement unit for device type."""
+        """
+        Get measurement unit for a given device type.
+
+        Args:
+            device_type (str): The device type string (e.g., 'temperature_sensor').
+
+        Returns:
+            str: The corresponding unit (e.g., '°C').
+        """
         unit_mapping = {
             'temperature_sensor': '°C', 'pressure_sensor': 'hPa',
             'vibration_sensor': 'mm/s', 'humidity_sensor': '%RH',
@@ -526,7 +642,16 @@ class UnifiedDataGenerator:
         return unit_mapping.get(device_type, 'units')
 
     def _calculate_heat_index(self, temperature: float, humidity: float) -> float:
-        """Calculate heat index from temperature and humidity."""
+        """
+        Calculate heat index from temperature (in Celsius) and humidity (%).
+
+        Args:
+            temperature (float): Temperature in Celsius.
+            humidity (float): Relative humidity (%).
+
+        Returns:
+            float: Calculated heat index in Celsius.
+        """
         # Ensure temperature is in Fahrenheit for the formula
         temp_f = temperature * 9/5 + 32
 
@@ -561,10 +686,17 @@ class UnifiedDataGenerator:
         return round(hi_c, 2)
 
 
-    # --- DataFrame Augmentation (No changes needed) ---
-    # ... (_add_calculated_fields, _add_maintenance_events) ...
+    # --- DataFrame Augmentation ---
     def _add_calculated_fields(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add calculated fields to the dataset."""
+        """
+        Add calculated fields (health, efficiency, operating hours) to the dataset.
+
+        Args:
+            df (pd.DataFrame): The input DataFrame.
+
+        Returns:
+            pd.DataFrame: The DataFrame with added columns.
+        """
         if df.empty:
             return df
         df_copy = df.copy()
@@ -611,7 +743,7 @@ class UnifiedDataGenerator:
         df_copy = df_copy.sort_values(['device_id', 'timestamp'])
         if 'timestamp' in df_copy.columns and len(df_copy) > 1:
             # Calculate time difference in hours between consecutive readings per device
-            time_diff_hours = df_copy.groupby('device_id')['timestamp'].diff().dt.total_seconds() / 3600.0
+            # time_diff_hours = df_copy.groupby('device_id')['timestamp'].diff().dt.total_seconds() / 3600.0
             # Cumulative sum of hours for each device
             df_copy['operating_hours'] = df_copy.groupby('device_id')['timestamp'].transform(
                  lambda x: (x - x.min()).dt.total_seconds() / 3600.0
@@ -636,7 +768,15 @@ class UnifiedDataGenerator:
         return df_copy
 
     def _add_maintenance_events(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add maintenance events to the dataset."""
+        """
+        Add simulated maintenance events to the dataset.
+
+        Args:
+            df (pd.DataFrame): The input DataFrame.
+
+        Returns:
+            pd.DataFrame: The DataFrame with 'maintenance' status events added.
+        """
         if df.empty or self.maintenance_probability <= 0:
             return df
         df = df.copy()
@@ -662,10 +802,17 @@ class UnifiedDataGenerator:
         return df
 
 
-    # --- Data Generation Orchestration (No changes needed) ---
-    # ... (generate_system_metrics, generate_energy_data, save_to_database, ...) ...
+    # --- Data Generation Orchestration ---
     def generate_system_metrics(self, days_of_data: int = 30) -> pd.DataFrame:
-        """Generate historical system-level performance metrics."""
+        """
+        Generate historical system-level performance metrics.
+
+        Args:
+            days_of_data (int): Number of past days of data to generate.
+
+        Returns:
+            pd.DataFrame: A DataFrame containing system metrics.
+        """
         try:
             self.logger.info(f"Generating historical system metrics for {days_of_data} days")
             start_time = datetime.now() - timedelta(days=days_of_data)
@@ -679,7 +826,15 @@ class UnifiedDataGenerator:
             raise
 
     def generate_energy_data(self, days_of_data: int = 30) -> pd.DataFrame:
-        """Generate historical energy consumption and efficiency data."""
+        """
+        Generate historical energy consumption and efficiency data.
+
+        Args:
+            days_of_data (int): Number of past days of data to generate.
+
+        Returns:
+            pd.DataFrame: A DataFrame containing energy data.
+        """
         try:
             self.logger.info(f"Generating historical energy data for {days_of_data} days")
             start_time = datetime.now() - timedelta(days=days_of_data)
@@ -697,7 +852,13 @@ class UnifiedDataGenerator:
             raise
 
     def save_to_database(self, dataframes: Dict[str, pd.DataFrame]):
-        """Save generated dataframes to the configured SQLite database."""
+        """
+        Save generated dataframes to the configured SQLite database.
+
+        Args:
+            dataframes (Dict[str, pd.DataFrame]): A dictionary where keys are
+                table names and values are the DataFrames to save.
+        """
         try:
             db_file = Path(self.db_path)
             db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -729,12 +890,51 @@ class UnifiedDataGenerator:
             self.logger.error(f"General database save error: {e}", exc_info=True)
             raise
 
+    # --- NEW METHOD (was missing) ---
+    def generate_complete_dataset(self, device_count: int = 20, days_of_data: int = 30) -> Dict[str, pd.DataFrame]:
+        """
+        Generates a complete set of historical data (devices, system, energy)
+        and saves them to the database.
 
-    # --- Simulation Methods (No changes needed) ---
-    # ... (setup_simulation, run_device_simulation, run_system_simulation, run_energy_simulation) ...
+        Args:
+            device_count (int): Number of devices to simulate.
+            days_of_data (int): Number of past days of data to generate.
+
+        Returns:
+            Dict[str, pd.DataFrame]: A dictionary containing the generated DataFrames.
+        """
+        self.logger.info("Generating complete historical dataset...")
+        try:
+            # Generate all datasets
+            device_df = self.generate_device_data(device_count, days_of_data)
+            system_df = self.generate_system_metrics(days_of_data)
+            energy_df = self.generate_energy_data(days_of_data)
+
+            datasets = {
+                "device_data": device_df,
+                "system_metrics": system_df,
+                "energy_data": energy_df
+            }
+
+            # Save to database
+            self.save_to_database(datasets)
+
+            return datasets
+        except Exception as e:
+            self.logger.error(f"Failed to generate complete dataset: {e}", exc_info=True)
+            return {}
+    # --- END NEW METHOD ---
+
+
+    # --- Simulation Methods ---
     def setup_simulation(self, device_count: int, start_time: Optional[datetime] = None):
         """
         Initialize devices and their states for a new simulation.
+
+        Args:
+            device_count (int): The number of devices to set up.
+            start_time (Optional[datetime]): The simulation start time.
+                Defaults to `datetime.now()`.
         """
         self.logger.info(f"Setting up simulation for {device_count} devices...")
         if start_time is None:
@@ -760,7 +960,7 @@ class UnifiedDataGenerator:
                               duration_days: float,
                               interval_minutes: int,
                               simulation_speed: float = 1.0,
-                              publish_mqtt: bool = False):
+                              publish_mqtt: bool = False) -> Iterator[List[Dict]]:
         """
         Run a real-time device simulation, yielding data or publishing to MQTT.
 
@@ -846,8 +1046,18 @@ class UnifiedDataGenerator:
     def run_system_simulation(self,
                               duration_days: float,
                               simulation_speed: float = 1.0,
-                              publish_mqtt: bool = False):
-        """Run a real-time system metrics simulation (hourly interval)."""
+                              publish_mqtt: bool = False) -> Iterator[Dict]:
+        """
+        Run a real-time system metrics simulation (hourly interval).
+
+        Args:
+            duration_days: How long the simulation should run in *simulated time*.
+            simulation_speed: Multiplier for real-time.
+            publish_mqtt: If True, publish to MQTT. If False, yield data.
+
+        Yields:
+            Dict: A system metric record if publish_mqtt is False.
+        """
         interval_minutes = 60
         sim_start_time = datetime.now()
         sim_end_time = sim_start_time + timedelta(days=duration_days)
@@ -899,8 +1109,18 @@ class UnifiedDataGenerator:
     def run_energy_simulation(self,
                               duration_days: float,
                               simulation_speed: float = 1.0,
-                              publish_mqtt: bool = False):
-        """Run a real-time energy metrics simulation (15-min interval)."""
+                              publish_mqtt: bool = False) -> Iterator[Dict]:
+        """
+        Run a real-time energy metrics simulation (15-min interval).
+
+        Args:
+            duration_days: How long the simulation should run in *simulated time*.
+            simulation_speed: Multiplier for real-time.
+            publish_mqtt: If True, publish to MQTT. If False, yield data.
+
+        Yields:
+            Dict: An energy metric record if publish_mqtt is False.
+        """
         interval_minutes = 15
         sim_start_time = datetime.now()
         sim_end_time = sim_start_time + timedelta(days=duration_days)
@@ -953,10 +1173,18 @@ class UnifiedDataGenerator:
             self.logger.info("Energy simulation finished.")
 
 
-    # --- Summary Method (No changes needed) ---
-    # ... (generate_dataset_summary) ...
+    # --- Summary Method ---
     def generate_dataset_summary(self, datasets: Dict[str, pd.DataFrame]) -> Dict:
-        """Generate summary statistics for the datasets."""
+        """
+        Generate summary statistics for the datasets.
+
+        Args:
+            datasets (Dict[str, pd.DataFrame]): A dictionary of DataFrames
+                (e.g., {"device_data": df1, "system_metrics": df2}).
+
+        Returns:
+            Dict: A nested dictionary containing summary statistics.
+        """
         summary = {
             'generation_timestamp': datetime.now().isoformat(),
             'seed': self.seed,
