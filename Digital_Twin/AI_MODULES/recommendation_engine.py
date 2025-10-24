@@ -21,12 +21,30 @@ import networkx as nx
 class RecommendationEngine:
     """
     Advanced recommendation engine for Digital Twin systems.
+
     Provides maintenance recommendations, optimization suggestions,
     operational improvements, and predictive actions based on
-    system health, patterns, and historical data.
+    system health, analytical patterns, historical data, and contextual rules.
+
+    Attributes:
+        config_path (Path): Path to the JSON configuration file.
+        logger (logging.Logger): Logger instance for the engine.
+        config (Dict): Loaded configuration from the JSON file.
+        recommendation_history (deque): A history of generated recommendations.
+        knowledge_base (Dict): Rule-based logic loaded from config.
+        models (Dict): In-memory storage for ML models (not used in this version).
+        scalers (Dict): In-memory storage for data scalers (not used in this version).
+        scoring_weights (Dict): Weights for calculating composite scores.
+        current_context (Dict): Current operational context (e.g., system load).
     """
     
     def __init__(self, config_path: str = "CONFIG/recommendation_config.json"):
+        """
+        Initializes the RecommendationEngine.
+
+        Args:
+            config_path (str): Path to the configuration file.
+        """
         self.config_path = Path(config_path)
         self.logger = self._setup_logging()
         
@@ -34,7 +52,7 @@ class RecommendationEngine:
         self.config = self._load_config()
         
         # Recommendation storage
-        self.recommendation_history = deque(maxlen=1000)
+        self.recommendation_history = deque(maxlen=self.config.get("history_maxlen", 1000))
         self.recommendation_templates = {}
         self.action_effectiveness = defaultdict(list)
         
@@ -57,8 +75,13 @@ class RecommendationEngine:
         # Context for recommendations
         self.current_context = {}
         
-    def _setup_logging(self):
-        """Setup logging for recommendation engine."""
+    def _setup_logging(self) -> logging.Logger:
+        """
+        Setup logging for recommendation engine.
+        
+        Returns:
+            logging.Logger: A configured logger instance.
+        """
         logger = logging.getLogger('RecommendationEngine')
         logger.setLevel(logging.INFO)
         
@@ -74,17 +97,25 @@ class RecommendationEngine:
         
         return logger
     
-    def _load_config(self) -> Dict:
-        """Load recommendation engine configuration."""
+    def _load_config(self) -> Dict[str, Any]:
+        """
+        Load recommendation engine configuration from the specified JSON file.
+        If the file doesn't exist, create a default configuration.
+        
+        Returns:
+            Dict[str, Any]: The loaded or default configuration dictionary.
+        """
         try:
             if self.config_path.exists():
                 with open(self.config_path, 'r') as f:
                     config = json.load(f)
-                self.logger.info("Recommendation configuration loaded")
+                self.logger.info(f"Recommendation configuration loaded from {self.config_path}")
                 return config
             else:
+                self.logger.warning(f"Configuration file not found at {self.config_path}. Creating default config.")
                 # Default configuration
                 default_config = {
+                    "history_maxlen": 1000,
                     "recommendation_types": {
                         "maintenance": {
                             "priority_weight": 0.8,
@@ -125,7 +156,6 @@ class RecommendationEngine:
                         "max_recommendations": 20,
                         "duplicate_threshold_hours": 24
                     },
-                    # --- NEW: Enhanced Dynamic Knowledge Base with AND/OR logic ---
                     "knowledge_base": {
                         "maintenance_rules": {
                             "critical_maintenance": {
@@ -200,7 +230,6 @@ class RecommendationEngine:
                                 "urgency": 0.7,
                                 "category": "preventive"
                             },
-                            # --- NEW: Example of a complex rule with OR ---
                             "critical_system_state": {
                                 "conditions": {
                                     "OR": [
@@ -232,7 +261,6 @@ class RecommendationEngine:
                             ]
                         }
                     }
-                    # --- End of Knowledge Base ---
                 }
                 
                 # Save default configuration
@@ -240,20 +268,29 @@ class RecommendationEngine:
                 with open(self.config_path, 'w') as f:
                     json.dump(default_config, f, indent=2)
                 
-                self.logger.info("Default recommendation configuration created")
+                self.logger.info(f"Default recommendation configuration created at {self.config_path}")
                 return default_config
                 
         except Exception as e:
-            self.logger.error(f"Failed to load configuration: {e}")
+            self.logger.error(f"Failed to load configuration: {e}", exc_info=True)
             return {}
 
-    # --- REMOVED: _initialize_knowledge_base method is no longer needed ---
-
-    # --- NEW: Helper function to flatten dictionaries for the rule engine ---
-    def _flatten_dict(self, d: Union[Dict, List], parent_key: str = '', sep: str = '.') -> Dict:
+    def _flatten_dict(self, d: Union[Dict, List], parent_key: str = '', sep: str = '.') -> Dict[str, Any]:
         """
         Flattens a nested dictionary or list into a single-level dictionary.
         List items are keyed by their index.
+        
+        Example:
+            _flatten_dict({'a': {'b': 1, 'c': [10, 20]}})
+            Returns: {'a.b': 1, 'a.c.0': 10, 'a.c.1': 20}
+
+        Args:
+            d (Union[Dict, List]): The dictionary or list to flatten.
+            parent_key (str): The prefix to prepend to keys.
+            sep (str): The separator to use between nested keys.
+
+        Returns:
+            Dict[str, Any]: A flattened dictionary.
         """
         items = {}
         if isinstance(d, dict):
@@ -273,88 +310,105 @@ class RecommendationEngine:
         return items
 
     def generate_recommendations(self, 
-                                 health_data: Dict,
-                                 pattern_analysis: Dict = None,
-                                 historical_data: pd.DataFrame = None,
-                                 context: Dict = None) -> Dict:
+                                 health_data: Dict[str, Any],
+                                 pattern_analysis: Optional[Dict[str, Any]] = None,
+                                 historical_data: Optional[pd.DataFrame] = None,
+                                 context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Generate comprehensive recommendations based on system state and analysis.
         
+        This is the main entry point for the engine. It orchestrates several
+        sub-generators (health-based, pattern-based, etc.) and then
+        scores, filters, and summarizes the results.
+        
         Args:
-            health_data: Health score and component analysis results
-            pattern_analysis: Pattern analysis results
-            historical_data: Historical system data
-            context: Additional context information
+            health_data (Dict[str, Any]): Health score and component analysis results
+                                          from the HealthScoreCalculator.
+            pattern_analysis (Optional[Dict[str, Any]]): Pattern analysis results
+                                          from the PatternAnalyzer. Defaults to None.
+            historical_data (Optional[pd.DataFrame]): Historical system data for
+                                          trend analysis. Defaults to None.
+            context (Optional[Dict[str, Any]]): Additional context information
+                                          (e.g., system load, location). Defaults to None.
             
         Returns:
-            Dictionary containing categorized recommendations
+            Dict[str, Any]: A dictionary containing categorized recommendations,
+                            a summary, and the context used.
         """
         try:
-            self.logger.info("Generating system recommendations")
+            self.logger.info("Generating system recommendations...")
             
             # Update context
             if context:
                 self.current_context.update(context)
             
-            recommendations = {
+            recommendations: Dict[str, Any] = {
                 'timestamp': datetime.now().isoformat(),
                 'maintenance_recommendations': [],
                 'optimization_recommendations': [],
                 'operational_recommendations': [],
                 'preventive_recommendations': [],
-                'emergency_recommendations': [],
+                'emergency_recommendations': [], # For critical, immediate actions
                 'summary': {},
                 'context': self.current_context.copy()
             }
             
+            all_generated_recs: List[Dict[str, Any]] = []
+
             # 1. Health-based recommendations
             if health_data:
-                health_recommendations = self._generate_health_based_recommendations(health_data)
-                self._categorize_recommendations(recommendations, health_recommendations)
+                all_generated_recs.extend(self._generate_health_based_recommendations(health_data))
             
             # 2. Pattern-based recommendations
             if pattern_analysis:
-                pattern_recommendations = self._generate_pattern_based_recommendations(pattern_analysis)
-                self._categorize_recommendations(recommendations, pattern_recommendations)
+                all_generated_recs.extend(self._generate_pattern_based_recommendations(pattern_analysis))
             
             # 3. Historical data recommendations
             if historical_data is not None and not historical_data.empty:
-                historical_recommendations = self._generate_historical_recommendations(historical_data)
-                self._categorize_recommendations(recommendations, historical_recommendations)
+                all_generated_recs.extend(self._generate_historical_recommendations(historical_data))
             
             # 4. Context-based recommendations
             if self.current_context:
-                context_recommendations = self._generate_context_recommendations(self.current_context)
-                self._categorize_recommendations(recommendations, context_recommendations)
+                all_generated_recs.extend(self._generate_context_recommendations(self.current_context))
             
-            # 5. Knowledge base recommendations (NOW DYNAMIC AND ENHANCED)
-            # This will now use the new rule engine and flattened data context
-            kb_recommendations = self._generate_knowledge_base_recommendations(
+            # 5. Knowledge base recommendations (Dynamic Rule Engine)
+            kb_recs = self._generate_knowledge_base_recommendations(
                 health_data, pattern_analysis, self.current_context
             )
-            self._categorize_recommendations(recommendations, kb_recommendations)
+            all_generated_recs.extend(kb_recs)
             
-            # 6. Calculate composite scores and prioritize
+            # 6. Categorize all recommendations
+            self._categorize_recommendations(recommendations, all_generated_recs)
+            
+            # 7. Calculate composite scores and prioritize
             self._calculate_composite_scores(recommendations)
             
-            # 7. Filter and limit recommendations
+            # 8. Filter and limit recommendations
             self._filter_recommendations(recommendations)
             
-            # 8. Generate summary
+            # 9. Generate summary
             recommendations['summary'] = self._generate_recommendations_summary(recommendations)
             
-            # 9. Store recommendations for learning
+            # 10. Store recommendations for learning
             self._store_recommendations(recommendations)
             
             self.logger.info(f"Generated {self._count_total_recommendations(recommendations)} recommendations")
             return recommendations
             
         except Exception as e:
-            self.logger.error(f"Recommendation generation error: {e}")
+            self.logger.error(f"Recommendation generation error: {e}", exc_info=True)
             return self._create_error_result(f"Recommendation generation failed: {e}")
     
-    def _generate_health_based_recommendations(self, health_data: Dict) -> List[Dict]:
-        """Generate recommendations based on health analysis."""
+    def _generate_health_based_recommendations(self, health_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Generate recommendations based on health analysis data.
+
+        Args:
+            health_data (Dict[str, Any]): The health score analysis dictionary.
+
+        Returns:
+            List[Dict[str, Any]]: A list of recommendation dictionaries.
+        """
         try:
             recommendations = []
             overall_score = health_data.get('overall_score', 1.0)
@@ -452,11 +506,19 @@ class RecommendationEngine:
             return recommendations
             
         except Exception as e:
-            self.logger.error(f"Health-based recommendation generation error: {e}")
+            self.logger.error(f"Health-based recommendation generation error: {e}", exc_info=True)
             return []
     
-    def _generate_pattern_based_recommendations(self, pattern_analysis: Dict) -> List[Dict]:
-        """Generate recommendations based on pattern analysis."""
+    def _generate_pattern_based_recommendations(self, pattern_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Generate recommendations based on pattern analysis results.
+
+        Args:
+            pattern_analysis (Dict[str, Any]): The results from the PatternAnalyzer.
+
+        Returns:
+            List[Dict[str, Any]]: A list of recommendation dictionaries.
+        """
         try:
             recommendations = []
             
@@ -551,11 +613,19 @@ class RecommendationEngine:
             return recommendations
             
         except Exception as e:
-            self.logger.error(f"Pattern-based recommendation generation error: {e}")
+            self.logger.error(f"Pattern-based recommendation generation error: {e}", exc_info=True)
             return []
     
-    def _generate_historical_recommendations(self, historical_data: pd.DataFrame) -> List[Dict]:
-        """Generate recommendations based on historical data analysis."""
+    def _generate_historical_recommendations(self, historical_data: pd.DataFrame) -> List[Dict[str, Any]]:
+        """
+        Generate recommendations based on historical data analysis.
+
+        Args:
+            historical_data (pd.DataFrame): DataFrame of historical data.
+
+        Returns:
+            List[Dict[str, Any]]: A list of recommendation dictionaries.
+        """
         try:
             recommendations = []
             
@@ -620,11 +690,19 @@ class RecommendationEngine:
             return recommendations
             
         except Exception as e:
-            self.logger.error(f"Historical recommendation generation error: {e}")
+            self.logger.error(f"Historical recommendation generation error: {e}", exc_info=True)
             return []
     
-    def _generate_context_recommendations(self, context: Dict) -> List[Dict]:
-        """Generate recommendations based on operational context."""
+    def _generate_context_recommendations(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Generate recommendations based on operational context.
+
+        Args:
+            context (Dict[str, Any]): The current operational context.
+
+        Returns:
+            List[Dict[str, Any]]: A list of recommendation dictionaries.
+        """
         try:
             recommendations = []
             
@@ -686,8 +764,8 @@ class RecommendationEngine:
                             'source': 'maintenance_schedule',
                             'priority_level': 'medium'
                         })
-                except ValueError:
-                    pass
+                except (ValueError, TypeError) as e:
+                    self.logger.warning(f"Could not parse last_maintenance date '{last_maintenance}': {e}")
             
             # Operating hours recommendations
             operating_hours = context.get('operating_hours', 0)
@@ -734,36 +812,49 @@ class RecommendationEngine:
             return recommendations
             
         except Exception as e:
-            self.logger.error(f"Context recommendation generation error: {e}")
+            self.logger.error(f"Context recommendation generation error: {e}", exc_info=True)
             return []
     
-    # --- ENHANCED: Dynamic Knowledge Base Rule Engine ---
-    
     def _generate_knowledge_base_recommendations(self, 
-                                               health_data: Dict, 
-                                               pattern_analysis: Dict, 
-                                               context: Dict) -> List[Dict]:
-        """Generate recommendations based on knowledge base rules loaded from config."""
+                                               health_data: Optional[Dict[str, Any]], 
+                                               pattern_analysis: Optional[Dict[str, Any]], 
+                                               context: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Generate recommendations based on knowledge base rules loaded from config.
+        Uses a flattened data context and a recursive rule evaluator.
+
+        Args:
+            health_data: The health score analysis dictionary.
+            pattern_analysis: The results from the PatternAnalyzer.
+            context: The current operational context.
+
+        Returns:
+            List[Dict[str, Any]]: A list of recommendation dictionaries.
+        """
         try:
             recommendations = []
             rules = self.knowledge_base.get('maintenance_rules', {})
             
-            # --- NEW: Create a comprehensive, flattened data context ---
+            # Create a comprehensive, flattened data context
             # This makes *all* data from all sources available to the rule engine
-            data_context = {}
+            data_context: Dict[str, Any] = {}
             if health_data:
                 data_context.update(self._flatten_dict(health_data))
             if pattern_analysis:
                 data_context.update(self._flatten_dict(pattern_analysis))
             if context:
-                # Context is already flat, so just update
+                # Context is assumed to be flat, so just update
                 data_context.update(context)
             
+            if not data_context:
+                self.logger.info("Knowledge base check skipped: no data context provided.")
+                return []
+                
             # Evaluate each rule from the knowledge base
             for rule_name, rule_config in rules.items():
                 conditions = rule_config.get('conditions', {})
                 
-                # --- NEW: Call the enhanced recursive rule evaluator ---
+                # Call the enhanced recursive rule evaluator
                 rule_triggered = self._evaluate_rule(conditions, data_context)
                 
                 if rule_triggered:
@@ -787,21 +878,29 @@ class RecommendationEngine:
             return recommendations
             
         except Exception as e:
-            self.logger.error(f"Knowledge base recommendation generation error: {e}")
+            self.logger.error(f"Knowledge base recommendation generation error: {e}", exc_info=True)
             return []
 
-    # --- NEW: Enhanced recursive rule evaluation (supports AND/OR) ---
-    def _evaluate_rule(self, conditions: Dict, data_context: Dict) -> bool:
+    def _evaluate_rule(self, conditions: Dict[str, Any], data_context: Dict[str, Any]) -> bool:
         """
         Recursively evaluate a set of conditions (AND/OR) against the data context.
+
+        Args:
+            conditions (Dict[str, Any]): The condition block (e.g., {'AND': [...]}).
+            data_context (Dict[str, Any]): The flattened data context.
+
+        Returns:
+            bool: True if the condition block evaluates to true, False otherwise.
         """
         try:
             if "AND" in conditions:
                 # All conditions in the list must be true
+                if not conditions["AND"]: return False # Empty AND is false
                 return all(self._evaluate_rule(cond, data_context) for cond in conditions["AND"])
             
             elif "OR" in conditions:
                 # Any condition in the list can be true
+                if not conditions["OR"]: return False # Empty OR is false
                 return any(self._evaluate_rule(cond, data_context) for cond in conditions["OR"])
             
             elif "key" in conditions:
@@ -814,14 +913,20 @@ class RecommendationEngine:
                 return False
                 
         except Exception as e:
-            self.logger.error(f"Error evaluating rule block '{conditions}': {e}")
+            self.logger.error(f"Error evaluating rule block '{conditions}': {e}", exc_info=True)
             return False
 
-    # --- NEW: Enhanced condition checker with robust type handling ---
-    def _check_condition(self, condition: Dict, data_context: Dict) -> bool:
+    def _check_condition(self, condition: Dict[str, Any], data_context: Dict[str, Any]) -> bool:
         """
         Check a single condition (e.g., {"key": "x", "op": ">", "value": 5}).
         Handles type conversion for numeric and string comparisons.
+
+        Args:
+            condition (Dict[str, Any]): The single condition dictionary.
+            data_context (Dict[str, Any]): The flattened data context.
+
+        Returns:
+            bool: True if the condition is met, False otherwise.
         """
         key = condition.get("key")
         op = condition.get("op")
@@ -853,9 +958,10 @@ class RecommendationEngine:
             if op == '>=':
                 return num_actual >= num_rule
             if op == '==':
-                return num_actual == num_rule
+                # Use np.isclose for float equality
+                return np.isclose(num_actual, num_rule)
             if op == '!=':
-                return num_actual != num_rule
+                return not np.isclose(num_actual, num_rule)
 
         except (ValueError, TypeError):
             # Fallback to string comparison for '==' and '!='
@@ -870,17 +976,22 @@ class RecommendationEngine:
             # Cannot perform <, > on non-numeric types
             self.logger.warning(
                 f"Cannot perform numeric op '{op}' on non-numeric values: "
-                f"'{key}' (Value: {actual_value}) vs Rule Value: {rule_value}"
+                f"'{key}' (Value: {actual_value}, Type: {type(actual_value)}) "
+                f"vs Rule Value: {rule_value} (Type: {type(rule_value)})"
             )
             return False
         
         self.logger.warning(f"Unknown operator in rule: {op}")
         return False
         
-    # --- End of Enhancement ---
+    def _categorize_recommendations(self, recommendations: Dict[str, Any], new_recommendations: List[Dict[str, Any]]):
+        """
+        Categorize new recommendations into the main recommendations dictionary.
 
-    def _categorize_recommendations(self, recommendations: Dict, new_recommendations: List[Dict]):
-        """Categorize recommendations into appropriate buckets."""
+        Args:
+            recommendations (Dict[str, Any]): The main dictionary to update.
+            new_recommendations (List[Dict[str, Any]]): The list of new recommendations.
+        """
         try:
             for rec in new_recommendations:
                 rec_type = rec.get('type', 'operational')
@@ -889,17 +1000,27 @@ class RecommendationEngine:
                 if category_key in recommendations:
                     recommendations[category_key].append(rec)
                 else:
+                    # Fallback to operational if type is unknown
                     recommendations['operational_recommendations'].append(rec)
                     
         except Exception as e:
-            self.logger.error(f"Recommendation categorization error: {e}")
+            self.logger.error(f"Recommendation categorization error: {e}", exc_info=True)
     
-    def _calculate_composite_scores(self, recommendations: Dict):
-        """Calculate composite scores for all recommendations."""
+    def _calculate_composite_scores(self, recommendations: Dict[str, Any]):
+        """
+        Calculate composite scores for all recommendations in place.
+
+        Args:
+            recommendations (Dict[str, Any]): The main recommendations dictionary.
+        """
         try:
-            all_categories = ['emergency_recommendations', 'maintenance_recommendations',
-                            'optimization_recommendations', 'operational_recommendations',
-                            'preventive_recommendations']
+            all_categories = [
+                'emergency_recommendations', 'maintenance_recommendations',
+                'optimization_recommendations', 'operational_recommendations',
+                'preventive_recommendations'
+            ]
+            
+            thresholds = self.config.get('thresholds', {})
             
             for category in all_categories:
                 for rec in recommendations.get(category, []):
@@ -908,9 +1029,9 @@ class RecommendationEngine:
                     impact = rec.get('impact', 0.5)
                     
                     # Estimate missing scores based on type and urgency
-                    feasibility = 0.8 if rec.get('type') in ['operational', 'optimization'] else 0.6
-                    cost_effectiveness = 0.7 if urgency > 0.7 else 0.5
-                    risk_reduction = urgency * 0.8  # Higher urgency usually means higher risk reduction
+                    feasibility = rec.get('feasibility', 0.8 if rec.get('type') in ['operational', 'optimization'] else 0.6)
+                    cost_effectiveness = rec.get('cost_effectiveness', 0.7 if urgency > 0.7 else 0.5)
+                    risk_reduction = rec.get('risk_reduction', urgency * 0.8)
                     
                     # Calculate composite score
                     composite_score = (
@@ -921,6 +1042,7 @@ class RecommendationEngine:
                         risk_reduction * self.scoring_weights.get('risk_reduction', 0.1)
                     )
                     
+                    # Update recommendation dictionary in-place
                     rec['composite_score'] = round(composite_score, 3)
                     rec['feasibility'] = feasibility
                     rec['cost_effectiveness'] = cost_effectiveness
@@ -928,7 +1050,6 @@ class RecommendationEngine:
                     
                     # Set priority level if not already set
                     if 'priority_level' not in rec:
-                        thresholds = self.config.get('thresholds', {})
                         if composite_score >= thresholds.get('critical_score', 0.8):
                             rec['priority_level'] = 'critical'
                         elif composite_score >= thresholds.get('high_priority', 0.7):
@@ -957,18 +1078,25 @@ class RecommendationEngine:
                 )
                 
         except Exception as e:
-            self.logger.error(f"Composite score calculation error: {e}")
+            self.logger.error(f"Composite score calculation error: {e}", exc_info=True)
     
-    def _filter_recommendations(self, recommendations: Dict):
-        """Filter and limit recommendations based on configuration."""
+    def _filter_recommendations(self, recommendations: Dict[str, Any]):
+        """
+        Filter and limit recommendations based on configuration.
+
+        Args:
+            recommendations (Dict[str, Any]): The main recommendations dictionary.
+        """
         try:
             filters = self.config.get('filters', {})
             min_confidence = filters.get('min_confidence', 0.4)
             max_recommendations = filters.get('max_recommendations', 20)
             
-            all_categories = ['emergency_recommendations', 'maintenance_recommendations',
-                            'optimization_recommendations', 'operational_recommendations',
-                            'preventive_recommendations']
+            all_categories = [
+                'emergency_recommendations', 'maintenance_recommendations',
+                'optimization_recommendations', 'operational_recommendations',
+                'preventive_recommendations'
+            ]
             
             for category in all_categories:
                 category_recs = recommendations.get(category, [])
@@ -977,16 +1105,25 @@ class RecommendationEngine:
                 filtered_recs = [rec for rec in category_recs if rec.get('composite_score', 0) >= min_confidence]
                 
                 # Limit number of recommendations per category
-                category_limit = max_recommendations // len(all_categories)
+                # (More sophisticated logic could limit total while preserving priority)
+                category_limit = max(1, max_recommendations // len(all_categories))
                 filtered_recs = filtered_recs[:category_limit]
                 
                 recommendations[category] = filtered_recs
                 
         except Exception as e:
-            self.logger.error(f"Recommendation filtering error: {e}")
+            self.logger.error(f"Recommendation filtering error: {e}", exc_info=True)
     
-    def _generate_recommendations_summary(self, recommendations: Dict) -> Dict:
-        """Generate summary of recommendations."""
+    def _generate_recommendations_summary(self, recommendations: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate a summary of the generated recommendations.
+
+        Args:
+            recommendations (Dict[str, Any]): The main recommendations dictionary.
+
+        Returns:
+            Dict[str, Any]: A summary dictionary.
+        """
         try:
             total_recommendations = self._count_total_recommendations(recommendations)
             
@@ -1038,10 +1175,10 @@ class RecommendationEngine:
             }
             
         except Exception as e:
-            self.logger.error(f"Recommendations summary generation error: {e}")
+            self.logger.error(f"Recommendations summary generation error: {e}", exc_info=True)
             return {}
     
-    def _count_total_recommendations(self, recommendations: Dict) -> int:
+    def _count_total_recommendations(self, recommendations: Dict[str, Any]) -> int:
         """Count total number of recommendations across all categories."""
         try:
             total = 0
@@ -1055,10 +1192,10 @@ class RecommendationEngine:
             return total
             
         except Exception as e:
-            self.logger.error(f"Recommendation counting error: {e}")
+            self.logger.error(f"Recommendation counting error: {e}", exc_info=True)
             return 0
     
-    def _identify_next_actions(self, recommendations: List[Dict]) -> List[Dict]:
+    def _identify_next_actions(self, recommendations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Identify immediate next actions from recommendations."""
         try:
             # Sort by urgency and impact
@@ -1079,14 +1216,14 @@ class RecommendationEngine:
             return next_actions
             
         except Exception as e:
-            self.logger.error(f"Next actions identification error: {e}")
+            self.logger.error(f"Next actions identification error: {e}", exc_info=True)
             return []
     
-    def _estimate_overall_impact(self, recommendations: List[Dict]) -> Dict:
+    def _estimate_overall_impact(self, recommendations: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Estimate overall impact of implementing recommendations."""
         try:
             if not recommendations:
-                return {'estimated_improvement': 0, 'confidence': 0}
+                return {'estimated_improvement': 0, 'confidence': 0, 'impact_areas': []}
             
             # Calculate weighted impact
             total_weighted_impact = 0
@@ -1112,10 +1249,10 @@ class RecommendationEngine:
             }
             
         except Exception as e:
-            self.logger.error(f"Overall impact estimation error: {e}")
-            return {'estimated_improvement': 0, 'confidence': 0}
+            self.logger.error(f"Overall impact estimation error: {e}", exc_info=True)
+            return {'estimated_improvement': 0, 'confidence': 0, 'impact_areas': []}
     
-    def _identify_impact_areas(self, recommendations: List[Dict]) -> List[str]:
+    def _identify_impact_areas(self, recommendations: List[Dict[str, Any]]) -> List[str]:
         """Identify main areas of impact from recommendations."""
         try:
             impact_areas = set()
@@ -1125,32 +1262,35 @@ class RecommendationEngine:
                 component = rec.get('component', '')
                 
                 if component:
-                    impact_areas.add(component)
+                    impact_areas.add(component.title())
                 else:
-                    impact_areas.add(rec_type)
+                    impact_areas.add(rec_type.title())
             
             return list(impact_areas)
             
         except Exception as e:
-            self.logger.error(f"Impact areas identification error: {e}")
+            self.logger.error(f"Impact areas identification error: {e}", exc_info=True)
             return []
     
-    def _store_recommendations(self, recommendations: Dict):
+    def _store_recommendations(self, recommendations: Dict[str, Any]):
         """Store recommendations in history for learning."""
         try:
+            # Create a serializable copy of the recommendations
+            serializable_recs = json.loads(json.dumps(recommendations, default=str))
+
             history_entry = {
-                'timestamp': recommendations['timestamp'],
-                'recommendations': recommendations,
-                'context': recommendations.get('context', {}),
-                'total_count': self._count_total_recommendations(recommendations)
+                'timestamp': serializable_recs['timestamp'],
+                'recommendations': serializable_recs,
+                'context': serializable_recs.get('context', {}),
+                'total_count': self._count_total_recommendations(serializable_recs)
             }
             
             self.recommendation_history.append(history_entry)
             
         except Exception as e:
-            self.logger.error(f"Recommendation storage error: {e}")
+            self.logger.error(f"Recommendation storage error: {e}", exc_info=True)
     
-    def _assess_historical_data_quality(self, data: pd.DataFrame) -> Dict:
+    def _assess_historical_data_quality(self, data: pd.DataFrame) -> Dict[str, Any]:
         """Assess quality of historical data."""
         try:
             total_cells = data.size
@@ -1164,8 +1304,8 @@ class RecommendationEngine:
             }
             
         except Exception as e:
-            self.logger.error(f"Data quality assessment error: {e}")
-            return {'missing_percentage': 0, 'total_records': 0}
+            self.logger.error(f"Data quality assessment error: {e}", exc_info=True)
+            return {'missing_percentage': 0, 'total_records': 0, 'completeness_score': 0.0}
     
     def _calculate_simple_trend(self, data: pd.Series) -> float:
         """Calculate simple trend coefficient."""
@@ -1178,15 +1318,15 @@ class RecommendationEngine:
             
             # Normalize by data range
             data_range = data.max() - data.min()
-            normalized_trend = coeffs[0] / data_range if data_range > 0 else 0
+            normalized_trend = coeffs[0] / data_range if data_range > 1e-6 else 0
             
             return float(normalized_trend)
             
-        except Exception as e:
-            self.logger.error(f"Trend calculation error: {e}")
+        except (np.linalg.LinAlgError, ValueError, TypeError) as e:
+            self.logger.error(f"Trend calculation error: {e}", exc_info=True)
             return 0.0
     
-    def _analyze_historical_failures(self, data: pd.DataFrame) -> List[Dict]:
+    def _analyze_historical_failures(self, data: pd.DataFrame) -> List[Dict[str, Any]]:
         """Analyze historical data for failure patterns."""
         try:
             recommendations = []
@@ -1196,31 +1336,33 @@ class RecommendationEngine:
             
             for col in data.columns:
                 if any(indicator in col.lower() for indicator in failure_indicators):
-                    col_data = data[col].dropna()
-                    
-                    if len(col_data) > 0 and col_data.sum() > 0:  # Failures detected
-                        failure_rate = col_data.mean()
+                    # Ensure column is numeric for .sum()
+                    if pd.api.types.is_numeric_dtype(data[col]):
+                        col_data = data[col].dropna()
                         
-                        if failure_rate > 0.1:  # High failure rate
-                            recommendations.append({
-                                'type': 'maintenance',
-                                'title': f'High {col} Rate Detected',
-                                'description': f'Historical data shows {failure_rate*100:.1f}% {col} rate',
-                                'action': f'Investigate and address root causes of {col}',
-                                'urgency': 0.8,
-                                'impact': 0.7,
-                                'timeframe': 'within_week',
-                                'source': 'failure_analysis',
-                                'priority_level': 'high'
-                            })
+                        if len(col_data) > 0 and col_data.sum() > 0:  # Failures detected
+                            failure_rate = col_data.mean()
+                            
+                            if failure_rate > 0.1:  # High failure rate
+                                recommendations.append({
+                                    'type': 'maintenance',
+                                    'title': f'High {col} Rate Detected',
+                                    'description': f'Historical data shows {failure_rate*100:.1f}% {col} rate',
+                                    'action': f'Investigate and address root causes of {col}',
+                                    'urgency': 0.8,
+                                    'impact': 0.7,
+                                    'timeframe': 'within_week',
+                                    'source': 'failure_analysis',
+                                    'priority_level': 'high'
+                                })
             
             return recommendations
             
         except Exception as e:
-            self.logger.error(f"Historical failure analysis error: {e}")
+            self.logger.error(f"Historical failure analysis error: {e}", exc_info=True)
             return []
     
-    def _create_error_result(self, error_message: str) -> Dict:
+    def _create_error_result(self, error_message: str) -> Dict[str, Any]:
         """Create error result structure."""
         return {
             'error': True,
@@ -1234,7 +1376,14 @@ class RecommendationEngine:
         }
     
     def update_recommendation_effectiveness(self, recommendation_id: str, effectiveness_score: float):
-        """Update effectiveness score for a recommendation."""
+        """
+        Update effectiveness score for a recommendation (feedback loop).
+
+        Args:
+            recommendation_id (str): The unique ID of the recommendation.
+            effectiveness_score (float): A score (e.g., 0.0 to 1.0) indicating
+                                         how effective the action was.
+        """
         try:
             self.action_effectiveness[recommendation_id].append({
                 'effectiveness_score': effectiveness_score,
@@ -1244,40 +1393,66 @@ class RecommendationEngine:
             self.logger.info(f"Updated effectiveness for recommendation {recommendation_id}: {effectiveness_score}")
             
         except Exception as e:
-            self.logger.error(f"Effectiveness update error: {e}")
+            self.logger.error(f"Effectiveness update error: {e}", exc_info=True)
     
-    def get_recommendation_history(self, limit: int = 50) -> List[Dict]:
-        """Get historical recommendations."""
+    def get_recommendation_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Get historical recommendations.
+
+        Args:
+            limit (int): The maximum number of historical entries to return.
+
+        Returns:
+            List[Dict[str, Any]]: A list of historical recommendation entries.
+        """
         try:
             history = list(self.recommendation_history)
             history.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
             return history[:limit]
             
         except Exception as e:
-            self.logger.error(f"Recommendation history retrieval error: {e}")
+            self.logger.error(f"Recommendation history retrieval error: {e}", exc_info=True)
             return []
     
-    def export_recommendations(self, recommendations: Dict, output_path: str = None) -> str:
-        """Export recommendations to file."""
+    def export_recommendations(self, recommendations: Dict[str, Any], output_path: str = None) -> str:
+        """
+        Export recommendations to a JSON file.
+
+        Args:
+            recommendations (Dict[str, Any]): The recommendations dictionary to export.
+            output_path (str, optional): The file path to save to. Defaults to None.
+
+        Returns:
+            str: The path to the saved file.
+        """
         try:
             if output_path is None:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                output_path = f"REPORTS/recommendations_{timestamp}.json"
+                output_dir = Path("REPORTS")
+                output_dir.mkdir(exist_ok=True)
+                output_path_obj = output_dir / f"recommendations_{timestamp}.json"
+            else:
+                output_path_obj = Path(output_path)
+                
+            output_path_obj.parent.mkdir(parents=True, exist_ok=True)
             
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(output_path, 'w') as f:
+            with open(output_path_obj, 'w') as f:
                 json.dump(recommendations, f, indent=2, default=str)
             
-            self.logger.info(f"Recommendations exported to {output_path}")
-            return output_path
+            self.logger.info(f"Recommendations exported to {output_path_obj}")
+            return str(output_path_obj)
             
         except Exception as e:
-            self.logger.error(f"Recommendation export error: {e}")
+            self.logger.error(f"Recommendation export error: {e}", exc_info=True)
             raise
     
-    def get_recommendation_statistics(self) -> Dict:
-        """Get comprehensive recommendation statistics."""
+    def get_recommendation_statistics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive recommendation statistics from history.
+
+        Returns:
+            Dict[str, Any]: A dictionary of statistics.
+        """
         try:
             if not self.recommendation_history:
                 return {'total_sessions': 0, 'statistics': {}}
@@ -1289,7 +1464,7 @@ class RecommendationEngine:
             priority_stats = defaultdict(int)
             
             for entry in self.recommendation_history:
-                recs = entry['recommendations']
+                recs = entry.get('recommendations', {})
                 for category in ['emergency_recommendations', 'maintenance_recommendations',
                                'optimization_recommendations', 'operational_recommendations', 
                                'preventive_recommendations']:
@@ -1313,7 +1488,7 @@ class RecommendationEngine:
             return {
                 'total_sessions': len(self.recommendation_history),
                 'total_recommendations': total_recs,
-                'average_per_session': total_recs / len(self.recommendation_history),
+                'average_per_session': total_recs / len(self.recommendation_history) if self.recommendation_history else 0,
                 'category_distribution': dict(category_stats),
                 'priority_distribution': dict(priority_stats),
                 'average_effectiveness': round(avg_effectiveness, 3),
@@ -1322,187 +1497,199 @@ class RecommendationEngine:
             }
             
         except Exception as e:
-            self.logger.error(f"Recommendation statistics error: {e}")
+            self.logger.error(f"Recommendation statistics error: {e}", exc_info=True)
             return {}
 
 
 # Example usage and testing
 if __name__ == "__main__":
+    """
+    Test scenarios for the RecommendationEngine.
+    This block is executed when the script is run directly.
+    It demonstrates how to use the engine and validates its output.
+    """
+    
     # Initialize recommendation engine
-    # This will create a new 'CONFIG/recommendation_config.json' if it doesn't exist,
-    # now with the new enhanced rule structure.
+    # This will create a 'CONFIG/recommendation_config.json' if it doesn't exist.
+    print("Initializing RecommendationEngine...")
     rec_engine = RecommendationEngine()
     
-    # Sample health data
-    sample_health_data = {
-        'overall_score': 0.65,
-        'health_status': 'warning',
+    # === Test Scenario 1: Critical Failure Imminent ===
+    print("\n" + "="*30)
+    print("=== Test Scenario 1: Critical Failure Imminent ===")
+    print("="*30)
+    
+    # This data should trigger multiple 'critical' and 'emergency' rules
+    sample_health_data_critical = {
+        'overall_score': 0.25, # Triggers 'critical_system_state' (OR)
+        'health_status': 'critical', # Triggers 'critical_system_state' (OR)
         'component_scores': {
-            'performance': {'score': 0.7},
-            'reliability': {'score': 0.8},
-            'efficiency': {'score': 0.4},  # Low efficiency (triggers 'low_efficiency' rule)
+            'performance': {'score': 0.4},
+            'reliability': {'score': 0.5},  # Triggers 'high_risk_factor'
+            'efficiency': {'score': 0.3},  # Triggers 'low_efficiency'
             'safety': {'score': 0.9},
-            'maintenance': {'score': 0.3}  # Critical maintenance (triggers 'critical_maintenance' rule)
+            'maintenance': {'score': 0.1}   # Triggers 'critical_maintenance'
         },
         'trend_analysis': {
-            'trend_direction': 'degrading', # Triggers 'degrading_performance' rule
-            'trend_strength': 0.08
+            'trend_direction': 'degrading', # Triggers 'degrading_performance'
+            'trend_strength': 0.15
         },
         'risk_assessment': {
-            'overall_risk_level': 'high', # Could trigger 'critical_system_state' rule
+            'overall_risk_level': 'critical', # Triggers 'critical_system_state' (OR)
             'risk_factors': [
-                {
-                    'component': 'efficiency',
-                    'risk_level': 'high',
-                    'impact': 'performance_degradation'
-                },
-                {
-                    'component': 'maintenance',
-                    'risk_level': 'high',
-                    'impact': 'critical_component_failure'
-                }
+                {'component': 'maintenance', 'risk_level': 'critical', 'impact': 'system_failure'}
             ]
         }
     }
     
-    # Sample pattern analysis
-    sample_pattern_analysis = {
-        'temporal': {
-            'patterns_found': {
-                'temperature': {
-                    'cyclical': {
-                        'cycles_detected': 2,
-                        'dominant_cycle': {
-                            'cycle_length': 24,
-                            'strength': 0.8
-                        }
-                    },
-                    'change_points': {
-                        'change_points_detected': 3
-                    }
-                }
-            }
-        },
+    sample_pattern_analysis_critical = {
         'behavioral': {
             'behavioral_patterns': {
-                'anomalies': {
-                    'anomaly_detection': True,
-                    'anomalous_entities_count': 2
-                },
-                'clustering': {
-                    'clusters_found': 3
-                }
+                'anomalies': {'anomaly_detection': True, 'anomalous_entities_count': 5}
             }
         }
     }
     
+    sample_context_critical = {
+        'system_load': 0.98, # Triggers 'high_system_load'
+        'operating_hours': 12000, # Triggers 'Very High Operating Hours'
+        'last_maintenance': (datetime.now() - timedelta(days=100)).isoformat(), # Triggers 'Overdue'
+        'location': 'harsh_environment_zone' # Triggers 'Harsh Environment'
+    }
+    
+    print("1. Generating recommendations for CRITICAL state...")
+    recommendations_critical = rec_engine.generate_recommendations(
+        health_data=sample_health_data_critical,
+        pattern_analysis=sample_pattern_analysis_critical,
+        historical_data=None, # Skipping historical for this test
+        context=sample_context_critical
+    )
+    
+    print(f"\n    Total recommendations generated: {recommendations_critical['summary']['total_recommendations']}")
+    print(f"    Emergency: {len(recommendations_critical['emergency_recommendations'])}")
+    print(f"    Maintenance: {len(recommendations_critical['maintenance_recommendations'])}")
+    print(f"    Operational: {len(recommendations_critical['operational_recommendations'])}")
+
+    print("\n    Top 3 Priority Recommendations:")
+    top_recs_critical = recommendations_critical['summary']['top_recommendations']
+    for i, rec in enumerate(top_recs_critical[:3], 1):
+        print(f"    {i}. [{rec['priority'].upper()}] {rec['title']} (Score: {rec['score']:.3f})")
+        
+    print("\n    Immediate Next Actions:")
+    next_actions_critical = recommendations_critical['summary']['next_actions']
+    for i, action in enumerate(next_actions_critical, 1):
+        print(f"    {i}. {action['action']} (Priority: {action['priority']})")
+
+
+    # === Test Scenario 2: Healthy System ===
+    print("\n" + "="*30)
+    print("=== Test Scenario 2: Healthy System ===")
+    print("="*30)
+    
+    # This data should trigger few or no recommendations
+    sample_health_data_healthy = {
+        'overall_score': 0.92,
+        'health_status': 'excellent',
+        'component_scores': {
+            'performance': {'score': 0.9},
+            'reliability': {'score': 0.95},
+            'efficiency': {'score': 0.88},
+            'safety': {'score': 0.98},
+            'maintenance': {'score': 0.9}
+        },
+        'trend_analysis': {
+            'trend_direction': 'improving',
+            'trend_strength': 0.02
+        },
+        'risk_assessment': {
+            'overall_risk_level': 'low',
+            'risk_factors': []
+        }
+    }
+    
+    sample_pattern_analysis_healthy = {
+        'behavioral': {
+            'behavioral_patterns': {
+                'anomalies': {'anomaly_detection': True, 'anomalous_entities_count': 0}
+            }
+        }
+    }
+    
+    sample_context_healthy = {
+        'system_load': 0.35,
+        'operating_hours': 1500,
+        'last_maintenance': (datetime.now() - timedelta(days=10)).isoformat(),
+        'location': 'clean_room'
+    }
+
+    print("1. Generating recommendations for HEALTHY state...")
+    recommendations_healthy = rec_engine.generate_recommendations(
+        health_data=sample_health_data_healthy,
+        pattern_analysis=sample_pattern_analysis_healthy,
+        historical_data=None,
+        context=sample_context_healthy
+    )
+    
+    print(f"\n    Total recommendations generated: {recommendations_healthy['summary']['total_recommendations']}")
+    
+    print("\n    Top Priority Recommendations (if any):")
+    top_recs_healthy = recommendations_healthy['summary']['top_recommendations']
+    if not top_recs_healthy:
+        print("    No significant recommendations generated, as expected.")
+    for i, rec in enumerate(top_recs_healthy, 1):
+        print(f"    {i}. [{rec['priority'].upper()}] {rec['title']} (Score: {rec['score']:.3f})")
+        
+    print("\n    Immediate Next Actions (if any):")
+    next_actions_healthy = recommendations_healthy['summary']['next_actions']
+    if not next_actions_healthy:
+        print("    No immediate actions required.")
+    for i, action in enumerate(next_actions_healthy, 1):
+        print(f"    {i}. {action['action']} (Priority: {action['priority']})")
+        
+
+    # === Test Scenario 3: Historical Data Trend ===
+    print("\n" + "="*30)
+    print("=== Test Scenario 3: Historical Data Trend ===")
+    print("="*30)
+
     # Sample historical data
     np.random.seed(42)
     sample_historical_data = pd.DataFrame({
         'timestamp': pd.date_range('2024-01-01', periods=100, freq='H'),
-        'temperature': np.random.normal(30, 5, 100),
-        'efficiency': np.random.normal(75, 10, 100) - np.arange(100) * 0.1,  # Declining efficiency
-        'vibration': np.random.exponential(0.2, 100) + np.arange(100) * 0.001,  # Increasing vibration
+        'temperature': np.random.normal(30, 5, 100) + np.arange(100) * 0.1, # Increasing temp
+        'efficiency': np.random.normal(75, 10, 100) - np.arange(100) * 0.2,  # Declining efficiency
+        'vibration': np.random.exponential(0.2, 100),
         'error_count': np.random.poisson(0.5, 100)
     })
     
-    # Context information
-    sample_context = {
-        'system_load': 0.95,  # High load (triggers 'high_system_load' rule)
-        'operating_hours': 8760,  # Full year
-        'last_maintenance': '2024-01-01',
-        'location': 'factory_floor_a'
-    }
-    
-    print("=== DIGITAL TWIN RECOMMENDATION ENGINE DEMO (ENHANCED) ===\n")
-    
-    # Generate recommendations
-    print("1. Generating comprehensive recommendations...")
-    recommendations = rec_engine.generate_recommendations(
-        health_data=sample_health_data,
-        pattern_analysis=sample_pattern_analysis,
+    print("1. Generating recommendations from HISTORICAL data...")
+    recommendations_hist = rec_engine.generate_recommendations(
+        health_data={}, # No current health
+        pattern_analysis=None,
         historical_data=sample_historical_data,
-        context=sample_context
+        context=None
     )
     
-    # Display results
-    print(f"    Total recommendations generated: {recommendations['summary']['total_recommendations']}")
-    print(f"    Emergency: {len(recommendations['emergency_recommendations'])}")
-    print(f"    Maintenance: {len(recommendations['maintenance_recommendations'])}")
-    print(f"    Optimization: {len(recommendations['optimization_recommendations'])}")
-    print(f"    Operational: {len(recommendations['operational_recommendations'])}")
-    print(f"    Preventive: {len(recommendations['preventive_recommendations'])}")
-    print()
-    
-    # Show top recommendations
-    print("2. Top Priority Recommendations:")
-    top_recs = recommendations['summary']['top_recommendations']
-    for i, rec in enumerate(top_recs, 1):
-        print(f"    {i}. [{rec['priority'].upper()}] {rec['title']}")
-        print(f"       Score: {rec['score']:.3f} | Timeframe: {rec['timeframe']}")
-    print()
-    
-    # Show emergency recommendations
-    if recommendations['emergency_recommendations']:
-        print("3. Emergency Recommendations (from Knowledge Base):")
-        for rec in recommendations['emergency_recommendations']:
-            print(f"    • {rec['title']} (Source: {rec['source']})")
-            print(f"      Action: {rec['action']}")
-            print(f"      Urgency: {rec['urgency']:.2f} | Impact: {rec['impact']:.2f}")
-        print()
-    
-    # Show maintenance recommendations
-    if recommendations['maintenance_recommendations']:
-        print("4. Critical Maintenance Recommendations:")
-        for rec in recommendations['maintenance_recommendations'][:3]:
-            print(f"    • {rec['title']} (Source: {rec['source']})")
-            print(f"      Action: {rec['action']}")
-            print(f"      Priority: {rec.get('priority_level', 'unknown')}")
-        print()
-    
-    # Show next actions
-    print("5. Immediate Next Actions:")
-    next_actions = recommendations['summary']['next_actions']
-    for i, action in enumerate(next_actions, 1):
-        print(f"    {i}. {action['action']}")
-        print(f"       Category: {action['category']} | Timeframe: {action['timeframe']}")
-    print()
-    
-    # Impact estimation
-    print("6. Estimated Impact of Recommendations:")
-    impact = recommendations['summary']['estimated_impact']
-    print(f"    Estimated Improvement: {impact['estimated_improvement']*100:.1f}%")
-    print(f"    Confidence: {impact['confidence']*100:.1f}%")
-    print(f"    Impact Areas: {', '.join(impact['impact_areas'])}")
-    print()
-    
-    # Export recommendations
-    print("7. Exporting recommendations...")
-    export_path = rec_engine.export_recommendations(recommendations)
-    print(f"    Recommendations exported to: {export_path}")
-    
-    # Statistics
-    print("\n8. Recommendation Engine Statistics:")
+    print(f"\n    Total recommendations generated: {recommendations_hist['summary']['total_recommendations']}")
+    print("    Recommendations from historical analysis:")
+    all_recs_hist = []
+    for cat in recommendations_hist:
+        if cat.endswith('_recommendations'):
+            all_recs_hist.extend(recommendations_hist[cat])
+            
+    for rec in all_recs_hist:
+        if rec['source'] == 'historical_analysis':
+            print(f"    - [{rec['priority_level'].upper()}] {rec['title']}")
+
+    # === Final Statistics ===
+    print("\n" + "="*30)
+    print("=== Final Engine Statistics ===")
+    print("="*30)
     stats = rec_engine.get_recommendation_statistics()
-    print(f"    Total recommendation sessions: {stats['total_sessions']}")
+    print(f"    Total recommendation sessions run: {stats['total_sessions']}")
     print(f"    Total recommendations generated: {stats['total_recommendations']}")
-    if stats['total_sessions'] > 0:
-        print(f"    Average recommendations per session: {stats['average_per_session']:.1f}")
-    print()
-    
-    # Simulate effectiveness feedback
-    print("9. Simulating recommendation effectiveness feedback...")
-    if recommendations['maintenance_recommendations']:
-        # Simulate high effectiveness for first maintenance recommendation
-        rec_engine.update_recommendation_effectiveness("maintenance_001", 0.85)
-        print("    Updated effectiveness score for maintenance recommendation")
+    print(f"    Average per session: {stats['average_per_session']:.1f}")
+    print(f"    Category Distribution: {stats['category_distribution']}")
+    print(f"    Priority Distribution: {stats['priority_distribution']}")
     
     print("\n=== RECOMMENDATION ENGINE DEMO COMPLETED ===")
-    print("\nKey Findings:")
-    print("- Critical maintenance issues identified requiring immediate attention")
-    print("- Efficiency optimization opportunities detected")
-    print("- Pattern-based recommendations for preventive actions")
-    print("- Context-aware suggestions for current operating conditions")
-    print("- Comprehensive scoring and prioritization of all recommendations")
-    print("- Actionable next steps with clear timeframes and priorities")
-    print("- **NEW**: Enhanced Knowledge Base rules (e.g., 'critical_system_state') were evaluated using AND/OR logic and a fully flattened data context.")

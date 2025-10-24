@@ -1,3 +1,5 @@
+# Updated File: Digital_Twin/AI_MODULES/dashboard_helper.py
+
 #!/usr/bin/env python3
 """
 Dashboard Helper Module for Digital Twin System v2.0
@@ -13,7 +15,7 @@ import os # Added for path handling
 import sys # Added for path handling
 # import sqlite3 # Removed direct SQLite dependency
 import pickle
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # Added timezone
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from collections import defaultdict, deque
@@ -54,11 +56,6 @@ class DashboardHelper:
         # Create cache directory
         self.cache_path.mkdir(parents=True, exist_ok=True)
 
-        # Data caches (consider moving caching layer higher up if helper becomes stateless)
-        # self.data_cache = {}
-        # self.cache_timestamps = {}
-        # self.cache_ttl = 300  # 5 minutes
-
         # Aggregation settings
         self.aggregation_config = {
             'temperature': {'unit': '°C', 'normal_range': (15, 35), 'precision': 1},
@@ -88,10 +85,6 @@ class DashboardHelper:
             }
         }
 
-        # Real-time data buffer (Consider if this state belongs here or higher up)
-        # self.realtime_buffer = defaultdict(lambda: deque(maxlen=100))
-
-        # Store previous values for delta calculations (again, consider state management)
         self._previous_metric_values = {}
 
 
@@ -100,14 +93,24 @@ class DashboardHelper:
         logger = logging.getLogger('DashboardHelper')
         logger.setLevel(logging.INFO)
 
+        # Prevent duplicate handlers if logger already exists
         if not logger.handlers:
-            Path("LOGS").mkdir(exist_ok=True)
-            handler = logging.FileHandler('LOGS/digital_twin_dashboard.log')
+            log_dir = Path("LOGS")
+            log_dir.mkdir(exist_ok=True)
+            log_file = log_dir / 'digital_twin_dashboard.log'
+            
+            # File Handler
+            file_handler = logging.FileHandler(log_file)
             formatter = logging.Formatter(
                 '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
             )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+            # Console Handler (optional, for visibility during development/debugging)
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
 
         return logger
 
@@ -118,8 +121,8 @@ class DashboardHelper:
         Args:
             historical_df: DataFrame containing historical device data (e.g., last 7 days).
                            Expected columns: device_id, timestamp, value, status, health_score,
-                           efficiency_score, device_type, unit, location, operating_hours,
-                           days_since_maintenance. Timestamp should be datetime objects.
+                           efficiency_score, device_type, unit, location. Optional: operating_hours,
+                           days_since_maintenance. Timestamp should be datetime objects or ISO strings.
             alerts_summary: Dictionary containing current alert summary.
 
         Returns:
@@ -128,22 +131,45 @@ class DashboardHelper:
         try:
             self.logger.info("Generating dashboard overview from DataFrame")
 
-            if historical_df.empty:
-                self.logger.warning("Input historical_df is empty. Returning default overview.")
+            if historical_df is None or historical_df.empty:
+                self.logger.warning("Input historical_df is empty or None. Returning default overview.")
                 return self._get_default_overview()
 
+            # Make a copy to avoid modifying the original DataFrame
+            historical_df = historical_df.copy()
+
             # Ensure timestamp is datetime
-            if 'timestamp' in historical_df.columns and not pd.api.types.is_datetime64_any_dtype(historical_df['timestamp']):
-                historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
+            if 'timestamp' in historical_df.columns:
+                try:
+                    # Attempt conversion, handling potential errors for mixed types
+                    historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'], errors='coerce')
+                    # Drop rows where timestamp conversion failed
+                    historical_df.dropna(subset=['timestamp'], inplace=True)
+                    if historical_df.empty:
+                        self.logger.warning("DataFrame became empty after timestamp conversion/dropna.")
+                        return self._get_default_overview()
+                except Exception as e:
+                    self.logger.error(f"Error converting timestamp column: {e}. Returning default overview.", exc_info=True)
+                    return self._get_default_overview()
+            else:
+                 self.logger.warning("Timestamp column not found in historical_df.")
+                 # Decide if you want to proceed without time-based analysis or return default
+                 # return self._get_default_overview() # Option 1: Return default
+                 # Option 2: Proceed, but time-based calculations will fail gracefully
 
 
             # Get the latest snapshot for each device from the provided DataFrame
             # Ensure we handle potential duplicates by taking the absolute last entry per device
-            latest_df = historical_df.sort_values('timestamp').groupby('device_id').last().reset_index()
+            if 'timestamp' in historical_df.columns:
+                 latest_df = historical_df.sort_values('timestamp').groupby('device_id').last().reset_index()
+            else:
+                 # If no timestamp, just take the last occurrence per device_id (less reliable)
+                 latest_df = historical_df.groupby('device_id').last().reset_index()
+
 
             # Calculate key metrics
             overview = {
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(), # Use timezone aware
                 'system_metrics': self._calculate_system_metrics(latest_df, historical_df),
                 'device_metrics': self._calculate_device_metrics(latest_df),
                 'health_metrics': self._calculate_health_metrics(historical_df), # Uses historical
@@ -161,12 +187,9 @@ class DashboardHelper:
             self.logger.error(f"Dashboard overview generation error from DataFrame: {e}", exc_info=True)
             return self._get_default_overview()
 
-    # REMOVED: _fetch_device_data - Data should be fetched via SQLAlchemy in Flask app
 
-    # Kept for fallback/demo purposes if needed, but should not be used in production flow
     def _generate_sample_device_data(self) -> List[Dict]:
         """Generate sample device data for demonstration (now richer for trends)."""
-        # (Implementation remains the same as provided)
         try:
             devices = []
             device_types = ['temperature_sensor', 'pressure_sensor', 'vibration_sensor',
@@ -182,7 +205,7 @@ class DashboardHelper:
                 base_efficiency = np.random.uniform(0.6, 0.9)
 
                 for j in range(10): # 10 data points each over the last 7 days
-                    timestamp = datetime.now() - timedelta(days=np.random.uniform(0, 7),
+                    timestamp = datetime.now(timezone.utc) - timedelta(days=np.random.uniform(0, 7),
                                                            hours=np.random.uniform(0, 24))
 
                     device_type = device_type_base
@@ -247,43 +270,47 @@ class DashboardHelper:
             self.logger.error(f"Sample data generation error: {e}")
             return []
 
-    # --- Calculation methods remain largely the same, operating on DataFrames ---
-
     def _calculate_system_metrics(self, latest_df: pd.DataFrame, historical_df: pd.DataFrame) -> Dict:
         """Calculate system-level metrics from DataFrames."""
-        # (Implementation remains the same - already uses DataFrames)
         try:
             total_devices = latest_df['device_id'].nunique() if not latest_df.empty else 0
 
             if total_devices == 0:
-                return {'total_devices': 0, 'active_devices': 0, 'uptime': 100.0, 'data_points_collected': 0}
+                return {'total_devices': 0, 'active_devices': 0, 'offline_devices': 0, 'uptime': 100.0, 'data_points_collected': 0, 'response_time_ms': 0.0, 'last_update': datetime.now(timezone.utc).isoformat()}
 
-            # Assuming 'status' column exists
-            active_devices = latest_df[latest_df['status'] == 'normal'].shape[0] if 'status' in latest_df.columns else total_devices
+            active_devices = 0
+            offline_devices = 0
+            if 'status' in latest_df.columns:
+                status_counts = latest_df['status'].value_counts()
+                active_devices = status_counts.get('normal', 0) + status_counts.get('warning', 0) + status_counts.get('critical', 0)
+                offline_devices = status_counts.get('offline', 0)
+            else:
+                 # If no status column, assume all devices seen are active
+                 active_devices = total_devices
 
-            # Calculate system uptime based on device status
+
             uptime = (active_devices / total_devices) * 100 if total_devices > 0 else 100.0
 
-            # Calculate average response time (simulated)
+            # Calculate average response time (simulated - replace with real data if available)
             response_time = np.random.uniform(50, 200)
 
             return {
                 'total_devices': total_devices,
                 'active_devices': active_devices,
-                'offline_devices': total_devices - active_devices, # Simple assumption
+                'offline_devices': offline_devices,
                 'uptime': round(uptime, 2),
                 'response_time_ms': round(response_time, 1),
                 'data_points_collected': len(historical_df), # Total points in the period
-                'last_update': datetime.now().isoformat()
+                'last_update': datetime.now(timezone.utc).isoformat()
             }
 
         except Exception as e:
             self.logger.error(f"System metrics calculation error: {e}", exc_info=True)
-            return {'total_devices': 0, 'active_devices': 0, 'uptime': 0.0, 'data_points_collected': 0}
+            return {'total_devices': 0, 'active_devices': 0, 'offline_devices': 0, 'uptime': 0.0, 'data_points_collected': 0, 'response_time_ms': 0.0, 'last_update': datetime.now(timezone.utc).isoformat()}
+
 
     def _calculate_device_metrics(self, latest_df: pd.DataFrame) -> Dict:
         """Calculate device-specific metrics based on latest snapshot DataFrame."""
-        # (Implementation remains the same - already uses DataFrames)
         try:
             if latest_df.empty or 'device_type' not in latest_df.columns:
                 return {}
@@ -291,13 +318,33 @@ class DashboardHelper:
             device_metrics = {}
 
             for device_type in latest_df['device_type'].unique():
+                if pd.isna(device_type): continue # Skip if device_type is NaN
+
                 type_df = latest_df[latest_df['device_type'] == device_type]
 
-                avg_val = type_df['value'].mean() if 'value' in type_df.columns and not type_df['value'].isnull().all() else 0
-                min_val = type_df['value'].min() if 'value' in type_df.columns and not type_df['value'].isnull().all() else 0
-                max_val = type_df['value'].max() if 'value' in type_df.columns and not type_df['value'].isnull().all() else 0
-                unit = type_df['unit'].iloc[0] if 'unit' in type_df.columns and not type_df['unit'].isnull().all() else 'units'
-                status_dist = type_df['status'].value_counts().to_dict() if 'status' in type_df.columns else {}
+                avg_val = 0
+                min_val = 0
+                max_val = 0
+                unit = 'units'
+                status_dist = {}
+
+                if 'value' in type_df.columns:
+                     value_col = type_df['value'].dropna()
+                     if not value_col.empty:
+                         avg_val = value_col.mean()
+                         min_val = value_col.min()
+                         max_val = value_col.max()
+
+                if 'unit' in type_df.columns:
+                     unit_col = type_df['unit'].dropna()
+                     if not unit_col.empty:
+                         unit = unit_col.iloc[0]
+
+
+                if 'status' in type_df.columns:
+                     status_col = type_df['status'].dropna()
+                     if not status_col.empty:
+                          status_dist = status_col.value_counts().to_dict()
 
 
                 device_metrics[device_type] = {
@@ -317,9 +364,9 @@ class DashboardHelper:
 
     def _calculate_health_metrics(self, historical_df: pd.DataFrame) -> Dict:
         """Calculate health-related metrics from historical DataFrame."""
-        # (Implementation remains the same - already uses DataFrames)
         try:
             if historical_df.empty or 'health_score' not in historical_df.columns:
+                self.logger.warning("Health score column missing or DataFrame empty for health metrics.")
                 return self._get_default_health_metrics()
 
             # Get latest health scores for current snapshot
@@ -327,6 +374,7 @@ class DashboardHelper:
             health_scores = latest_df['health_score'].dropna()
 
             if health_scores.empty:
+                self.logger.warning("No valid health scores found in the latest device snapshot.")
                 return self._get_default_health_metrics()
 
             # Convert to percentages
@@ -334,25 +382,28 @@ class DashboardHelper:
 
             # Calculate health distribution from latest snapshot
             health_distribution = {
-                'excellent': len(health_scores[health_scores >= 0.9]),
-                'good': len(health_scores[(health_scores >= 0.7) & (health_scores < 0.9)]),
-                'fair': len(health_scores[(health_scores >= 0.5) & (health_scores < 0.7)]),
-                'poor': len(health_scores[(health_scores >= 0.3) & (health_scores < 0.5)]),
-                'critical': len(health_scores[health_scores < 0.3])
+                'excellent': int((health_scores_pct >= 90).sum()),
+                'good': int(((health_scores_pct >= 75) & (health_scores_pct < 90)).sum()),
+                'fair': int(((health_scores_pct >= 60) & (health_scores_pct < 75)).sum()),
+                'poor': int((health_scores_pct < 60).sum()),
+                # 'critical' is usually below 'poor', adjust if needed based on config
+                # 'critical': int((health_scores_pct < 30).sum()) # Example critical threshold
             }
+            devices_needing_attention = health_distribution['poor'] # + health_distribution.get('critical', 0)
+
 
             # Calculate trend from historical data
             health_trend_details = self._calculate_detailed_trend(historical_df, 'health_score')
 
             return {
-                'average_health': round(health_scores_pct.mean(), 1),
-                'median_health': round(health_scores_pct.median(), 1),
-                'min_health': round(health_scores_pct.min(), 1),
-                'max_health': round(health_scores_pct.max(), 1),
-                'std_health': round(health_scores_pct.std(), 1) if not np.isnan(health_scores_pct.std()) else 0.0, # Handle NaN std
+                'average_health': round(health_scores_pct.mean(), 1) if not np.isnan(health_scores_pct.mean()) else 0.0,
+                'median_health': round(health_scores_pct.median(), 1) if not np.isnan(health_scores_pct.median()) else 0.0,
+                'min_health': round(health_scores_pct.min(), 1) if not np.isnan(health_scores_pct.min()) else 0.0,
+                'max_health': round(health_scores_pct.max(), 1) if not np.isnan(health_scores_pct.max()) else 0.0,
+                'std_health': round(health_scores_pct.std(), 1) if not np.isnan(health_scores_pct.std()) else 0.0,
                 'health_distribution': health_distribution,
                 'health_trend': health_trend_details.get('trend', 'stable'), # Simple trend for overview card
-                'devices_needing_attention': health_distribution['poor'] + health_distribution['critical']
+                'devices_needing_attention': devices_needing_attention
             }
 
         except Exception as e:
@@ -362,23 +413,24 @@ class DashboardHelper:
 
     def _get_default_health_metrics(self) -> Dict:
         """Get default health metrics when no data is available."""
-        # (Implementation remains the same)
         return {
-            'average_health': 85.0,
-            'median_health': 87.0,
-            'min_health': 65.0,
-            'max_health': 98.0,
-            'std_health': 12.5,
+            'average_health': 0.0, # Default to 0 if no data
+            'median_health': 0.0,
+            'min_health': 0.0,
+            'max_health': 0.0,
+            'std_health': 0.0,
             'health_distribution': {
-                'excellent': 5, 'good': 8, 'fair': 4, 'poor': 2, 'critical': 1
+                'excellent': 0, 'good': 0, 'fair': 0, 'poor': 0, 'critical': 0
             },
             'health_trend': 'stable',
-            'devices_needing_attention': 3
+            'devices_needing_attention': 0
         }
 
     def _calculate_performance_metrics(self, historical_df: pd.DataFrame) -> Dict:
-        """Calculate performance-related metrics from historical DataFrame."""
-        # (Implementation remains the same - already uses DataFrames)
+        """
+        Calculate performance-related metrics from historical DataFrame.
+        Handles missing optional columns 'operating_hours' and 'days_since_maintenance'.
+        """
         try:
             if historical_df.empty:
                 return self._get_default_performance_metrics()
@@ -386,43 +438,57 @@ class DashboardHelper:
             # Get latest snapshot for current metrics
             latest_df = historical_df.sort_values('timestamp').groupby('device_id').last().reset_index()
 
-            efficiency_scores = pd.Series([], dtype=float) # Initialize with dtype
+            # --- Efficiency ---
+            average_efficiency = 0.0
+            min_efficiency = 0.0
+            max_efficiency = 0.0
             if 'efficiency_score' in latest_df.columns:
-                 efficiency_scores = latest_df['efficiency_score'].dropna() * 100
+                efficiency_scores = latest_df['efficiency_score'].dropna() * 100
+                if not efficiency_scores.empty:
+                    average_efficiency = round(efficiency_scores.mean(), 1) if not np.isnan(efficiency_scores.mean()) else 0.0
+                    min_efficiency = round(efficiency_scores.min(), 1) if not np.isnan(efficiency_scores.min()) else 0.0
+                    max_efficiency = round(efficiency_scores.max(), 1) if not np.isnan(efficiency_scores.max()) else 0.0
+            else:
+                 self.logger.warning("Efficiency score column not found for performance metrics.")
 
 
-            # Calculate operating hours statistics
+            # Calculate trend from historical data
+            efficiency_trend_details = self._calculate_detailed_trend(historical_df, 'efficiency_score')
+
+            # --- Operating Hours (Optional) ---
             operating_hours_stats = {}
             if 'operating_hours' in latest_df.columns:
                 operating_hours = latest_df['operating_hours'].dropna()
                 if not operating_hours.empty:
                     operating_hours_stats = {
-                        'total_operating_hours': round(operating_hours.sum(), 0),
-                        'average_operating_hours': round(operating_hours.mean(), 0),
-                        'max_operating_hours': round(operating_hours.max(), 0)
+                        'total_operating_hours': round(operating_hours.sum(), 0) if not np.isnan(operating_hours.sum()) else 0.0,
+                        'average_operating_hours': round(operating_hours.mean(), 0) if not np.isnan(operating_hours.mean()) else 0.0,
+                        'max_operating_hours': round(operating_hours.max(), 0) if not np.isnan(operating_hours.max()) else 0.0,
                     }
+            else:
+                self.logger.info("Optional column 'operating_hours' not found in DataFrame.")
 
-            # Calculate maintenance statistics
+            # --- Maintenance Statistics (Optional) ---
             maintenance_stats = {}
             if 'days_since_maintenance' in latest_df.columns:
                 maintenance_days = latest_df['days_since_maintenance'].dropna()
                 if not maintenance_days.empty:
                     maintenance_stats = {
-                        'average_days_since_maintenance': round(maintenance_days.mean(), 0),
-                        'devices_due_maintenance': len(maintenance_days[maintenance_days > 60]),
-                        'devices_overdue_maintenance': len(maintenance_days[maintenance_days > 90])
+                        'average_days_since_maintenance': round(maintenance_days.mean(), 0) if not np.isnan(maintenance_days.mean()) else 0.0,
+                        'devices_due_maintenance': int((maintenance_days > 60).sum()),
+                        'devices_overdue_maintenance': int((maintenance_days > 90).sum())
                     }
+            else:
+                 self.logger.info("Optional column 'days_since_maintenance' not found in DataFrame.")
 
-            # Calculate trend from historical data
-            efficiency_trend_details = self._calculate_detailed_trend(historical_df, 'efficiency_score')
 
             return {
-                'average_efficiency': round(efficiency_scores.mean(), 1) if not efficiency_scores.empty else 85.0,
-                'min_efficiency': round(efficiency_scores.min(), 1) if not efficiency_scores.empty else 70.0,
-                'max_efficiency': round(efficiency_scores.max(), 1) if not efficiency_scores.empty else 98.0,
+                'average_efficiency': average_efficiency,
+                'min_efficiency': min_efficiency,
+                'max_efficiency': max_efficiency,
                 'efficiency_trend': efficiency_trend_details.get('trend', 'stable'),
-                **operating_hours_stats,
-                **maintenance_stats
+                **operating_hours_stats, # Merges dict if exists, otherwise empty
+                **maintenance_stats    # Merges dict if exists, otherwise empty
             }
 
         except Exception as e:
@@ -432,37 +498,42 @@ class DashboardHelper:
 
     def _get_default_performance_metrics(self) -> Dict:
         """Get default performance metrics when no data is available."""
-        # (Implementation remains the same)
+        # Removed operating_hours and maintenance stats from default if they are optional
         return {
-            'average_efficiency': 85.5,
-            'min_efficiency': 68.0,
-            'max_efficiency': 97.5,
+            'average_efficiency': 0.0,
+            'min_efficiency': 0.0,
+            'max_efficiency': 0.0,
             'efficiency_trend': 'stable',
-            'total_operating_hours': 45000,
-            'average_operating_hours': 2250,
-            'max_operating_hours': 8760,
-            'average_days_since_maintenance': 32,
-            'devices_due_maintenance': 3,
-            'devices_overdue_maintenance': 1
+            # 'total_operating_hours': 0,
+            # 'average_operating_hours': 0,
+            # 'max_operating_hours': 0,
+            # 'average_days_since_maintenance': 0,
+            # 'devices_due_maintenance': 0,
+            # 'devices_overdue_maintenance': 0
         }
 
 
     def _calculate_status_distribution(self, latest_df: pd.DataFrame) -> Dict:
         """Calculate device status distribution from latest snapshot DataFrame."""
-        # (Implementation remains the same - already uses DataFrames)
         try:
             if latest_df.empty or 'status' not in latest_df.columns:
                 return {'normal': 0, 'warning': 0, 'critical': 0, 'offline': 0}
 
-            status_counts = latest_df['status'].value_counts().to_dict()
+            # Ensure 'status' column is treated as string and handle NaNs
+            status_counts = latest_df['status'].astype(str).fillna('unknown').value_counts().to_dict()
 
-            # Ensure all status types are present
+            # Ensure all standard status types are present
             status_distribution = {
                 'normal': status_counts.get('normal', 0),
                 'warning': status_counts.get('warning', 0),
                 'critical': status_counts.get('critical', 0),
-                'offline': status_counts.get('offline', 0)
+                'offline': status_counts.get('offline', 0),
+                'unknown': status_counts.get('unknown', 0) # Include unknown count if any NaNs existed
             }
+             # Remove unknown if count is 0
+            if status_distribution['unknown'] == 0:
+                 del status_distribution['unknown']
+
 
             return status_distribution
 
@@ -473,20 +544,20 @@ class DashboardHelper:
     def _calculate_detailed_trend(self, df: pd.DataFrame, metric: str) -> Dict:
         """
         Calculate detailed trend analysis for a specific metric using daily resampling.
-        (Implementation remains the same - already uses DataFrames)
+        Handles potential missing 'unit' column.
         """
-        # (Implementation remains the same)
-        default_trend = {'trend': 'stable', 'slope': 0.0, 'change_24h': 0.0, 'change_7d': 0.0, 'unit': '%'}
+        default_trend = {'trend': 'stable', 'slope': 0.0, 'change_24h': 0.0, 'change_7d': 0.0, 'unit': ''} # Default unit to empty string
 
         try:
-            if df.empty or metric not in df.columns or df[metric].isnull().all():
+            if df is None or df.empty or metric not in df.columns or df[metric].isnull().all():
                 self.logger.warning(f"No valid data for detailed trend on '{metric}'.")
                 return default_trend
 
             df_copy = df.dropna(subset=[metric, 'timestamp']).copy()
             # Ensure timestamp is datetime type
             if not pd.api.types.is_datetime64_any_dtype(df_copy['timestamp']):
-                 df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'])
+                 df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'], errors='coerce')
+                 df_copy.dropna(subset=['timestamp'], inplace=True)
 
             if df_copy.empty:
                 self.logger.warning(f"No valid data after dropping NaNs for trend on '{metric}'.")
@@ -497,72 +568,87 @@ class DashboardHelper:
                 self.logger.debug(f"Handling duplicate timestamps for trend on '{metric}'. Keeping last.")
                 df_copy = df_copy.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
 
+            if df_copy.empty: # Check again after potential drop_duplicates
+                 self.logger.warning(f"No data after handling duplicates for trend on '{metric}'.")
+                 return default_trend
+
             df_copy = df_copy.set_index('timestamp')
 
             # Determine appropriate resampling frequency (e.g., daily)
-            # Adjust freq based on data density if needed
             resample_freq = 'D'
-            daily_avg = df_copy[metric].resample(resample_freq).mean().dropna()
+            try:
+                # Use mean for numeric, maybe mode or first for categorical if needed later
+                 daily_avg = df_copy[metric].resample(resample_freq).mean().dropna()
+            except TypeError: # Handle non-numeric data gracefully if metric isn't number
+                 self.logger.warning(f"Metric '{metric}' is not numeric, cannot calculate trend.")
+                 return default_trend
 
 
             if len(daily_avg) < 2:
-                # Need at least two points for trend calculation
                 self.logger.warning(f"Not enough resampled data points ({len(daily_avg)}) for detailed trend on '{metric}'.")
-                # Return basic trend if possible
-                if len(daily_avg) == 1:
-                     return {'trend': 'stable', 'slope': 0.0, 'change_24h': 0.0, 'change_7d': 0.0, 'unit': '%'} # Treat single point as stable
-                else:
-                     return default_trend # No data after resampling
+                return {'trend': 'stable', 'slope': 0.0, 'change_24h': 0.0, 'change_7d': 0.0, 'unit': ''}
+
 
             # Get latest, 24h ago, and 7d ago (or first) values
             latest_val = daily_avg.iloc[-1]
-            prev_val_24h = daily_avg.iloc[-2] if len(daily_avg) >= 2 else latest_val # Fallback if only 1 day
-            # Use data from 7 days prior if available, otherwise use the first point
-            seven_days_ago = daily_avg.index[-1] - pd.Timedelta(days=7)
-            prev_val_7d_series = daily_avg[daily_avg.index <= seven_days_ago]
+            prev_val_24h = daily_avg.iloc[-2] if len(daily_avg) >= 2 else latest_val
+            seven_days_ago_ts = daily_avg.index[-1] - pd.Timedelta(days=7)
+            # Find the value closest to 7 days ago, or use the first if none exist before that
+            prev_val_7d_series = daily_avg[daily_avg.index <= seven_days_ago_ts]
             prev_val_7d = prev_val_7d_series.iloc[-1] if not prev_val_7d_series.empty else daily_avg.iloc[0]
+
 
             # Calculate changes
             change_24h = latest_val - prev_val_24h
             change_7d = latest_val - prev_val_7d
 
             # Calculate linear regression slope
-            x = np.arange(len(daily_avg))
-            slope, _, _, _, _ = stats.linregress(x, daily_avg.values)
+            slope = 0.0
+            r_value_sq = 0.0
+            if len(daily_avg) >= 2:
+                x = np.arange(len(daily_avg))
+                try:
+                    slope_val, _, r_val, _, _ = stats.linregress(x, daily_avg.values)
+                    slope = slope_val
+                    r_value_sq = r_val**2
+                except ValueError as e:
+                     self.logger.warning(f"Linregress failed for {metric}: {e}")
 
-            # Determine trend string based on normalized slope (more robust)
+
+            # Determine trend string based on normalized slope
             data_range = daily_avg.max() - daily_avg.min() if len(daily_avg) > 1 else 1.0
             normalized_slope = slope / (data_range + 1e-9) # Avoid division by zero
 
             trend_str = 'stable'
-            if normalized_slope > 0.05:  # Threshold for 'improving' (e.g., >5% change over period)
+            if normalized_slope > 0.05:
                 trend_str = 'improving'
-            elif normalized_slope < -0.05: # Threshold for 'declining'
+            elif normalized_slope < -0.05:
                 trend_str = 'declining'
 
             # Unit determination
             unit = '%'
             multiplier = 100
-            if metric == 'value' and 'unit' in df.columns: # Special case for 'value' trend
-                unit_series = df_copy['unit'].dropna() # Use df_copy to access unit after potential dropna
-                if not unit_series.empty:
-                    unit = unit_series.iloc[0]
-                    multiplier = 1 # Don't multiply raw values by 100
-                else:
-                     unit = '' # Fallback if unit column exists but is empty
-                     multiplier = 1
-            elif metric != 'health_score' and metric != 'efficiency_score':
-                 # Assume other metrics are not 0-1 scores
+            if metric == 'value': # Special case for 'value' trend
+                unit = '' # Default if 'unit' column is missing
+                if 'unit' in df_copy.columns:
+                     unit_series = df_copy['unit'].dropna()
+                     if not unit_series.empty:
+                         unit = unit_series.iloc[0]
+                multiplier = 1 # Don't multiply raw values by 100
+            elif metric not in ['health_score', 'efficiency_score']:
                  multiplier = 1
-                 unit_series = df_copy['unit'].dropna()
-                 unit = unit_series.iloc[0] if not unit_series.empty else ''
+                 unit = ''
+                 if 'unit' in df_copy.columns:
+                      unit_series = df_copy['unit'].dropna()
+                      if not unit_series.empty:
+                           unit = unit_series.iloc[0]
 
 
             return {
                 'trend': trend_str,
-                'slope': round(slope * multiplier, 3), # Apply multiplier for scores
-                'change_24h': round(change_24h * multiplier, 2), # Apply multiplier for scores
-                'change_7d': round(change_7d * multiplier, 2), # Apply multiplier for scores
+                'slope': round(slope * multiplier, 3) if not np.isnan(slope) else 0.0,
+                'change_24h': round(change_24h * multiplier, 2) if not np.isnan(change_24h) else 0.0,
+                'change_7d': round(change_7d * multiplier, 2) if not np.isnan(change_7d) else 0.0,
                 'unit': unit
             }
 
@@ -573,14 +659,13 @@ class DashboardHelper:
 
     def _calculate_trend_analysis(self, df: pd.DataFrame) -> Dict:
         """Calculate detailed trend analysis for key metrics from DataFrame."""
-        # (Implementation remains the same - already uses DataFrames)
         try:
             trends = {}
 
-            if df.empty:
+            if df is None or df.empty:
                 return {
-                    'health': self._calculate_detailed_trend(df, 'health_score'),
-                    'efficiency': self._calculate_detailed_trend(df, 'efficiency_score')
+                    'health': self._calculate_detailed_trend(pd.DataFrame(), 'health_score'),
+                    'efficiency': self._calculate_detailed_trend(pd.DataFrame(), 'efficiency_score')
                 }
 
             # Health trend
@@ -589,15 +674,17 @@ class DashboardHelper:
             # Efficiency trend
             trends['efficiency'] = self._calculate_detailed_trend(df, 'efficiency_score')
 
-            # Example: Key metric trend (e.g., Temperature)
-            # Find common device types and analyze their 'value' trend
-            common_types = df['device_type'].value_counts().head(3).index.tolist()
-            for dev_type in common_types:
-                 type_df = df[df['device_type'] == dev_type]
-                 if not type_df.empty:
-                      # Use a simplified key like 'temperature_trend' instead of 'temperature_sensor_trend'
-                      metric_key = dev_type.split('_')[0] + "_trend"
-                      trends[metric_key] = self._calculate_detailed_trend(type_df, 'value')
+            # Key metric trend (e.g., Temperature, Pressure) - analyze 'value' for common types
+            if 'device_type' in df.columns:
+                common_types = df['device_type'].dropna().value_counts().head(3).index.tolist()
+                for dev_type in common_types:
+                    type_df = df[df['device_type'] == dev_type]
+                    if not type_df.empty:
+                        # Use a simplified key like 'temperature_trend' instead of 'temperature_sensor_trend'
+                        metric_key = dev_type.split('_')[0] + "_trend"
+                        trends[metric_key] = self._calculate_detailed_trend(type_df, 'value')
+            else:
+                 self.logger.warning("Device type column not found, cannot calculate metric-specific trends.")
 
 
             return trends
@@ -609,26 +696,29 @@ class DashboardHelper:
 
     def _calculate_asset_comparisons(self, latest_df: pd.DataFrame) -> Dict:
         """Calculate multi-asset comparisons from latest snapshot DataFrame."""
-        # (Implementation remains the same - already uses DataFrames)
         try:
             comparisons = {}
-            if latest_df.empty: return comparisons
+            if latest_df is None or latest_df.empty: return comparisons
 
             # Top 5 / Bottom 5 by Health
             if 'health_score' in latest_df.columns and not latest_df['health_score'].isnull().all():
                 health_cols = ['device_id', 'device_name', 'health_score']
-                # Drop rows where health_score is NaN before nlargest/nsmallest
                 health_df_valid = latest_df.dropna(subset=['health_score'])
 
                 if not health_df_valid.empty:
-                    top_health = health_df_valid.nlargest(5, 'health_score')[health_cols].copy()
-                    top_health['health_score'] = (top_health['health_score'] * 100).round(1)
+                    # Make sure health_score is numeric before nlargest/nsmallest
+                    health_df_valid['health_score'] = pd.to_numeric(health_df_valid['health_score'], errors='coerce')
+                    health_df_valid = health_df_valid.dropna(subset=['health_score'])
 
-                    bottom_health = health_df_valid.nsmallest(5, 'health_score')[health_cols].copy()
-                    bottom_health['health_score'] = (bottom_health['health_score'] * 100).round(1)
+                    if not health_df_valid.empty:
+                        top_health = health_df_valid.nlargest(5, 'health_score')[health_cols].copy()
+                        top_health['health_score'] = (top_health['health_score'] * 100).round(1)
 
-                    comparisons['top_5_health'] = top_health.to_dict('records')
-                    comparisons['bottom_5_health'] = bottom_health.to_dict('records')
+                        bottom_health = health_df_valid.nsmallest(5, 'health_score')[health_cols].copy()
+                        bottom_health['health_score'] = (bottom_health['health_score'] * 100).round(1)
+
+                        comparisons['top_5_health'] = top_health.to_dict('records')
+                        comparisons['bottom_5_health'] = bottom_health.to_dict('records')
 
             # Top 5 / Bottom 5 by Efficiency
             if 'efficiency_score' in latest_df.columns and not latest_df['efficiency_score'].isnull().all():
@@ -636,26 +726,41 @@ class DashboardHelper:
                 eff_df_valid = latest_df.dropna(subset=['efficiency_score'])
 
                 if not eff_df_valid.empty:
-                    top_eff = eff_df_valid.nlargest(5, 'efficiency_score')[eff_cols].copy()
-                    top_eff['efficiency_score'] = (top_eff['efficiency_score'] * 100).round(1)
+                    eff_df_valid['efficiency_score'] = pd.to_numeric(eff_df_valid['efficiency_score'], errors='coerce')
+                    eff_df_valid = eff_df_valid.dropna(subset=['efficiency_score'])
 
-                    bottom_eff = eff_df_valid.nsmallest(5, 'efficiency_score')[eff_cols].copy()
-                    bottom_eff['efficiency_score'] = (bottom_eff['efficiency_score'] * 100).round(1)
+                    if not eff_df_valid.empty:
+                        top_eff = eff_df_valid.nlargest(5, 'efficiency_score')[eff_cols].copy()
+                        top_eff['efficiency_score'] = (top_eff['efficiency_score'] * 100).round(1)
 
-                    comparisons['top_5_efficiency'] = top_eff.to_dict('records')
-                    comparisons['bottom_5_efficiency'] = bottom_eff.to_dict('records')
+                        bottom_eff = eff_df_valid.nsmallest(5, 'efficiency_score')[eff_cols].copy()
+                        bottom_eff['efficiency_score'] = (bottom_eff['efficiency_score'] * 100).round(1)
+
+                        comparisons['top_5_efficiency'] = top_eff.to_dict('records')
+                        comparisons['bottom_5_efficiency'] = bottom_eff.to_dict('records')
 
             # Aggregates by Location
             if 'location' in latest_df.columns and 'health_score' in latest_df.columns:
-                health_by_loc = (latest_df.groupby('location')['health_score'].mean() * 100).round(1).dropna()
-                if not health_by_loc.empty:
-                    comparisons['health_by_location'] = health_by_loc.to_dict()
+                # Ensure health_score is numeric before grouping
+                loc_df_valid = latest_df.dropna(subset=['health_score'])
+                loc_df_valid['health_score'] = pd.to_numeric(loc_df_valid['health_score'], errors='coerce')
+                loc_df_valid = loc_df_valid.dropna(subset=['health_score'])
+
+                if not loc_df_valid.empty:
+                    health_by_loc = (loc_df_valid.groupby('location')['health_score'].mean() * 100).round(1).dropna()
+                    if not health_by_loc.empty:
+                        comparisons['health_by_location'] = health_by_loc.to_dict()
 
             # Aggregates by Device Type
             if 'device_type' in latest_df.columns and 'efficiency_score' in latest_df.columns:
-                eff_by_type = (latest_df.groupby('device_type')['efficiency_score'].mean() * 100).round(1).dropna()
-                if not eff_by_type.empty:
-                    comparisons['efficiency_by_type'] = eff_by_type.to_dict()
+                type_df_valid = latest_df.dropna(subset=['efficiency_score'])
+                type_df_valid['efficiency_score'] = pd.to_numeric(type_df_valid['efficiency_score'], errors='coerce')
+                type_df_valid = type_df_valid.dropna(subset=['efficiency_score'])
+
+                if not type_df_valid.empty:
+                    eff_by_type = (type_df_valid.groupby('device_type')['efficiency_score'].mean() * 100).round(1).dropna()
+                    if not eff_by_type.empty:
+                        comparisons['efficiency_by_type'] = eff_by_type.to_dict()
 
             return comparisons
 
@@ -663,114 +768,135 @@ class DashboardHelper:
             self.logger.error(f"Asset comparison calculation error: {e}", exc_info=True)
             return {}
 
-    # REMOVED: _get_alerts_summary - Should be passed in
-
     def _calculate_energy_metrics(self, historical_df: pd.DataFrame) -> Dict:
         """Calculate energy consumption metrics based on historical DataFrame."""
-        # (Implementation remains the same - already uses DataFrames)
         try:
+            if historical_df is None or historical_df.empty or 'device_type' not in historical_df.columns:
+                 self.logger.warning("Cannot calculate energy metrics: DataFrame empty or missing 'device_type'.")
+                 return self._get_default_energy_metrics()
+
             # Filter for power meter data
             power_df = historical_df[historical_df['device_type'] == 'power_meter'].copy()
 
             if power_df.empty:
-                # Fallback to simulated data if no power meter data
+                self.logger.info("No 'power_meter' device type found for energy metrics.")
                 return self._get_default_energy_metrics()
 
-            # Ensure timestamp is datetime
-            if 'timestamp' in power_df.columns and not pd.api.types.is_datetime64_any_dtype(power_df['timestamp']):
-                power_df['timestamp'] = pd.to_datetime(power_df['timestamp'])
+            # Ensure timestamp is datetime and value is numeric
+            if 'timestamp' not in power_df.columns:
+                 self.logger.warning("Timestamp column missing in power meter data.")
+                 return self._get_default_energy_metrics()
+
+            power_df['timestamp'] = pd.to_datetime(power_df['timestamp'], errors='coerce')
+            power_df.dropna(subset=['timestamp'], inplace=True)
+            if power_df.empty:
+                 return self._get_default_energy_metrics()
+
+
+            if 'value' not in power_df.columns:
+                self.logger.warning("Value column missing in power meter data.")
+                return self._get_default_energy_metrics()
+
+            power_df['value'] = pd.to_numeric(power_df['value'], errors='coerce')
+            power_df.dropna(subset=['value'], inplace=True)
+            if power_df.empty:
+                 return self._get_default_energy_metrics()
+
 
             # Get latest total power by summing the last reading of each power meter
             latest_power_df = power_df.sort_values('timestamp').groupby('device_id').last()
             current_power_w = latest_power_df['value'].sum()
             current_power_kw = current_power_w / 1000.0
 
-            # Calculate daily energy estimate from historical data (more accurate)
-            # Resample to hourly mean power, then sum over 24h
-            daily_energy_kwh = 0 # Default
-            if 'timestamp' in power_df.columns and len(power_df) > 1:
+            # Calculate daily energy estimate from historical data
+            daily_energy_kwh = 0.0 # Default
+            if len(power_df) > 1:
                 power_df_indexed = power_df.set_index('timestamp')
                 # Sum power across all meters at each timestamp
-                total_power_series_w = power_df_indexed.groupby(power_df_indexed.index)['value'].sum()
+                total_power_series_w = power_df_indexed.groupby(level=0)['value'].sum() # Group by index (timestamp)
                 # Resample to hourly average power in kW
                 hourly_power_kw = total_power_series_w.resample('H').mean() / 1000.0
+                hourly_power_kw.dropna(inplace=True) # Drop hours with no data
 
-                # Get the last 24 hours of data relative to the LATEST timestamp in the data
                 if not hourly_power_kw.empty:
                     last_ts = hourly_power_kw.index.max()
                     start_ts = last_ts - pd.Timedelta(hours=24)
-                    last_24h_power = hourly_power_kw[(hourly_power_kw.index > start_ts) & (hourly_power_kw.index <= last_ts)]
+                    last_24h_power = hourly_power_kw[hourly_power_kw.index > start_ts]
 
                     if not last_24h_power.empty:
-                        # Energy = Power * Time (assuming hourly samples, so time interval = 1 hour)
-                        # Summing the average hourly power gives the total kWh for the period
+                        # Energy = Sum of (Average Power in hour * 1 hour)
                         daily_energy_kwh = last_24h_power.sum()
                     else:
-                        # Fallback: estimate based on current power if not enough history
-                        daily_energy_kwh = current_power_kw * 24
+                        daily_energy_kwh = current_power_kw * 24 # Fallback estimate
                 else:
-                     daily_energy_kwh = current_power_kw * 24
+                     daily_energy_kwh = current_power_kw * 24 # Fallback estimate
             else:
-                 # Fallback estimate
-                 daily_energy_kwh = current_power_kw * 24
+                 daily_energy_kwh = current_power_kw * 24 # Fallback estimate
+
 
             monthly_cost_usd = daily_energy_kwh * 30 * 0.12 # Example cost: $0.12 per kWh
 
-            # Estimate efficiency and footprint (can be refined)
-            # Use efficiency score if available, otherwise simulate
-            avg_efficiency_series = historical_df['efficiency_score'].dropna()
-            avg_efficiency = avg_efficiency_series.mean() * 100 if not avg_efficiency_series.empty else np.random.uniform(85, 95)
+            # Use overall average efficiency score if available
+            avg_efficiency = 0.0
+            if 'efficiency_score' in historical_df.columns:
+                 avg_efficiency_series = historical_df['efficiency_score'].dropna()
+                 if not avg_efficiency_series.empty:
+                      avg_efficiency = avg_efficiency_series.mean() * 100
+
 
             return {
-                'current_power_kw': round(current_power_kw, 1),
-                'daily_energy_kwh': round(daily_energy_kwh, 1),
-                'monthly_cost_usd': round(monthly_cost_usd, 0),
-                'energy_efficiency': round(avg_efficiency, 1), # Use calculated or simulated
-                'carbon_footprint_kg': round(daily_energy_kwh * 0.4, 1)  # Example factor: 0.4 kg CO2 per kWh
+                'current_power_kw': round(current_power_kw, 1) if not np.isnan(current_power_kw) else 0.0,
+                'daily_energy_kwh': round(daily_energy_kwh, 1) if not np.isnan(daily_energy_kwh) else 0.0,
+                'monthly_cost_usd': round(monthly_cost_usd, 0) if not np.isnan(monthly_cost_usd) else 0.0,
+                'energy_efficiency': round(avg_efficiency, 1) if not np.isnan(avg_efficiency) else 0.0,
+                'carbon_footprint_kg': round(daily_energy_kwh * 0.4, 1) if not np.isnan(daily_energy_kwh) else 0.0 # Example factor
             }
 
         except Exception as e:
             self.logger.error(f"Energy metrics calculation error: {e}", exc_info=True)
             return self._get_default_energy_metrics()
 
+
     def _get_default_energy_metrics(self) -> Dict:
         """Get default energy metrics when no data is available."""
-        # (Implementation remains the same)
         return {
-            'current_power_kw': 125.0, # Adjusted default
-            'daily_energy_kwh': 3000.0, # Adjusted default
-            'monthly_cost_usd': 360.0, # Adjusted default
-            'energy_efficiency': 88.5,
-            'carbon_footprint_kg': 1200.0 # Adjusted default
+            'current_power_kw': 0.0,
+            'daily_energy_kwh': 0.0,
+            'monthly_cost_usd': 0.0,
+            'energy_efficiency': 0.0,
+            'carbon_footprint_kg': 0.0
         }
-
-    # REMOVED: _fetch_energy_data - Integrated into _calculate_energy_metrics
 
     def _get_default_overview(self) -> Dict:
         """Get default dashboard overview when no data is available."""
-        # (Implementation remains the same)
         return {
-            'timestamp': datetime.now().isoformat(),
-            'system_metrics': {'total_devices': 0, 'active_devices': 0, 'uptime': 0.0},
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'system_metrics': self._calculate_system_metrics(pd.DataFrame(), pd.DataFrame()),
             'device_metrics': {},
             'health_metrics': self._get_default_health_metrics(),
             'performance_metrics': self._get_default_performance_metrics(),
             'status_distribution': {'normal': 0, 'warning': 0, 'critical': 0, 'offline': 0},
             'trend_analysis': {'health': {'trend': 'stable'}, 'efficiency': {'trend': 'stable'}},
             'asset_comparisons': {},
-            'alerts_summary': {'total_alerts': 0, 'critical_alerts': 0}, # Keep alerts structure
+            'alerts_summary': {'total_alerts': 0, 'critical_alerts': 0, 'warning_alerts': 0, 'info_alerts': 0},
             'energy_metrics': self._get_default_energy_metrics()
         }
 
-
-    # --- Chart preparation methods remain the same, operating on DataFrames ---
-    # (No changes needed for _prepare_line_chart_data, _prepare_bar_chart_data, etc.)
-    # ... (rest of the chart methods like _prepare_pie_chart_data_from_counts) ...
     def _prepare_pie_chart_data_from_counts(self, counts: Dict[str, int]) -> Dict:
         """Prepares data suitable for a pie chart from a counts dictionary."""
+        # Ensure counts is a dict
+        if not isinstance(counts, dict):
+            self.logger.warning("Invalid input for pie chart counts, expected dict.")
+            return {'labels': [], 'datasets': []}
+
         labels = list(counts.keys())
         values = list(counts.values())
-        colors = [self.color_schemes['status'].get(label, '#bdc3c7') for label in labels] # Use status colors
+        # Make sure values are numbers
+        values = [v if isinstance(v, (int, float)) else 0 for v in values]
+
+        # Use status colors if labels match, otherwise default
+        colors = [self.color_schemes['status'].get(label, self.color_schemes['primary'][i % len(self.color_schemes['primary'])])
+                  for i, label in enumerate(labels)]
 
         return {
             'labels': labels,
@@ -781,7 +907,6 @@ class DashboardHelper:
             }]
         }
 
-    # Added prepare_chart_data from example usage for completeness
     def prepare_chart_data(self, chart_type: str, time_range: str = '24h', device_id: Optional[str] = None, data_df: Optional[pd.DataFrame] = None) -> Dict:
         """
         Prepares data for various chart types based on input DataFrame or generates sample data.
@@ -790,58 +915,103 @@ class DashboardHelper:
         """
         self.logger.info(f"Preparing chart data: type={chart_type}, range={time_range}, device={device_id}")
 
-        if data_df is None:
-            # Fallback to internal generator ONLY if no data provided
-            self.logger.warning("No DataFrame provided to prepare_chart_data. Using internal demo generator.")
-            if device_id:
-                # Generate sample historical for a specific device
-                hours = {'1h': 1, '4h': 4, '24h': 24, '7d': 7*24, '30d': 30*24}.get(time_range, 24)
-                sample_records = self._generate_sample_historical_data(device_id, hours)
-                data_df = pd.DataFrame(sample_records)
-            else:
-                 # Generate sample overview data
-                 sample_records = self._generate_sample_device_data()
-                 data_df = pd.DataFrame(sample_records)
-                 # Filter by time range roughly
-                 cutoff = datetime.now() - timedelta(days={'1h': 1/24, '4h': 4/24, '24h': 1, '7d': 7, '30d': 30}.get(time_range, 1))
-                 data_df['timestamp'] = pd.to_datetime(data_df['timestamp'])
-                 data_df = data_df[data_df['timestamp'] >= cutoff]
+        if data_df is None or data_df.empty:
+            self.logger.warning("No DataFrame provided or empty for prepare_chart_data. Cannot generate chart.")
+            # Avoid using internal generator, return error/empty structure
+            return {'error': 'No data available to generate chart', 'labels': [], 'datasets': []}
 
 
-        if data_df.empty:
-            return {'error': 'No data available to generate chart'}
+        # Make a copy to avoid modifying original
+        data_df = data_df.copy()
 
-        # Ensure timestamp is datetime
-        if 'timestamp' in data_df.columns and not pd.api.types.is_datetime64_any_dtype(data_df['timestamp']):
-            data_df['timestamp'] = pd.to_datetime(data_df['timestamp'])
+        # Ensure timestamp is datetime and handle errors
+        if 'timestamp' in data_df.columns:
+             try:
+                 data_df['timestamp'] = pd.to_datetime(data_df['timestamp'], errors='coerce')
+                 data_df.dropna(subset=['timestamp'], inplace=True)
+                 if data_df.empty:
+                      self.logger.warning("DataFrame empty after timestamp conversion/dropna in prepare_chart_data.")
+                      return {'error': 'No valid time data available', 'labels': [], 'datasets': []}
+             except Exception as e:
+                  self.logger.error(f"Error handling timestamp in prepare_chart_data: {e}", exc_info=True)
+                  return {'error': 'Invalid time data format', 'labels': [], 'datasets': []}
+        else:
+             self.logger.warning("Timestamp column missing for chart preparation.")
+             # Charts requiring time axis might fail or produce unexpected results
+
 
         try:
             if chart_type == 'line':
+                # Pass only the relevant time range if possible (more efficient if done earlier)
+                # cutoff = datetime.now(timezone.utc) - timedelta(days={'1h': 1/24, '4h': 4/24, '24h': 1, '7d': 7, '30d': 30}.get(time_range, 1))
+                # data_df = data_df[data_df['timestamp'] >= cutoff]
                 return self._prepare_line_chart_data(data_df, device_id)
-            # Add other chart types like 'bar', 'pie' based on needs
             elif chart_type == 'pie': # Example: Use status distribution
+                 # Pie chart represents the LATEST status, not historical distribution
+                 if data_df.empty: return {'labels': [], 'datasets': []}
                  latest_df = data_df.sort_values('timestamp').groupby('device_id').last().reset_index()
-                 status_counts = latest_df['status'].value_counts().to_dict()
+                 status_counts = self._calculate_status_distribution(latest_df) # Use helper
                  return self._prepare_pie_chart_data_from_counts(status_counts)
+            elif chart_type == 'bar': # Example: Average health per device type
+                if data_df.empty: return {'labels': [], 'datasets': []}
+                # Use latest values for bar chart comparison
+                latest_df = data_df.sort_values('timestamp').groupby('device_id').last().reset_index()
+                return self._prepare_bar_chart_data_grouped(latest_df, group_by_col='device_type', value_col='health_score')
+
             else:
+                self.logger.warning(f"Unsupported chart type requested: {chart_type}")
                 return {'error': f'Unsupported chart type: {chart_type}'}
         except Exception as e:
             self.logger.error(f"Chart preparation error for {chart_type}: {e}", exc_info=True)
-            return {'error': str(e)}
+            return {'error': f'Failed to prepare chart: {str(e)}'}
+
 
     def _prepare_line_chart_data(self, df: pd.DataFrame, device_id: Optional[str] = None) -> Dict:
         """Prepares data for a line chart (e.g., value over time)."""
-        df_filtered = df if device_id is None else df[df['device_id'] == device_id]
+        target_col = 'value' # Could be configurable, e.g., health_score
 
-        if df_filtered.empty:
+        if device_id:
+            df_filtered = df[df['device_id'] == device_id].copy()
+            label_prefix = device_id
+        else:
+            # Aggregate if no specific device is selected
+            if 'timestamp' not in df.columns:
+                 self.logger.warning("Timestamp column missing for aggregation.")
+                 return {'labels': [], 'datasets': []}
+            # Resample to hourly mean if data spans multiple days, else use raw points
+            time_span_days = (df['timestamp'].max() - df['timestamp'].min()).days if not df.empty else 0
+            if time_span_days > 2:
+                 df_filtered = df.set_index('timestamp')[target_col].resample('H').mean().reset_index()
+                 df_filtered.dropna(subset=[target_col], inplace=True) # Drop hours with no avg
+                 label_prefix = f"Average {target_col}"
+            else:
+                 # For shorter periods, maybe plot individual devices or just use raw points averaged?
+                 # Let's average raw points per timestamp for simplicity
+                 df_filtered = df.groupby('timestamp')[target_col].mean().reset_index()
+                 label_prefix = f"Average {target_col}"
+
+
+        if df_filtered.empty or target_col not in df_filtered.columns:
             return {'labels': [], 'datasets': []}
 
         df_sorted = df_filtered.sort_values('timestamp')
 
-        labels = df_sorted['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
-        values = df_sorted['value'].tolist()
-        unit = df_sorted['unit'].iloc[0] if not df_sorted['unit'].empty else ''
-        label_text = f"{device_id} Value ({unit})" if device_id else f"Average Value ({unit})"
+        # Format labels clearly
+        time_format = '%H:%M' if time_span_days <= 1 else '%m-%d %H:%M'
+        labels = df_sorted['timestamp'].dt.strftime(time_format).tolist()
+        values = df_sorted[target_col].round(2).tolist() # Round values
+
+        # Determine Unit - tricky if aggregated, get from original df if possible
+        unit = ''
+        if device_id and 'unit' in df.columns:
+             unit_val = df.loc[df['device_id'] == device_id, 'unit'].iloc[0]
+             unit = str(unit_val) if pd.notna(unit_val) else ''
+        elif 'unit' in df.columns: # Get common unit if aggregating
+             common_unit = df['unit'].mode()
+             unit = common_unit[0] if not common_unit.empty else ''
+
+
+        label_text = f"{label_prefix} ({unit})" if unit else label_prefix
 
         return {
             'labels': labels,
@@ -849,99 +1019,136 @@ class DashboardHelper:
                 'label': label_text,
                 'data': values,
                 'borderColor': self.color_schemes['primary'][0],
-                'tension': 0.1
+                'tension': 0.1,
+                'pointRadius': 2 # Smaller points
+            }]
+        }
+
+    def _prepare_bar_chart_data_grouped(self, df: pd.DataFrame, group_by_col: str, value_col: str) -> Dict:
+        """Prepares data for a grouped bar chart."""
+        if df.empty or group_by_col not in df.columns or value_col not in df.columns:
+            return {'labels': [], 'datasets': []}
+
+        # Ensure value col is numeric, group by category, calculate mean
+        df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
+        grouped_data = df.groupby(group_by_col)[value_col].mean().dropna()
+
+        if grouped_data.empty:
+            return {'labels': [], 'datasets': []}
+
+        # Apply multiplier if it's a score
+        multiplier = 100 if '_score' in value_col else 1
+        values = (grouped_data * multiplier).round(1).tolist()
+        labels = grouped_data.index.tolist()
+
+        return {
+            'labels': labels,
+            'datasets': [{
+                'label': f'Average {value_col.replace("_", " ").title()}',
+                'data': values,
+                'backgroundColor': self.color_schemes['primary'][:len(labels)] # Use multiple colors
             }]
         }
 
 
-    # --- Real-time updates remain the same, operating on DataFrames ---
-    # (No changes needed for get_realtime_updates, _get_metric_with_delta, etc.)
-    # ... (rest of real-time update methods) ...
-
-    # --- Device summary needs modification to accept DataFrame input ---
-
     def get_device_summary(self, device_id: str, historical_df: pd.DataFrame, alerts: List[Dict], recommendations: List[Dict]) -> Dict:
         """
         Get comprehensive summary for a specific device based on provided data.
-
-        Args:
-            device_id: Device identifier.
-            historical_df: DataFrame with historical data for the specific device (e.g., last 7 days).
-            alerts: List of alerts specific to this device.
-            recommendations: List of recommendations specific to this device.
-
-        Returns:
-            Device summary data dictionary.
+        Ensures timestamps are ISO strings.
         """
         try:
-            if historical_df.empty:
+            if historical_df is None or historical_df.empty:
                 return {'error': f'No historical data provided for device {device_id}'}
 
-            # Ensure timestamp is datetime
-            if 'timestamp' in historical_df.columns and not pd.api.types.is_datetime64_any_dtype(historical_df['timestamp']):
-                 historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
+            # Make a copy
+            historical_df = historical_df.copy()
+
+            # Ensure timestamp is datetime and handle errors
+            if 'timestamp' in historical_df.columns:
+                historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'], errors='coerce')
+                historical_df.dropna(subset=['timestamp'], inplace=True)
+                if historical_df.empty:
+                     return {'error': f'No valid time data for device {device_id}'}
+            else:
+                 return {'error': f'Timestamp column missing for device {device_id}'}
+
 
             # Get the latest data point for current metrics
-            device = historical_df.sort_values('timestamp').iloc[-1].to_dict()
+            # Use last() which is slightly safer if index isn't perfectly sequential
+            device_latest_series = historical_df.sort_values('timestamp').iloc[-1]
+            device = device_latest_series.to_dict()
+
+            # Safely get metrics, providing defaults
+            current_metrics = {
+                'value': round(device.get('value', 0.0), self.aggregation_config.get(device.get('device_type', '').split('_')[0], {}).get('precision', 2)),
+                'unit': device.get('unit', ''),
+                'health_score': round(device.get('health_score', 0.0) * 100, 1),
+                'efficiency_score': round(device.get('efficiency_score', 0.0) * 100, 1),
+                'operating_hours': round(device.get('operating_hours', 0.0)),
+                'days_since_maintenance': int(device.get('days_since_maintenance', 0))
+            }
+
 
             summary = {
                 'device_id': device_id,
-                'device_name': device.get('device_name', ''),
-                'device_type': device.get('device_type', ''),
-                'location': device.get('location', ''),
+                'device_name': device.get('device_name', 'Unknown Name'),
+                'device_type': device.get('device_type', 'unknown_type'),
+                'location': device.get('location', 'Unknown Location'),
                 'status': device.get('status', 'unknown'),
-                'current_metrics': {
-                    'value': device.get('value', 0),
-                    'unit': device.get('unit', ''),
-                    'health_score': round(device.get('health_score', 0) * 100, 1),
-                    'efficiency_score': round(device.get('efficiency_score', 0) * 100, 1),
-                    'operating_hours': round(device.get('operating_hours', 0)),
-                    'days_since_maintenance': int(device.get('days_since_maintenance', 0))
-                },
+                'current_metrics': current_metrics,
                 'trends': self._calculate_device_trends(historical_df), # Use full history for trends
                 'alerts': alerts, # Pass through provided alerts
                 'recommendations': recommendations, # Pass through provided recommendations
-                'last_updated': device.get('timestamp', datetime.now().isoformat())
-            }
-            # Ensure last_updated is string
-            if isinstance(summary['last_updated'], (datetime, pd.Timestamp)):
-                 summary['last_updated'] = summary['last_updated'].isoformat()
+                # Ensure last_updated is ISO string
+                'last_updated': device_latest_series['timestamp'].isoformat() if pd.notna(device_latest_series['timestamp']) else datetime.now(timezone.utc).isoformat()
 
+            }
 
             return summary
 
+        except IndexError: # Handles case where iloc[-1] fails on empty df after filtering
+             return {'error': f'No data found for device {device_id} after processing'}
         except Exception as e:
             self.logger.error(f"Device summary error for {device_id} using DataFrame: {e}", exc_info=True)
-            return {'error': str(e)}
+            return {'error': f'Failed to generate summary for {device_id}: {str(e)}'}
 
-    # REMOVED: _get_device_historical_data - Data should be fetched via SQLAlchemy
 
-    # Kept for fallback/demo
     def _generate_sample_historical_data(self, device_id: str, hours: int) -> List[Dict]:
         """Generate sample historical data for demonstration."""
-        # (Implementation remains the same)
         try:
             data = []
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             base_health = np.random.uniform(0.6, 0.95)
             health_trend = np.random.uniform(-0.001, 0.0005) # Slight trend
 
             for i in range(hours):
                 timestamp = now - timedelta(hours=hours-1-i)
 
-                # Generate realistic pattern
-                base_value = 25 + 5 * np.sin(i * 0.1)  # Daily temperature pattern
+                # Generate realistic pattern (e.g., sine wave + noise)
+                # Adjust based on likely device type if known, otherwise generic
+                is_temp = 'temp' in device_id.lower()
+                base_value = 25 + (10 * np.sin(i * 2 * np.pi / 24)) if is_temp else 50 + 10*np.random.rand()
                 noise = np.random.normal(0, 1)
 
+                value = base_value + noise
+                unit = '°C' if is_temp else 'units'
+
                 current_health = max(0.2, min(1.0, base_health + health_trend * i))
+                current_efficiency = max(0.3, min(1.0, current_health - np.random.uniform(0.05, 0.1)))
+
+                status = 'normal'
+                if current_health < 0.6: status = 'critical'
+                elif current_health < 0.75: status = 'warning'
+
 
                 data.append({
                     'device_id': device_id,
                     'timestamp': timestamp.isoformat(),
-                    'value': round(base_value + noise, 2),
+                    'value': round(value, 2),
+                    'unit': unit, # Include unit
                     'health_score': current_health,
-                    'efficiency_score': max(0.3, min(1.0, current_health - np.random.uniform(0.05, 0.1))),
-                    'status': np.random.choice(['normal', 'warning'], p=[0.9, 0.1]) if current_health > 0.6 else 'critical',
+                    'efficiency_score': current_efficiency,
+                    'status': status,
                     'operating_hours': 1000 + i, # Example
                     'days_since_maintenance': 30 + i // 24 # Example
                 })
@@ -949,233 +1156,112 @@ class DashboardHelper:
             return data
 
         except Exception as e:
-            self.logger.error(f"Sample historical data generation error: {e}")
+            self.logger.error(f"Sample historical data generation error for {device_id}: {e}")
             return []
 
 
     def _calculate_device_trends(self, historical_df: pd.DataFrame) -> Dict:
         """Calculate trends for a single device's metrics from DataFrame."""
-        # (Implementation remains the same - already uses DataFrames)
         try:
-            if historical_df.empty:
+            if historical_df is None or historical_df.empty:
                 return {'health': 'stable', 'efficiency': 'stable', 'value': 'stable'}
 
             trends = {}
 
+            # Calculate trends only if columns exist and have enough data
             for metric in ['health_score', 'efficiency_score', 'value']:
-                if metric in historical_df.columns:
-                    # Use the robust trend calculation method
+                trend_key = metric.replace('_score', '') # Simplified key
+                if metric in historical_df.columns and len(historical_df[metric].dropna()) >= 3:
                     trend_details = self._calculate_detailed_trend(historical_df, metric)
-                    # Extract only the trend direction string
-                    trends[metric.replace('_score', '')] = trend_details.get('trend', 'stable')
+                    trends[trend_key] = trend_details.get('trend', 'stable')
+                else:
+                    trends[trend_key] = 'unknown' # Indicate insufficient data
+
 
             return trends
 
         except Exception as e:
             self.logger.error(f"Device trends calculation error: {e}", exc_info=True)
-            return {'health': 'stable', 'efficiency': 'stable', 'value': 'stable'}
+            # Return default trends on error
+            return {'health': 'unknown', 'efficiency': 'unknown', 'value': 'unknown'}
 
-
-    # REMOVED: _get_device_alerts - Should be passed in
-    # REMOVED: _get_device_recommendations - Should be passed in
-
-    # --- Export methods remain the same, but input data source changes ---
 
     def export_dashboard_data(self, overview_data: Dict, latest_devices_df: pd.DataFrame, historical_df: Optional[pd.DataFrame] = None, format_type: str = 'json') -> Dict:
         """
         Export dashboard data (overview, latest devices, optional history) in specified format.
-
-        Args:
-            overview_data: The dictionary returned by get_dashboard_overview.
-            latest_devices_df: DataFrame of the latest data for each device.
-            historical_df: Optional DataFrame of historical data used for the overview.
-            format_type: Export format ('json', 'csv', 'excel').
-
-        Returns:
-            Dictionary with export path or error.
+        Ensures DataFrames are handled correctly, including timestamps.
         """
         try:
             self.logger.info(f"Exporting dashboard data in {format_type} format from provided data")
 
+            # Prepare DataFrames for export (handle potential NaNs and timestamps)
+            latest_devices_export_df = latest_devices_df.copy() if latest_devices_df is not None else pd.DataFrame()
+            historical_export_df = historical_df.copy() if historical_df is not None else pd.DataFrame()
+
+            # Convert timestamps to ISO strings for export consistency
+            for df in [latest_devices_export_df, historical_export_df]:
+                if 'timestamp' in df.columns and pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+                     df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%SZ') # Use ISO 8601 format
+
+            # Prepare main export dictionary
             export_data = {
-                'export_timestamp': datetime.now().isoformat(),
-                'overview': overview_data,
-                'latest_devices': latest_devices_df.to_dict('records') if not latest_devices_df.empty else []
+                'export_timestamp': datetime.now(timezone.utc).isoformat(),
+                'overview': overview_data if overview_data else {},
+                'latest_devices': latest_devices_export_df.to_dict('records') if not latest_devices_export_df.empty else []
             }
 
-            if historical_df is not None and not historical_df.empty:
-                # Ensure timestamp is string for JSON/CSV compatibility if needed
-                historical_df_export = historical_df.copy() # Avoid modifying original
-                if 'timestamp' in historical_df_export.columns and pd.api.types.is_datetime64_any_dtype(historical_df_export['timestamp']):
-                     historical_df_export['timestamp'] = historical_df_export['timestamp'].dt.isoformat()
-
-                export_data['historical_data'] = historical_df_export.to_dict('records')
+            if not historical_export_df.empty:
+                export_data['historical_data'] = historical_export_df.to_dict('records')
 
 
-            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+            timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
             base_filename = f"dashboard_export_{timestamp_str}"
+            export_path_base = self.cache_path / base_filename # Use cache path as base
 
             if format_type == 'json':
-                export_path = self.cache_path / f"{base_filename}.json"
-                with open(export_path, 'w') as f:
+                export_path = export_path_base.with_suffix('.json')
+                with open(export_path, 'w', encoding='utf-8') as f: # Specify encoding
+                    # Use default=str to handle potential non-serializable types like Timestamps if conversion failed
                     json.dump(export_data, f, indent=2, default=str)
                 return {'export_path': str(export_path), 'format': 'json'}
 
             elif format_type == 'csv':
                 # Export latest devices to CSV
-                export_path = self.cache_path / f"{base_filename}_latest_devices.csv"
-                latest_devices_df.to_csv(export_path, index=False, date_format='%Y-%m-%dT%H:%M:%SZ')
-                export_paths = {'latest_devices': str(export_path)}
+                export_path_latest = export_path_base.with_name(f"{base_filename}_latest_devices.csv")
+                latest_devices_export_df.to_csv(export_path_latest, index=False, date_format='%Y-%m-%dT%H:%M:%SZ')
+                export_paths = {'latest_devices': str(export_path_latest)}
 
                 # Optionally export historical data to a separate CSV
-                if historical_df is not None and not historical_df.empty:
-                    # Use the same export_df as JSON for consistent timestamp formatting
-                    hist_export_path = self.cache_path / f"{base_filename}_historical.csv"
-                    historical_df_export.to_csv(hist_export_path, index=False, date_format='%Y-%m-%dT%H:%M:%SZ')
+                if not historical_export_df.empty:
+                    hist_export_path = export_path_base.with_name(f"{base_filename}_historical.csv")
+                    historical_export_df.to_csv(hist_export_path, index=False, date_format='%Y-%m-%dT%H:%M:%SZ')
                     export_paths['historical_data'] = str(hist_export_path)
 
                 return {'export_paths': export_paths, 'format': 'csv'}
 
-            # Add 'excel' format if needed using pandas ExcelWriter
             elif format_type == 'excel':
-                export_path = self.cache_path / f"{base_filename}.xlsx"
-                with pd.ExcelWriter(export_path, engine='xlsxwriter',
-                                    datetime_format='yyyy-mm-dd hh:mm:ss',
-                                    date_format='yyyy-mm-dd') as writer:
-                    latest_devices_df.to_excel(writer, sheet_name='Latest Devices', index=False)
-                    if historical_df is not None and not historical_df.empty:
-                        # Use export_df for consistent timestamp formatting if exists
-                        (historical_df_export if 'historical_df_export' in locals() else historical_df).to_excel(writer, sheet_name='Historical Data', index=False)
-                return {'export_path': str(export_path), 'format': 'excel'}
+                export_path = export_path_base.with_suffix('.xlsx')
+                try:
+                    with pd.ExcelWriter(export_path, engine='xlsxwriter',
+                                        datetime_format='yyyy-mm-dd hh:mm:ss',
+                                        date_format='yyyy-mm-dd') as writer:
+                        if not latest_devices_export_df.empty:
+                           latest_devices_export_df.to_excel(writer, sheet_name='Latest Devices', index=False)
+                        if not historical_export_df.empty:
+                           historical_export_df.to_excel(writer, sheet_name='Historical Data', index=False)
+                    return {'export_path': str(export_path), 'format': 'excel'}
+                except ImportError:
+                    self.logger.error("Excel export failed: 'xlsxwriter' library not installed. pip install xlsxwriter")
+                    return {'error': "Excel export requires the 'xlsxwriter' library."}
+                except Exception as ex_err:
+                     self.logger.error(f"Excel export failed during writing: {ex_err}", exc_info=True)
+                     return {'error': f"Failed to write Excel file: {str(ex_err)}"}
 
 
             else:
+                self.logger.warning(f"Unsupported export format requested: {format_type}")
                 return {'error': f'Unsupported export format: {format_type}'}
 
         except Exception as e:
             self.logger.error(f"Dashboard data export error: {e}", exc_info=True)
-            return {'error': str(e)}
-
-    # REMOVED: _get_all_historical_data - Data should be fetched via SQLAlchemy
-
-    # --- Cache methods remain conceptually similar ---
-    # ... (clear_cache, get_cache_statistics) ...
-
-
-# Example usage adjusted for DataFrame input
-if __name__ == "__main__":
-    # Initialize dashboard helper
-    dashboard = DashboardHelper()
-
-    print("=== DIGITAL TWIN DASHBOARD HELPER DEMO (v2.0 - DataFrame Input) ===\n")
-
-    # 1. Generate sample data (simulating data fetched from DB)
-    print("1. Generating sample historical DataFrame (simulating DB fetch)...")
-    # Use the helper's generator for demo purposes
-    sample_records = dashboard._generate_sample_device_data() # Generates ~200 records over 7 days
-    historical_df = pd.DataFrame(sample_records)
-    if not historical_df.empty:
-        historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
-        print(f"Generated DataFrame with {len(historical_df)} records.")
-    else:
-        print("Failed to generate sample data.")
-        sys.exit(1) # Use sys.exit
-
-
-    # 2. Get dashboard overview using the DataFrame
-    print("\n2. Getting dashboard overview (using DataFrame)...")
-    # Simulate alerts summary
-    alerts_summary_demo = {
-        'total_alerts': 8, 'critical_alerts': 1, 'warning_alerts': 4, 'info_alerts': 3
-    }
-    overview = dashboard.get_dashboard_overview(historical_df, alerts_summary_demo)
-
-    # Print summary parts (same as before)
-    print(f"System Metrics:")
-    system_metrics = overview.get('system_metrics', {})
-    print(f"  - Total Devices: {system_metrics.get('total_devices', 0)}")
-    print(f"  - Active Devices: {system_metrics.get('active_devices', 0)}")
-    # ... (print other overview sections as before) ...
-    print(f"\nHealth Metrics:")
-    health_metrics = overview.get('health_metrics', {})
-    print(f"  - Average Health: {health_metrics.get('average_health', 0)}%")
-    print(f"  - Health Trend: {health_metrics.get('health_trend', 'stable')}")
-
-
-    # 3. Test chart data preparation (these methods might need adjustment based on how data is passed)
-    print("\n" + "="*50)
-    print("3. Testing chart data preparation (using generated overview data)...")
-    # Example: Pie chart using status distribution from overview
-    status_dist = overview.get('status_distribution', {})
-    if status_dist:
-         pie_chart_data = dashboard._prepare_pie_chart_data_from_counts(status_dist)
-         print(f"✓ Pie Chart prepared from overview status counts.")
-    else:
-         print(f"✗ Could not prepare Pie chart (no status distribution in overview).")
-
-    # Example: Prepare line chart data (needs refinement - how to pass specific device history?)
-    # For demo, we might call the internal generator
-    line_chart = dashboard.prepare_chart_data('line', time_range='7d') # Uses internal generator for demo
-    print(f"✓ Line Chart prepared (using internal demo generator).")
-
-
-    # 4. Test device summary using DataFrame subset
-    print("\n" + "="*50)
-    print("4. Testing device summary (using DataFrame subset)...")
-    device_id_to_test = 'DEVICE_001'
-    device_historical_df = historical_df[historical_df['device_id'] == device_id_to_test]
-
-    if not device_historical_df.empty:
-        # Simulate alerts and recommendations for the device
-        device_alerts_demo = [{'title': 'Sample Alert', 'severity': 'warning'}]
-        device_recs_demo = [{'action': 'Perform routine check'}]
-
-        device_summary = dashboard.get_device_summary(
-            device_id_to_test,
-            device_historical_df,
-            device_alerts_demo,
-            device_recs_demo
-        )
-
-        if 'error' not in device_summary:
-            print(f"Device: {device_summary.get('device_name', 'Unknown')}")
-            print(f"Status: {device_summary.get('status', 'Unknown')}")
-            current_metrics = device_summary.get('current_metrics', {})
-            print(f"Health Score: {current_metrics.get('health_score', 0)}%")
-            trends = device_summary.get('trends', {})
-            print(f"Trends: Health={trends.get('health', 'stable')}")
-            print(f"Alerts: {len(device_summary.get('alerts', []))}")
-            print(f"Recommendations: {len(device_summary.get('recommendations', []))}")
-        else:
-            print(f"✗ Device Summary Error: {device_summary['error']}")
-    else:
-         print(f"✗ Cannot test device summary: No data found for {device_id_to_test}")
-
-
-    # 5. Test data export using generated data
-    print("\n" + "="*50)
-    print("5. Testing data export (using generated overview and latest data)...")
-    latest_devices_df = historical_df.sort_values('timestamp').groupby('device_id').last().reset_index()
-
-    # JSON Export
-    json_export = dashboard.export_dashboard_data(overview, latest_devices_df, historical_df, format_type='json')
-    if 'error' not in json_export:
-        print(f"✓ JSON Export: {json_export.get('export_path', 'Unknown path')}")
-    else:
-        print(f"✗ JSON Export Error: {json_export['error']}")
-
-    # CSV Export
-    csv_export = dashboard.export_dashboard_data(overview, latest_devices_df, historical_df, format_type='csv')
-    if 'error' not in csv_export:
-        print(f"✓ CSV Export: {csv_export.get('export_paths', 'Unknown paths')}")
-    else:
-        print(f"✗ CSV Export Error: {csv_export['error']}")
-
-    # Excel Export
-    excel_export = dashboard.export_dashboard_data(overview, latest_devices_df, historical_df, format_type='excel')
-    if 'error' not in excel_export:
-        print(f"✓ Excel Export: {excel_export.get('export_path', 'Unknown path')}")
-    else:
-        print(f"✗ Excel Export Error: {excel_export['error']}")
-
-    print("\n=== DEMO COMPLETED (v2.0) ===")
+            return {'error': f'An unexpected error occurred during export: {str(e)}'}

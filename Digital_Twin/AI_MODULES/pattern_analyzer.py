@@ -10,13 +10,13 @@ from collections import defaultdict, deque
 import warnings
 warnings.filterwarnings('ignore')
 
-# Scientific computing
+# Scientific computing libraries for signal processing, stats, clustering, etc.
 from scipy import signal, stats, fft
 from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
 from scipy.spatial.distance import pdist, squareform
 from scipy.optimize import curve_fit
 
-# Machine Learning
+# Machine Learning libraries for preprocessing, dimensionality reduction, clustering, etc.
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.decomposition import PCA, FastICA
 from sklearn.manifold import TSNE
@@ -25,7 +25,7 @@ from sklearn.metrics import silhouette_score
 from sklearn.feature_selection import mutual_info_regression
 from sklearn.ensemble import IsolationForest
 
-# Time series analysis
+# Time series analysis libraries
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import acf, pacf, adfuller
 from statsmodels.tsa.seasonal import seasonal_decompose
@@ -33,40 +33,85 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 
 # --- Aggregation Helper Functions for Feature Extraction ---
 
-def _pa_agg_slope(series):
-    """(Helper) Calculate linear trend slope."""
+def _pa_agg_slope(series: pd.Series) -> float:
+    """
+    (Helper) Calculate the slope of the linear trend for a given series.
+
+    Args:
+        series (pd.Series): Input time series data.
+
+    Returns:
+        float: The calculated slope of the linear trend. Returns 0.0 if calculation fails or not enough data.
+    """
+    # Check if there are enough data points for trend calculation
     if len(series) < 2:
         return 0.0
     try:
+        # Drop missing values
         series = series.dropna()
         if len(series) < 2:
             return 0.0
+        # Create x-axis values (indices)
         x = np.arange(len(series))
+        # Fit a linear polynomial (degree 1)
         coeffs = np.polyfit(x, series.values, 1)
+        # Return the slope (first coefficient)
         return float(coeffs[0])
     except (np.linalg.LinAlgError, ValueError):
+        # Handle potential errors during polyfit
         return 0.0
 
-def _pa_agg_autocorr(series):
-    """(Helper) Calculate lag-1 autocorrelation."""
+def _pa_agg_autocorr(series: pd.Series) -> float:
+    """
+    (Helper) Calculate the lag-1 autocorrelation of a series.
+
+    Args:
+        series (pd.Series): Input time series data.
+
+    Returns:
+        float: The lag-1 autocorrelation coefficient. Returns 0.0 if calculation fails or not enough data.
+    """
+    # Check for sufficient data points
     if len(series) < 2:
         return 0.0
+    # Calculate autocorrelation for lag 1
     val = series.dropna().autocorr(lag=1)
+    # Return the value or 0.0 if it's NaN
     return float(val) if pd.notna(val) else 0.0
 
-def _pa_agg_cv(series):
-    """(Helper) Calculate coefficient of variation."""
+def _pa_agg_cv(series: pd.Series) -> float:
+    """
+    (Helper) Calculate the coefficient of variation (std / mean).
+
+    Args:
+        series (pd.Series): Input time series data.
+
+    Returns:
+        float: The coefficient of variation. Returns 0.0 if mean is zero or calculation fails.
+    """
     mean = series.mean()
     std = series.std()
+    # Check for NaN or zero mean to avoid division errors
     if pd.isna(mean) or pd.isna(std) or mean == 0:
         return 0.0
+    # Calculate CV
     return float(std / mean)
 
-def _pa_agg_entropy(series):
-    """(Helper) Calculate entropy of a categorical series."""
+def _pa_agg_entropy(series: pd.Series) -> float:
+    """
+    (Helper) Calculate the Shannon entropy of a categorical series.
+
+    Args:
+        series (pd.Series): Input categorical data.
+
+    Returns:
+        float: The calculated entropy. Returns 0.0 for empty series.
+    """
     if series.empty:
         return 0.0
+    # Calculate probability distribution of categories
     probs = series.dropna().value_counts(normalize=True)
+    # Calculate entropy
     return float(stats.entropy(probs))
 
 # --- End Helper Functions ---
@@ -75,277 +120,334 @@ def _pa_agg_entropy(series):
 class PatternAnalyzer:
     """
     Advanced pattern analysis system for Digital Twin applications.
-    Detects temporal patterns, spatial relationships, behavioral patterns,
-    and system-level correlations in industrial IoT data.
+    Detects temporal patterns (cycles, seasonality, trends), spatial relationships (clustering, correlation),
+    behavioral patterns (entity clustering, sequences, anomalies), and system-level correlations
+    in industrial IoT data. Provides methods for analyzing various pattern types and exporting results.
     """
-    
+
     def __init__(self, cache_path="ANALYTICS/analysis_cache/"):
         """
         Initialize the PatternAnalyzer.
 
         Args:
-            cache_path (str): Path to store cache files and patterns.
+            cache_path (str): Path to store cache files and pattern templates.
         """
         self.cache_path = Path(cache_path)
         self.logger = self._setup_logging()
-        
-        # Create cache directory
+
+        # Create cache directory if it doesn't exist
         self.cache_path.mkdir(parents=True, exist_ok=True)
-        
-        # Pattern storage
-        self.detected_patterns = {}
-        self.pattern_templates = {}
-        self.pattern_history = deque(maxlen=1000)
-        
-        # Analysis configuration
+
+        # In-memory storage for detected patterns and history
+        self.detected_patterns: Dict[str, Any] = {} # Stores results of different analyses (temporal, spatial, etc.)
+        self.pattern_templates: Dict[str, Dict] = {} # Stores user-saved patterns for later matching
+        self.pattern_history: deque = deque(maxlen=1000) # Tracks recent analysis runs
+
+        # Default configuration for various analyses
         self.config = {
             'temporal_patterns': {
-                'min_pattern_length': 5,
-                'max_pattern_length': 100,
-                'similarity_threshold': 0.8,
-                'frequency_threshold': 3
+                'min_pattern_length': 5,      # Minimum length for subsequence detection
+                'max_pattern_length': 100,     # Maximum length for subsequence detection
+                'similarity_threshold': 0.8,  # Threshold for subsequence similarity (not currently used)
+                'frequency_threshold': 3      # Min occurrences for a subsequence to be considered recurring
             },
             'spatial_patterns': {
-                'clustering_eps': 0.5,
-                'min_samples': 5,
-                'correlation_threshold': 0.7
+                'clustering_eps': 0.5,        # DBSCAN epsilon parameter
+                'min_samples': 5,             # DBSCAN minimum samples parameter
+                'correlation_threshold': 0.7  # Threshold for strong spatial correlation
             },
             'anomaly_patterns': {
-                'z_score_threshold': 3.0,
-                'isolation_contamination': 0.1,
-                'moving_window_size': 50
+                'z_score_threshold': 3.0,     # Threshold for Z-score anomaly detection
+                'isolation_contamination': 0.1,# Assumed contamination for Isolation Forest
+                'moving_window_size': 50      # Window size for moving anomaly checks (not currently used)
             },
             'seasonal_patterns': {
-                'min_periods': 24,
-                'seasonality_test_alpha': 0.05,
-                'decomposition_model': 'additive'
+                'min_periods': 24,            # Minimum data points for seasonality check (e.g., hours in a day)
+                'seasonality_test_alpha': 0.05,# Significance level for seasonality tests (not currently used)
+                'decomposition_model': 'additive' # 'additive' or 'multiplicative' for seasonal_decompose
             }
         }
-        
-        # Pattern recognition models
+
+        # Storage for potential ML models used in pattern recognition (currently unused)
         self.pattern_models = {}
         self.scalers = {}
-        
-        # Load existing patterns
+
+        # Load previously saved pattern templates on initialization
         self._load_pattern_templates()
-    
-    def _setup_logging(self):
-        """Setup logging for pattern analyzer."""
+
+    def _setup_logging(self) -> logging.Logger:
+        """
+        Sets up logging for the PatternAnalyzer class.
+
+        Returns:
+            logging.Logger: Configured logger instance.
+        """
         logger = logging.getLogger('PatternAnalyzer')
-        logger.setLevel(logging.INFO)
-        
+        logger.setLevel(logging.INFO) # Set default logging level
+
+        # Add file handler only if no handlers are already configured
         if not logger.handlers:
-            # Create logs directory if it doesn't exist
-            Path('LOGS').mkdir(exist_ok=True)
-            handler = logging.FileHandler('LOGS/digital_twin_patterns.log')
+            log_dir = Path('LOGS')
+            log_dir.mkdir(exist_ok=True) # Ensure LOGS directory exists
+            handler = logging.FileHandler(log_dir / 'digital_twin_patterns.log')
             formatter = logging.Formatter(
                 '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
             )
             handler.setFormatter(formatter)
             logger.addHandler(handler)
-        
+            # Optional: Add console handler for immediate feedback
+            # console_handler = logging.StreamHandler(sys.stdout)
+            # console_handler.setFormatter(formatter)
+            # logger.addHandler(console_handler)
+
         return logger
-    
-    def _load_pattern_templates(self):
-        """Load existing pattern templates from cache."""
+
+    def _load_pattern_templates(self) -> None:
+        """Load existing pattern templates from a pickle file in the cache directory."""
         try:
             template_file = self.cache_path / "pattern_templates.pkl"
             if template_file.exists():
                 with open(template_file, 'rb') as f:
+                    # Load the dictionary of templates from the file
                     self.pattern_templates = pickle.load(f)
-                    
-                self.logger.info(f"Loaded {len(self.pattern_templates)} pattern templates")
+                self.logger.info(f"Loaded {len(self.pattern_templates)} pattern templates from {template_file}")
         except Exception as e:
-            self.logger.error(f"Failed to load pattern templates: {e}")
+            # Log error and reset templates if loading fails
+            self.logger.error(f"Failed to load pattern templates: {e}", exc_info=True)
             self.pattern_templates = {}
-    
-    def _save_pattern_templates(self):
-        """Save pattern templates to cache."""
+
+    def _save_pattern_templates(self) -> None:
+        """Save the current pattern templates dictionary to a pickle file."""
         try:
             template_file = self.cache_path / "pattern_templates.pkl"
             with open(template_file, 'wb') as f:
+                # Save the current templates dictionary
                 pickle.dump(self.pattern_templates, f)
-                
-            self.logger.info("Pattern templates saved")
+            self.logger.info(f"Pattern templates saved to {template_file}")
         except Exception as e:
-            self.logger.error(f"Failed to save pattern templates: {e}")
-    
-    def analyze_temporal_patterns(self, data: pd.DataFrame, 
+            self.logger.error(f"Failed to save pattern templates: {e}", exc_info=True)
+
+    def analyze_temporal_patterns(self, data: pd.DataFrame,
                                   timestamp_col: str = 'timestamp',
-                                  value_cols: List[str] = None) -> Dict:
+                                  value_cols: Optional[List[str]] = None) -> Dict[str, Any]:
         """
-        Analyze temporal patterns in time series data.
-        
+        Analyze temporal patterns (cycles, seasonality, trends, recurrence) in time series data.
+
         Args:
-            data: DataFrame with time series data
-            timestamp_col: Column name for timestamps
-            value_cols: List of value columns to analyze
-            
+            data (pd.DataFrame): DataFrame containing time series data.
+            timestamp_col (str): Name of the column containing timestamps.
+            value_cols (Optional[List[str]]): List of numeric column names to analyze.
+                                                If None, analyzes all numeric columns.
+
         Returns:
-            Dictionary containing temporal pattern analysis results
+            Dict[str, Any]: A dictionary containing the analysis results for each specified value column,
+                            including cyclical, seasonal, trend, recurring subsequence, periodicity,
+                            and change point information.
         """
         try:
-            self.logger.info("Starting temporal pattern analysis")
-            
-            # Prepare data
+            self.logger.info("Starting temporal pattern analysis...")
+
+            # Ensure data is not modified in place
             df = data.copy()
+
+            # Convert timestamp column to datetime and set as index
             if timestamp_col in df.columns:
-                df[timestamp_col] = pd.to_datetime(df[timestamp_col])
-                df.set_index(timestamp_col, inplace=True)
-            
-            # Select value columns
+                try:
+                    df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+                    df.set_index(timestamp_col, inplace=True)
+                except Exception as e:
+                    self.logger.error(f"Failed to process timestamp column '{timestamp_col}': {e}")
+                    raise ValueError(f"Invalid timestamp column: {timestamp_col}") from e
+            else:
+                 raise ValueError(f"Timestamp column '{timestamp_col}' not found in data.")
+
+            # Automatically select numeric columns if value_cols is not specified
             if value_cols is None:
                 value_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            
+
+            # Initialize results dictionary
             results = {
                 'analysis_timestamp': datetime.now().isoformat(),
                 'analyzed_columns': value_cols,
                 'patterns_found': {}
             }
-            
+
+            # Analyze each specified value column
             for col in value_cols:
                 if col not in df.columns:
+                    self.logger.warning(f"Column '{col}' not found in data. Skipping.")
                     continue
-                    
+
+                # Get the series data, drop NaNs
                 series = df[col].dropna()
-                if len(series) < self.config['temporal_patterns']['min_pattern_length']:
+
+                # Check if enough data points exist for analysis
+                min_pattern_length = self.config['temporal_patterns']['min_pattern_length']
+                if len(series) < min_pattern_length:
+                    self.logger.warning(f"Insufficient data points ({len(series)} < {min_pattern_length}) for column '{col}'. Skipping.")
                     continue
-                
+
+                # Store patterns found for the current column
                 col_patterns = {}
-                
-                # 1. Cyclical patterns
-                cyclical = self._detect_cyclical_patterns(series)
-                col_patterns['cyclical'] = cyclical
-                
-                # 2. Seasonal patterns
-                seasonal = self._detect_seasonal_patterns(series)
-                col_patterns['seasonal'] = seasonal
-                
-                # 3. Trend patterns
-                trend = self._detect_trend_patterns(series)
-                col_patterns['trend'] = trend
-                
-                # 4. Recurring subsequences
-                recurring = self._detect_recurring_subsequences(series)
-                col_patterns['recurring_subsequences'] = recurring
-                
-                # 5. Periodicity analysis
-                periodicity = self._analyze_periodicity(series)
-                col_patterns['periodicity'] = periodicity
-                
-                # 6. Change point detection
-                change_points = self._detect_change_points(series)
-                col_patterns['change_points'] = change_points
-                
+
+                # --- Perform various temporal analyses ---
+                col_patterns['cyclical'] = self._detect_cyclical_patterns(series)
+                col_patterns['seasonal'] = self._detect_seasonal_patterns(series)
+                col_patterns['trend'] = self._detect_trend_patterns(series)
+                col_patterns['recurring_subsequences'] = self._detect_recurring_subsequences(series)
+                col_patterns['periodicity'] = self._analyze_periodicity(series)
+                col_patterns['change_points'] = self._detect_change_points(series)
+
                 results['patterns_found'][col] = col_patterns
-            
-            # Store results
+
+            # Store results in memory and update history
             self.detected_patterns['temporal'] = results
             self.pattern_history.append(('temporal_analysis', datetime.now().isoformat()))
-            
-            self.logger.info("Temporal pattern analysis completed")
+
+            self.logger.info(f"Temporal pattern analysis completed for columns: {value_cols}")
             return results
-            
+
         except Exception as e:
-            self.logger.error(f"Temporal pattern analysis error: {e}")
+            self.logger.error(f"Temporal pattern analysis error: {e}", exc_info=True)
+            # Re-raise to indicate failure to the caller
             raise
-    
-    def _detect_cyclical_patterns(self, series: pd.Series) -> Dict:
-        """Detect cyclical patterns using autocorrelation."""
+
+    def _detect_cyclical_patterns(self, series: pd.Series) -> Dict[str, Any]:
+        """
+        Detect cyclical patterns using Autocorrelation Function (ACF).
+
+        Args:
+            series (pd.Series): Input time series data.
+
+        Returns:
+            Dict[str, Any]: Dictionary containing detected cycles, their lengths, strengths, and the dominant cycle.
+        """
         try:
-            # Calculate autocorrelation
-            max_lag = min(len(series) // 4, 100)
+            # Determine maximum lag for ACF calculation (heuristic)
+            max_lag = min(len(series) // 4, 100) # Check up to 1/4 of series length or 100 points
             if max_lag < 1:
-                return {'cycles_detected': 0, 'cycles': []}
-                
+                return {'cycles_detected': 0, 'cycles': []} # Not enough data for lag calculation
+
+            # Calculate ACF using statsmodels, using FFT for efficiency
             autocorr = acf(series.values, nlags=max_lag, fft=True)
-            
-            # Find peaks in autocorrelation
+
+            # Find significant peaks in the ACF plot (excluding lag 0)
+            # height: minimum peak height
+            # distance: minimum horizontal distance between peaks
+            # prominence: minimum vertical drop from peak to surrounding lows
             peaks, properties = signal.find_peaks(
-                autocorr[1:], 
-                height=0.3, 
-                distance=5,
-                prominence=0.1
+                autocorr[1:], # Exclude lag 0 (always 1.0)
+                height=0.3, # Minimum correlation strength
+                distance=5, # Minimum separation between cycle lengths
+                prominence=0.1 # Peak must stand out from surroundings
             )
-            
+
+            # Process found peaks into cycle information
             cycles = []
             for peak_idx in peaks:
-                cycle_length = peak_idx + 1
-                cycle_strength = autocorr[cycle_length]
-                
+                cycle_length = peak_idx + 1 # +1 because we excluded lag 0
+                cycle_strength = autocorr[cycle_length] # ACF value at the peak lag
+
                 cycles.append({
-                    'cycle_length': int(cycle_length),
-                    'strength': float(cycle_strength),
-                    'period_hours': float(cycle_length) if series.index.freq else None
+                    'cycle_length': int(cycle_length), # Lag represents cycle length in data points
+                    'strength': float(cycle_strength), # How strong the correlation is at this lag
+                    # Estimate period in hours if series index has frequency info
+                    'period_hours': float(cycle_length * pd.Timedelta(series.index.freq).total_seconds() / 3600) if series.index.freq else None
                 })
-            
-            # Sort by strength
+
+            # Sort cycles by strength (descending) to find the most dominant ones
             cycles.sort(key=lambda x: x['strength'], reverse=True)
-            
+
             return {
                 'cycles_detected': len(cycles),
-                'cycles': cycles[:5],  # Top 5 cycles
-                'dominant_cycle': cycles[0] if cycles else None
+                'cycles': cycles[:5], # Return top 5 strongest cycles
+                'dominant_cycle': cycles[0] if cycles else None # The strongest cycle
             }
-            
+
         except Exception as e:
-            self.logger.error(f"Cyclical pattern detection error: {e}")
+            self.logger.error(f"Cyclical pattern detection error: {e}", exc_info=True)
+            # Return empty result on error
             return {'cycles_detected': 0, 'cycles': []}
-    
-    def _detect_seasonal_patterns(self, series: pd.Series) -> Dict:
-        """Detect seasonal patterns using decomposition."""
+
+    def _detect_seasonal_patterns(self, series: pd.Series) -> Dict[str, Any]:
+        """
+        Detect seasonal patterns using time series decomposition.
+
+        Args:
+            series (pd.Series): Input time series data.
+
+        Returns:
+            Dict[str, Any]: Dictionary indicating if seasonality was found, details of detected patterns,
+                            and the strongest seasonal pattern identified.
+        """
         try:
-            min_periods = self.config['seasonal_patterns']['min_periods']
-            
-            if len(series) < 2 * min_periods:
-                return {'seasonal': False, 'reason': 'Insufficient data'}
-            
-            # Try different seasonal periods
+            min_periods_config = self.config['seasonal_patterns']['min_periods']
+
+            # Check if there's enough data for seasonality analysis (at least 2 full periods)
+            if len(series) < 2 * min_periods_config:
+                return {'seasonal': False, 'reason': f'Insufficient data (less than 2 * {min_periods_config} periods)'}
+
             seasonal_results = {}
-            
-            for period in [24, 168, 720]:  # Daily, weekly, monthly (hours)
+            # Define potential seasonal periods to check (e.g., daily, weekly, monthly in hours)
+            potential_periods = [24, 168, 720] # Assuming hourly data
+
+            for period in potential_periods:
+                # Ensure enough data for the current period check
                 if len(series) < 2 * period:
                     continue
-                    
+
                 try:
+                    # Perform seasonal decomposition using statsmodels
                     decomposition = seasonal_decompose(
-                        series, 
-                        model=self.config['seasonal_patterns']['decomposition_model'],
+                        series,
+                        model=self.config['seasonal_patterns']['decomposition_model'], # 'additive' or 'multiplicative'
                         period=period,
-                        extrapolate_trend='freq'
+                        extrapolate_trend='freq' # Method to handle NaNs at ends due to filtering
                     )
-                    
-                    # Calculate seasonal strength
-                    seasonal_var = np.var(decomposition.seasonal.dropna())
-                    residual_var = np.var(decomposition.resid.dropna())
-                    seasonal_strength = seasonal_var / (seasonal_var + residual_var) if (seasonal_var + residual_var) > 0 else 0
-                    
-                    if seasonal_strength > 0.1:  # Significant seasonality
+
+                    # Calculate seasonal strength (variance of seasonal / (variance of seasonal + variance of residual))
+                    seasonal_comp = decomposition.seasonal.dropna()
+                    residual_comp = decomposition.resid.dropna()
+                    if seasonal_comp.empty or residual_comp.empty: continue # Skip if components are empty
+
+                    seasonal_var = np.var(seasonal_comp)
+                    residual_var = np.var(residual_comp)
+
+                    # Avoid division by zero
+                    total_var = seasonal_var + residual_var
+                    seasonal_strength = seasonal_var / total_var if total_var > 0 else 0
+
+                    # Consider seasonality significant if strength is above a threshold (e.g., 0.1)
+                    if seasonal_strength > 0.1:
                         seasonal_results[f'period_{period}'] = {
                             'period': period,
                             'strength': float(seasonal_strength),
-                            'seasonal_component': decomposition.seasonal.dropna().tolist()[-period:],
+                            # Store the last full cycle of the seasonal component
+                            'seasonal_component': seasonal_comp.tolist()[-period:],
+                            # Store the last full cycle of the trend component
                             'trend_component': decomposition.trend.dropna().tolist()[-period:]
                         }
-                        
-                except Exception as e:
+
+                except Exception as decomp_e:
+                    # Log errors during decomposition for a specific period but continue checking others
+                    self.logger.debug(f"Decomposition failed for period {period}: {decomp_e}")
                     continue
-            
-            # Find best seasonal pattern
+
+            # Find the seasonal pattern with the highest strength
             best_seasonal = None
             if seasonal_results:
                 best_seasonal = max(seasonal_results.values(), key=lambda x: x['strength'])
-            
+
             return {
-                'seasonal': len(seasonal_results) > 0,
-                'seasonal_patterns': seasonal_results,
-                'best_seasonal': best_seasonal
+                'seasonal': len(seasonal_results) > 0, # True if any significant seasonality was found
+                'seasonal_patterns': seasonal_results, # Details for each significant period found
+                'best_seasonal': best_seasonal # The pattern with the highest strength
             }
-            
+
         except Exception as e:
-            self.logger.error(f"Seasonal pattern detection error: {e}")
+            self.logger.error(f"Seasonal pattern detection error: {e}", exc_info=True)
             return {'seasonal': False, 'reason': str(e)}
-    
+
     def _detect_trend_patterns(self, series: pd.Series) -> Dict:
         """Detect trend patterns using statistical methods."""
         try:
@@ -401,7 +503,7 @@ class PatternAnalyzer:
             window_size = max(10, len(series) // 20)
             if len(series) < 2 * window_size:
                  return {'change_points_detected': 0, 'change_points': []}
-                 
+                
             trends = []
             
             for i in range(window_size, len(series) - window_size):
@@ -2090,12 +2192,12 @@ if __name__ == "__main__":
         print("\n    --- Example Cluster 0 Behavior Summary ---")
         summary_c0 = clustering_info['cluster_summaries'].get('cluster_0', {}).get('behavior_summary', {})
         for behavior, stats in summary_c0.items():
-            print(f"      - {behavior}:")
+            print(f"        - {behavior}:")
             for stat_name, values in stats.items():
                 if stat_name == 'top_proportions':
-                    print(f"        - {stat_name}: {values}")
+                    print(f"            - {stat_name}: {values}")
                 else:
-                    print(f"        - {stat_name} (mean): {values.get('mean', 0.0):.2f}")
+                    print(f"            - {stat_name} (mean): {values.get('mean', 0.0):.2f}")
         print("    ------------------------------------------")
 
     # 4. Pattern Summary
