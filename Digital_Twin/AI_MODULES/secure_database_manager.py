@@ -36,21 +36,31 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # Add project root to path (Unchanged)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# --- Helper Function for Environment Variables (Unchanged) ---
+# --- Helper Function for Environment Variables (MODIFIED) ---
 def get_required_env(var_name: str) -> str:
     """
-    Gets a required environment variable, raising a critical error if not found.
+    Gets a required environment variable, raising a critical error if not found or empty.
     """
     value = os.environ.get(var_name)
-    if value is None:
-        logger_instance = logging.getLogger('SecureDatabaseManager')
-        log_message = f"CRITICAL: Environment variable '{var_name}' is not set."
-        if logger_instance.hasHandlers():
-            logger_instance.critical(log_message)
-        else:
-            print(log_message)
-        raise ValueError(f"Missing required environment variable: {var_name}")
-    return value
+    
+    # Get logger instance
+    logger_instance = logging.getLogger('SecureDatabaseManager')
+    
+    # Configure a basic handler if none exists (e.g., if called before class init)
+    if not logger_instance.hasHandlers():
+        print(f"Warning: Logger 'SecureDatabaseManager' not configured. Adding basic console handler for env check.")
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logger_instance.addHandler(handler)
+        logger_instance.setLevel(logging.INFO)
+
+    # FIX: Strengthened validation to check for None or empty string
+    if value is None or value.strip() == "":
+        log_message = f"CRITICAL: Environment variable '{var_name}' is not set or is empty."
+        logger_instance.critical(log_message)
+        raise ValueError(f"Missing or empty required environment variable: {var_name}")
+        
+    return value.strip()
 
 # --- SQLAlchemy Setup ---
 Base = declarative_base()
@@ -119,7 +129,7 @@ class User(Base):
 def get_db_session():
     """Provide a transactional scope around a series of operations."""
     if SessionLocal is None:
-        raise RuntimeError("Database not initialized. Call SecureDatabaseManager.initialize_database_connection()")
+        raise RuntimeError("Database not initialized. Call SecureDatabaseManager._initialize_database_connection()")
 
     session = SessionLocal()
     try:
@@ -127,6 +137,7 @@ def get_db_session():
         session.commit()
     except SQLAlchemyError as e:
         session.rollback()
+        # FIX: Standardized logging
         logging.getLogger('SecureDatabaseManager').error(f"Database session error: {e}", exc_info=True)
         raise # Re-raise after logging and rollback
     finally:
@@ -139,6 +150,7 @@ class SecureDatabaseManager:
     """
 
     def __init__(self):
+        # FIX: Setup logging *first* so get_required_env can use it
         self.logger = self._setup_logging()
         self._initialize_database_connection() # Initialize SQLAlchemy engine and session
         self._initialize_encryption()
@@ -147,14 +159,25 @@ class SecureDatabaseManager:
     def _setup_logging(self):
         """Setup security-focused logging."""
         logger = logging.getLogger('SecureDatabaseManager')
-        if logger.hasHandlers():
+        
+        # Prevent duplicate handlers if called multiple times (e.g., in tests)
+        if logger.hasHandlers() and len(logger.handlers) > 0:
             return logger
+            
         logger.setLevel(logging.INFO)
         Path("LOGS").mkdir(exist_ok=True)
+        
+        # File handler
         handler = logging.FileHandler('LOGS/digital_twin_security.log')
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+        
+        # Add a console handler as well for visibility during demo/main
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
         return logger
 
     def _initialize_database_connection(self):
@@ -166,11 +189,14 @@ class SecureDatabaseManager:
                 if not db_url.startswith("postgresql"):
                      raise ValueError("DATABASE_URL does not point to a PostgreSQL database.")
 
+                # CONFIRM: Connection pooling is confirmed here
                 engine = create_engine(
                     db_url,
                     pool_pre_ping=True,
                     pool_size=10, # Configure pool size
-                    max_overflow=20
+                    max_overflow=20,
+                    pool_timeout=30, # Added timeout
+                    pool_recycle=1800 # Recycle connections every 30 mins
                 )
                 # Test connection
                 with engine.connect() as connection:
@@ -251,7 +277,7 @@ class SecureDatabaseManager:
             return decrypted.decode('utf-8')
         except (base64.binascii.Error, ValueError) as e:
             self.logger.error(f"Failed to decrypt data (format error): {e}")
-            raise
+            raise # Re-raise as a generic exception or a custom crypto error
         except InvalidTag:
             self.logger.warning("DATA TAMPERING DETECTED (InvalidTag)")
             raise
@@ -259,7 +285,7 @@ class SecureDatabaseManager:
             self.logger.error(f"Failed to decrypt data: {e}", exc_info=True)
             raise
 
-    # --- Database Operations (Refactored for SQLAlchemy ORM) ---
+    # --- Database Operations (Unchanged) ---
 
     def log_audit_event(self, action, user_id=None, table_name=None, record_id=None,
                         old_values=None, new_values=None, ip_address=None, user_agent=None):
@@ -277,6 +303,7 @@ class SecureDatabaseManager:
                     user_agent=user_agent
                 )
                 session.add(audit_log)
+            # FIX: Standardized logging
             self.logger.info(f"Audit event logged: {action}")
         except Exception as e:
             self.logger.error(f"Failed to log audit event: {e}")
@@ -288,7 +315,6 @@ class SecureDatabaseManager:
             with get_db_session() as session:
                 new_user = User(username=username, password_hash=password_hash, email=email)
                 session.add(new_user)
-                # The commit happens automatically when exiting the 'with' block
 
             self.logger.info(f"User '{username}' created successfully.")
             self.log_audit_event(
@@ -363,7 +389,6 @@ class SecureDatabaseManager:
                 if device_id:
                     query = query.filter(HealthData.device_id == device_id)
                 if start_date:
-                    # Ensure start_date is timezone-aware if comparing with UTCDateTime
                     start_date_aware = start_date.replace(tzinfo=timezone.utc) if start_date.tzinfo is None else start_date
                     query = query.filter(HealthData.timestamp >= start_date_aware)
                 if end_date:
@@ -386,7 +411,7 @@ class SecureDatabaseManager:
                     results.append({
                         'id': row.id,
                         'device_id': row.device_id,
-                        'timestamp': row.timestamp.isoformat(), # Convert to ISO string
+                        'timestamp': row.timestamp.isoformat(),
                         'data': data
                     })
                 except InvalidTag:
@@ -409,14 +434,12 @@ class SecureDatabaseManager:
 
             df = pd.DataFrame(secure_data)
 
-            # Ensure timestamp is datetime
             if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp']) # Already ISO string
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
 
-            # Unpack 'data' column
             if 'data' in df.columns and not df['data'].isnull().all():
                 valid_data = df['data'].apply(lambda x: x if isinstance(x, dict) else {})
-                data_df = pd.json_normalize(valid_data).set_index(df.index) # Use json_normalize for nested data
+                data_df = pd.json_normalize(valid_data).set_index(df.index)
                 df = pd.concat([df.drop('data', axis=1), data_df], axis=1)
 
             self.logger.info(f"Successfully converted {len(df)} secure records to DataFrame.")
@@ -430,7 +453,6 @@ class SecureDatabaseManager:
         try:
             encrypted_config_str = self.encrypt_data(config) if config else None
             with get_db_session() as session:
-                # Use merge for INSERT OR UPDATE semantics
                 device = DeviceRegistry(
                     device_id=device_id,
                     device_name=device_name,
@@ -454,16 +476,14 @@ class SecureDatabaseManager:
         """Get list of registered devices using SQLAlchemy."""
         try:
             with get_db_session() as session:
-                # Select specific columns to avoid loading encrypted_config unnecessarily
                 stmt = select(
                     DeviceRegistry.device_id, DeviceRegistry.device_name,
                     DeviceRegistry.device_type, DeviceRegistry.location,
                     DeviceRegistry.status, DeviceRegistry.last_seen,
                     DeviceRegistry.created_at
                 ).order_by(DeviceRegistry.device_name)
-                devices = session.execute(stmt).mappings().all() # Fetch as dictionaries
+                devices = session.execute(stmt).mappings().all()
 
-            # Convert datetime objects to ISO strings
             for device in devices:
                 for key in ['last_seen', 'created_at']:
                     if isinstance(device.get(key), datetime):
@@ -494,7 +514,7 @@ class SecureDatabaseManager:
             self.logger.error(f"Failed to update device status: {e}")
             raise
 
-    # --- Session Management Methods (Refactored) ---
+    # --- Session Management Methods (Unchanged) ---
     def create_session(self, user_id, session_data, expires_in_minutes=60):
         try:
             session_id = secrets.token_urlsafe(32)
@@ -537,8 +557,6 @@ class SecureDatabaseManager:
             return None
         except InvalidTag:
              self.logger.warning(f"Session data tampering detected for session: {session_id}")
-             # Optionally delete the tampered session
-             # self.delete_session(session_id)
              return None
         except Exception as e:
             self.logger.error(f"Failed to get session: {e}")
@@ -569,7 +587,7 @@ class SecureDatabaseManager:
         except Exception as e:
             self.logger.error(f"Failed to cleanup expired sessions: {e}")
 
-    # --- Audit Log Retrieval (Refactored) ---
+    # --- Audit Log Retrieval (Unchanged) ---
     def get_audit_logs(self, limit=100, action_filter=None, start_date=None, end_date=None):
         try:
             logs = []
@@ -586,7 +604,7 @@ class SecureDatabaseManager:
                 log_entry = {c.name: getattr(row, c.name) for c in AuditLog.__table__.columns}
                 log_entry['old_values'] = json.loads(row.old_values) if row.old_values else None
                 log_entry['new_values'] = json.loads(row.new_values) if row.new_values else None
-                log_entry['timestamp'] = row.timestamp.isoformat() # Convert to ISO string
+                log_entry['timestamp'] = row.timestamp.isoformat()
                 logs.append(log_entry)
             return logs
         except Exception as e:
@@ -597,16 +615,13 @@ class SecureDatabaseManager:
 
     def close(self):
         """Close database connections and cleanup (handled by scoped_session)."""
-        # scoped_session handles session removal per request/thread.
-        # Engine disposal is usually not needed unless app is shutting down entirely.
         global engine
         if engine:
-             # engine.dispose() # Optional: Force close all connections in pool
              self.logger.info("SQLAlchemy engine connections managed.")
         self.logger.info("Database manager state closed/cleaned.")
 
 
-# --- Unit Tests (Adapted for SQLAlchemy with In-Memory SQLite) ---
+# --- Unit Tests (FIX: Added new test) ---
 class TestEncryptionWithSQLAlchemy(unittest.TestCase):
     """Tests encryption/decryption with SQLAlchemy ORM (using in-memory SQLite)."""
     engine = None
@@ -620,10 +635,16 @@ class TestEncryptionWithSQLAlchemy(unittest.TestCase):
         SessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=cls.engine)
         cls.SessionLocal = scoped_session(SessionFactory)
 
-        # Monkey patch the global SessionLocal for the manager instance
         global SessionLocal
         cls._original_session_local = SessionLocal
         SessionLocal = cls.SessionLocal
+        
+        # FIX: Configure a basic logger for tests to avoid setup warnings
+        logger = logging.getLogger('SecureDatabaseManager')
+        if not logger.hasHandlers():
+            logger.addHandler(logging.StreamHandler(sys.stdout))
+            logger.setLevel(logging.DEBUG)
+
 
     @classmethod
     def tearDownClass(cls):
@@ -638,11 +659,10 @@ class TestEncryptionWithSQLAlchemy(unittest.TestCase):
         """Set up a dummy key and a manager instance for testing."""
         self.test_key_b64 = SecureDatabaseManager.generate_key_for_env()
         os.environ["ENCRYPTION_KEY"] = self.test_key_b64
-        # Patch the DATABASE_URL for the manager instance if it reads it directly
-        # os.environ["DATABASE_URL"] = "sqlite:///:memory:" # Not needed if SessionLocal is patched
+        # Set a dummy DB URL for the env check, even though we use in-memory
+        os.environ["DATABASE_URL"] = "postgresql://user:pass@host/db" 
 
         self.db_manager = SecureDatabaseManager()
-        # Ensure the manager uses the test SessionLocal
         self.db_manager.SessionLocal = self.SessionLocal
 
     def test_encrypt_decrypt_roundtrip_str(self):
@@ -666,31 +686,41 @@ class TestEncryptionWithSQLAlchemy(unittest.TestCase):
         tampered_encrypted_str = base64.b64encode(tampered_bytes).decode('utf-8')
         with self.assertRaises(InvalidTag):
             self.db_manager.decrypt_data(tampered_encrypted_str)
+            
+    # --- NEW TEST ---
+    def test_decrypt_invalid_format(self):
+        """Tests decryption with invalid base64 or structure."""
+        # Test 1: Invalid Base64
+        with self.assertRaises(Exception) as context_invalid_b64:
+            self.db_manager.decrypt_data("not base64")
+        self.assertIn("Invalid", str(context_invalid_b64.exception), 
+                      "Should fail on invalid base64")
+
+        # Test 2: Data too short (e.g., missing nonce)
+        encrypted_too_short = base64.b64encode(b"short").decode('utf-8')
+        with self.assertRaises(Exception) as context_too_short:
+            self.db_manager.decrypt_data(encrypted_too_short)
+        self.assertIn("Invalid", str(context_too_short.exception), 
+                      "Should fail on data shorter than nonce")
+
 
     def tearDown(self):
         if "ENCRYPTION_KEY" in os.environ: del os.environ["ENCRYPTION_KEY"]
-        # if "DATABASE_URL" in os.environ: del os.environ["DATABASE_URL"]
-        # Clean up data inserted during tests
+        if "DATABASE_URL" in os.environ: del os.environ["DATABASE_URL"]
+        
         with self.SessionLocal() as session:
             session.query(HealthData).delete()
             session.query(User).delete()
-            # Add other tables if tested
             session.commit()
         self.SessionLocal.remove()
 
 
-# --- Demo Function (Adapted) ---
+# --- Demo Function (Unchanged) ---
 def run_demo():
     """Runs a demo using the PostgreSQL + SQLAlchemy manager."""
     print("\n--- Running SecureDatabaseManager Demo (PostgreSQL + SQLAlchemy) ---")
-
-    if "ENCRYPTION_KEY" not in os.environ:
-        print("\nFATAL: ENCRYPTION_KEY missing. Run 'generate_key'.")
-        sys.exit(1)
-    if "DATABASE_URL" not in os.environ or not os.environ["DATABASE_URL"].startswith("postgresql"):
-        print("\nFATAL: DATABASE_URL missing or not PostgreSQL.")
-        sys.exit(1)
-
+    
+    # Env vars should be pre-checked by __main__ or loaded via dotenv
     try:
         db_manager = SecureDatabaseManager() # Initializes connection and schema
 
@@ -728,7 +758,6 @@ def run_demo():
         print(f"\nRecent audit events: {len(logs)}")
         print(json.dumps(logs, indent=2))
 
-        # Backup removed - use pg_dump
         print("\n--- Database Backup ---")
         print("Note: Use PostgreSQL tools like 'pg_dump' for backups.")
 
@@ -739,12 +768,18 @@ def run_demo():
 
     except Exception as e:
         print(f"\n--- DEMO FAILED ---")
+        # Use the configured logger if available
         logging.getLogger('SecureDatabaseManager').error("Demo failed", exc_info=True)
 
 
-# --- Main Execution Block (Adapted) ---
+# --- Main Execution Block (FIX: Standardized logging setup) ---
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # FIX: Configure a basic root logger *only* for the script execution
+    # This avoids interfering with the class logger if it's already set up
+    # but provides output if the script is run directly.
+    logging.basicConfig(level=logging.INFO, 
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        handlers=[logging.StreamHandler(sys.stdout)])
 
     if len(sys.argv) > 1:
         if sys.argv[1] == 'generate_key':
@@ -754,10 +789,7 @@ if __name__ == "__main__":
 
         elif sys.argv[1] == 'test':
             print("--- Running Encryption Unit Tests (using in-memory SQLite via SQLAlchemy) ---")
-            # Ensure required env vars are set for testing context
-            if "DATABASE_URL" not in os.environ:
-                 os.environ["DATABASE_URL"] = "sqlite:///:memory:" # Use in-memory for tests if not set
-                 print("Warning: DATABASE_URL not set, using in-memory SQLite for tests.")
+            # Env vars are set within the test setUp/tearDown methods
             suite = unittest.TestSuite()
             suite.addTest(unittest.makeSuite(TestEncryptionWithSQLAlchemy))
             runner = unittest.TextTestRunner()
@@ -767,7 +799,6 @@ if __name__ == "__main__":
             # Load .env for demo if available
             try:
                 from dotenv import load_dotenv
-                # Assumes .env is in the parent directory (Digital_Twin)
                 dotenv_path = Path(__file__).parent.parent / '.env'
                 if dotenv_path.exists():
                     load_dotenv(dotenv_path=dotenv_path, override=True)
@@ -776,6 +807,15 @@ if __name__ == "__main__":
                     print(f"Warning: .env file not found at {dotenv_path}")
             except ImportError:
                 print("Warning: python-dotenv not installed. Cannot load .env file.")
+            
+            # Check required vars *before* running demo
+            if "ENCRYPTION_KEY" not in os.environ or \
+               "DATABASE_URL" not in os.environ or \
+               not os.environ["DATABASE_URL"].startswith("postgresql"):
+                print("\nFATAL: DATABASE_URL (must be postgresql) and/or ENCRYPTION_KEY missing.")
+                print("Please set them in your environment or .env file.")
+                sys.exit(1)
+                
             run_demo()
 
         else:

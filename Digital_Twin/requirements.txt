@@ -115,3 +115,5 @@ paho-mqtt==2.1.0
 psutil==6.0.0
 GPUtil==1.4.0
 py-cpuinfo==9.0.0
+alembic
+psycopg2-binary
