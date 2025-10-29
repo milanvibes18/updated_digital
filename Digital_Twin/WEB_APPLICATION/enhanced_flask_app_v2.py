@@ -70,7 +70,7 @@ try:
     FLASK_LIMITER_AVAILABLE = True
 except ImportError:
     logging.warning("Flask-Limiter not installed. Rate limiting disabled.")
-    FLASK_LIMITER_AVAILABLE = False
+    FLASK_LIMITTER_AVAILABLE = False
     class Limiter:
         def __init__(self, *args, **kwargs): pass
         def limit(self, *args, **kwargs): return lambda f: f
@@ -143,9 +143,12 @@ try:
     from Digital_Twin.AI_MODULES.secure_database_manager import SecureDatabaseManager
     # --- Import WebSocket Manager ---
     from Digital_Twin.AI_MODULES.realtime_websocket_manager import RealtimeWebSocketManager
+    # --- FIX 2: Import cleanup task ---
+    from Digital_Twin.DATA_MANAGEMENT.auto_cleanup import perform_cleanup as perform_db_cleanup
 except ImportError as e:
     logging.warning(f"Could not import some modules: {e}. Functionality might be limited.")
     PredictiveAnalyticsEngine = HealthScoreCalculator = AlertManager = PatternAnalyzer = RecommendationEngine = UnifiedDataGenerator = HealthReportGenerator = SecureDatabaseManager = RealtimeWebSocketManager = object
+    perform_db_cleanup = None
 
 
 # ==================== LOGGING SETUP (Structlog) ====================
@@ -575,7 +578,8 @@ def make_celery(app_name=__name__):
             app_name,
             broker=broker_url,
             backend=result_backend,
-            include=['Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v3']
+            # --- FIX: Ensure this matches the module path of *this* file ---
+            include=['Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2']
         )
     except Exception as e:
         logger.error(f"Failed to create Celery app", error=str(e), exc_info=True)
@@ -590,14 +594,24 @@ def init_celery(app: Flask, celery: Optional[Celery]):
 
     celery.conf.beat_schedule = {
         'cleanup-inactive-clients-every-5-minutes': {
-            'task': 'Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v3.cleanup_inactive_clients_task',
+            # --- FIX: Use task name from decorator, not file path ---
+            'task': 'digital_twin.cleanup_inactive_clients',
             'schedule': timedelta(minutes=5),
         },
         'retrain-models-daily': {
-            'task': 'Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v3.run_model_retraining_task',
+            # --- FIX: Use task name from decorator, not file path ---
+            'task': 'digital_twin.run_model_retraining',
             'schedule': crontab(
                 hour=int(get_optional_env('RETRAIN_HOUR_UTC', 1)),
                 minute=int(get_optional_env('RETRAIN_MINUTE_UTC', 0))
+            ),
+        },
+        # --- FIX 2: Add periodic data cleanup task ---
+        'periodic-db-cleanup-daily': {
+            'task': 'digital_twin.perform_db_cleanup',
+            'schedule': crontab(
+                hour=int(get_optional_env('DB_CLEANUP_HOUR_UTC', 2)),
+                minute=int(get_optional_env('DB_CLEANUP_MINUTE_UTC', 30))
             ),
         },
     }
@@ -1467,6 +1481,56 @@ def get_device(device_id):
         logger.error(f"Error getting device", device_id=device_id, error=str(e), exc_info=True)
         return create_standard_response(error="Failed to retrieve device data", status_code=500)
 
+# --- NEW ENDPOINT (Fix 1) ---
+@api_bp.route('/historical_data')
+@jwt_required()
+def get_historical_data():
+    """
+    Fetches historical data for a device based on query parameters.
+    """
+    device_id = request.args.get('device_id')
+    if not device_id:
+        return create_standard_response(error="device_id query parameter is required", status_code=400)
+    
+    try:
+        # Parse start_time
+        start_time_str = request.args.get('start_time')
+        if start_time_str:
+            start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00')).astimezone(timezone.utc)
+        else:
+            start_time = datetime.now(timezone.utc) - timedelta(days=7)
+        
+        # Parse end_time
+        end_time_str = request.args.get('end_time')
+        if end_time_str:
+            end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00')).astimezone(timezone.utc)
+        else:
+            end_time = datetime.now(timezone.utc)
+        
+        limit = request.args.get('limit', default=1000, type=int)
+
+        logger.info("Fetching historical data", device_id=device_id, start=start_time, end=end_time, limit=limit)
+        
+        with get_session() as session:
+            query = session.query(DeviceData).filter(
+                DeviceData.device_id == device_id,
+                DeviceData.timestamp >= start_time,
+                DeviceData.timestamp <= end_time
+            ).order_by(DeviceData.timestamp.desc()).limit(limit)
+            
+            results = query.all()
+            data_list = [r.to_dict() for r in results]
+        
+        return create_standard_response(data=data_list)
+    
+    except ValueError as e:
+        logger.warning("Invalid timestamp format for historical data", error=str(e))
+        return create_standard_response(error=f"Invalid date format: {e}", status_code=400)
+    except Exception as e:
+        logger.error(f"Error getting historical data", device_id=device_id, error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to retrieve historical data", status_code=500)
+# --- END NEW ENDPOINT ---
+
 @api_bp.route('/alerts')
 @jwt_required()
 def get_alerts():
@@ -1664,6 +1728,43 @@ def get_task_status(task_id):
         logger.error(f"Failed to get task status", task_id=task_id, error=str(e), exc_info=True)
         return create_standard_response(error="Failed to retrieve task status", status_code=500)
 
+# --- NEW ENDPOINT (Fix 1) ---
+@tasks_bp.route('/export_data', methods=['POST'])
+@jwt_required()
+def start_export_task():
+    """
+    Triggers an asynchronous data export task.
+    """
+    if not celery_app:
+        return create_standard_response(error="Async task runner not available", status_code=503)
+    
+    data = request.get_json() or {}
+    format_type = data.get('format', 'json')
+    days = data.get('days', 7)
+
+    if format_type not in ['json', 'csv']:
+        return create_standard_response(error="Validation failed: 'format' must be 'json' or 'csv'", status_code=400)
+    
+    try:
+        days = int(days)
+        if days <= 0:
+            raise ValueError("Days must be positive")
+    except ValueError:
+        return create_standard_response(error="Validation failed: 'days' must be a positive integer", status_code=400)
+    
+    try:
+        user_id = get_jwt_identity()
+        task = celery_app.send_task(
+            'digital_twin.export_data', # This task already exists
+            args=[format_type, days]
+        )
+        logger.info(f"Dispatched export_data_task", task_id=task.id, user_id=user_id, format=format_type, days=days)
+        return create_standard_response(data={"task_id": task.id, "status": "PENDING"}, status_code=202)
+    except Exception as e:
+        logger.error(f"Failed to dispatch export task", error=str(e), exc_info=True)
+        return create_standard_response(error="Failed to start export task", status_code=500)
+# --- END NEW ENDPOINT ---
+
 
 # ==================== CELERY TASK DEFINITIONS ====================
 @celery_app.task(bind=True, name='digital_twin.cleanup_inactive_clients')
@@ -1777,6 +1878,39 @@ def export_data_task(self, format_type='json', date_range_days=7):
         logger.error(f"Celery task export_data_task failed", task_id=self.request.id, error=str(e), exc_info=True)
         self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
         raise
+
+# --- NEW TASK (Fix 2) ---
+@celery_app.task(bind=True, name='digital_twin.perform_db_cleanup')
+def perform_db_cleanup_task(self):
+    """
+    Celery wrapper task for performing database cleanup.
+    """
+    app_instance = current_app.extensions.get("digital_twin_instance")
+    if not app_instance:
+        logger.error("Could not get DigitalTwinApp instance in Celery task")
+        return {'status': 'FAILURE', 'error': 'App instance missing'}
+
+    if not perform_db_cleanup:
+        logger.error("perform_db_cleanup function not imported/available.")
+        return {'status': 'FAILURE', 'error': 'Cleanup function not loaded'}
+    
+    logger.info("Running scheduled database cleanup...")
+    try:
+        # Get retention days from env, with defaults
+        data_days = int(get_optional_env('DATA_RETENTION_DAYS', 30))
+        alert_days = int(get_optional_env('ALERT_RETENTION_DAYS', 90))
+        
+        result = perform_db_cleanup(
+            data_retention_days=data_days,
+            alert_retention_days=alert_days
+        )
+        logger.info("Database cleanup task finished", **result)
+        return {'status': 'SUCCESS', **result}
+    except Exception as e:
+        logger.error(f"Celery task perform_db_cleanup failed", error=str(e), exc_info=True)
+        self.update_state(state='FAILURE', meta={'exc_type': type(e).__name__, 'exc_message': str(e)})
+        raise
+# --- END NEW TASK ---
 
 
 # ==================== APPLICATION FACTORY & MAIN ====================
