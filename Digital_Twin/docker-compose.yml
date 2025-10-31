@@ -3,8 +3,8 @@ version: "3.8"
 # Define a base configuration for celery services to reduce repetition
 x-celery-base: &celery-base
   build:
-    context: . # Build context is the Digital_Twin directory
-    dockerfile: Dockerfile # Use the main Dockerfile
+    context: ..
+    dockerfile: Digital_Twin/Dockerfile # Use the main Dockerfile
   restart: unless-stopped
   env_file:
     - ./.env # Load common environment variables (DB URL, Redis URL, etc.)
@@ -33,8 +33,8 @@ services:
   # ----------------------------------------
   digital-twin-app:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: Digital_Twin/Dockerfile
     container_name: digital_twin_app
     restart: unless-stopped
     expose:

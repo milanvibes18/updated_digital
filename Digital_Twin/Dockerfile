@@ -18,7 +18,7 @@ COPY tsconfig.node.json .
 COPY tailwind.config.js .
 COPY postcss.config.cjs .
 COPY components.json .
-
+COPY index.html .
 # Build the production-ready static files
 RUN npm run build
 
@@ -77,7 +77,7 @@ COPY --from=react-builder /app-frontend/dist /app/Digital_Twin/WEB_APPLICATION/s
 
 # Copy backend application code
 COPY Digital_Twin /app/Digital_Twin
-COPY ANALYTICS /app/ANALYTICS
+#COPY ANALYTICS /app/ANALYTICS
 
 # Create necessary directories and set permissions (from your old file)
 # Paths are adjusted to be relative to /app
@@ -103,8 +103,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Expose port
 EXPOSE ${PORT}
 
-# Run the application using the robust Gunicorn command (from your old file)
-# BUT updated to use the app factory path (from your new file)
+# ... (rest of your Dockerfile) ...
+
+# Run the application using the robust Gunicorn command
+# pointing to the correct Flask app object 'flask_app'
 CMD ["gunicorn", \
      "--bind", "0.0.0.0:5000", \
      "--workers", "4", \
@@ -112,4 +114,4 @@ CMD ["gunicorn", \
      "--keep-alive", "2", \
      "--max-requests", "1000", \
      "--max-requests-jitter", "100", \
-     "Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2:create_app()"]
+     "Digital_Twin.WEB_APPLICATION.enhanced_flask_app_v2:flask_app"]
